@@ -113,8 +113,12 @@ public enum GMMKPacket {
         ///
         /// On the GMMK 1 TKL running firmware 1.08 this does **not** return the
         /// config block the community tools describe: it answers with a
-        /// device-info block (`55 aa` magic, VID/PID, firmware version, then the
-        /// list of supported mode IDs). Use ``readConfig`` to read config RAM.
+        /// device-info block — see ``GMMKDeviceInfo``. Use ``readConfig`` to
+        /// read config RAM.
+        ///
+        /// Issuing this read is also what lets subsequent config writes latch
+        /// into the running effect engine, which is why the transport opens
+        /// every session with it. See `docs/protocol-tkl-notes.md` §13.8.
         public static let readProfile: UInt8 = 0x03
         /// Read config RAM by address. Works as documented on firmware 1.08.
         public static let readConfig: UInt8 = 0x05
@@ -188,27 +192,45 @@ public enum GMMKPacket {
     /// the byte that is a zero pad on the way out is the status on the way back.
     public static let replyStatusOffset = 7
 
+    /// Wire offset where a reply's data area begins, same as a command's.
+    public static let replyDataOffset = 8
+
+    /// Maps a wire offset onto an index in a report as delivered.
+    ///
+    /// Input reports on this pipe arrive with the leading `0x04` intact — the
+    /// same asymmetry that makes ``payloadLength`` wrong for `SetReport`, see
+    /// `docs/protocol.md` §6 — so wire offsets are indices as-is. A 63-byte
+    /// report (ID stripped) is also handled, one index earlier, since which form
+    /// arrives is a property of the OS rather than of the protocol.
+    ///
+    /// - Returns: `nil` if the report is too short to contain that offset.
+    public static func index(ofWireOffset offset: Int, inReport report: [UInt8]) -> Int? {
+        let index = report.count == payloadLength ? offset - 1 : offset
+        guard index >= 0, index < report.count else { return nil }
+        return index
+    }
+
     /// Reads the status byte out of an input report.
     ///
     /// Firmware 1.08 echoes every command on input report ID 4 with the status
-    /// at wire offset 7. Input reports on this pipe arrive with the leading
-    /// `0x04` intact — the same asymmetry that makes ``payloadLength`` wrong for
-    /// `SetReport`, see `docs/protocol.md` §6 — so for a 64-byte report the
-    /// status is at index 7. A 63-byte report (ID stripped) is also accepted and
-    /// read one earlier, since which form arrives is a property of the OS rather
-    /// than of the protocol.
+    /// at wire offset 7.
     public static func replyStatus(inReport report: [UInt8]) -> ReplyStatus {
-        let index: Int
-        switch report.count {
-        case payloadLength: index = replyStatusOffset - 1
-        case let n where n > payloadLength: index = replyStatusOffset
-        default: return .malformed
+        guard let index = index(ofWireOffset: replyStatusOffset, inReport: report) else {
+            return .malformed
         }
         switch report[index] {
         case 0x00: return .ok
         case 0xFF, 0xFE: return .rejected(report[index])
         case let byte: return .other(byte)
         }
+    }
+
+    /// The data area of a reply — everything from wire offset 8 on.
+    public static func replyData(inReport report: [UInt8]) -> ArraySlice<UInt8>? {
+        guard let index = index(ofWireOffset: replyDataOffset, inReport: report) else {
+            return nil
+        }
+        return report[index...]
     }
 
     // MARK: - Transaction bracketing
