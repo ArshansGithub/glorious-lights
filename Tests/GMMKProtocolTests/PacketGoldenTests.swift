@@ -309,6 +309,78 @@ final class PacketGoldenTests: XCTestCase {
         XCTAssertEqual(packets[2][4], 0x6F)
     }
 
+    // MARK: - Profile bases
+
+    /// Three 42-byte blocks at 0x0000 / 0x002A / 0x0054.
+    func testProfileBases() {
+        XCTAssertEqual(GMMKPacket.profileStride, 0x2A)
+        XCTAssertEqual(GMMKPacket.profileBases, [0x0000, 0x002A, 0x0054])
+    }
+
+    /// Verified on hardware: mode 6 at profile 1 is
+    /// `04 37 00 06 01 2a 00 00 06` — 0x06+0x01+0x2A+0x06 = 0x37.
+    func testSetModeAtProfileOne() {
+        XCTAssertEqual(GMMKPacket.setMode(.fixed, profileBase: 0x2A),
+                       payload([0x37, 0x00, 0x06, 0x01, 0x2A, 0x00, 0x00, 0x06]))
+    }
+
+    /// Profile 2: `04 61 00 06 01 54 00 00 06` — 0x06+0x01+0x54+0x06 = 0x61.
+    func testSetModeAtProfileTwo() {
+        XCTAssertEqual(GMMKPacket.setMode(.fixed, profileBase: 0x54),
+                       payload([0x61, 0x00, 0x06, 0x01, 0x54, 0x00, 0x00, 0x06]))
+    }
+
+    /// Verified on hardware: rainbow off at profile 1 (offset 4 → address 0x2E)
+    /// is `04 35 00 06 01 2e 00 00 00` — 0x06+0x01+0x2E = 0x35.
+    func testSetRainbowAtProfileOne() {
+        XCTAssertEqual(GMMKPacket.setRainbow(false, profileBase: 0x2A),
+                       payload([0x35, 0x00, 0x06, 0x01, 0x2E, 0x00, 0x00, 0x00]))
+    }
+
+    /// Verified on hardware: colour ff8800 at profile 1 (offset 5 → address
+    /// 0x2F) is `04 bf 01 06 03 2f 00 00 ff 88 00` —
+    /// 0x06+0x03+0x2F+0xFF+0x88 = 0x01BF, little-endian `bf 01`.
+    func testSetColorAtProfileOne() {
+        XCTAssertEqual(
+            GMMKPacket.setColor(red: 0xFF, green: 0x88, blue: 0x00, profileBase: 0x2A),
+            payload([0xBF, 0x01, 0x06, 0x03, 0x2F, 0x00, 0x00, 0xFF, 0x88, 0x00]))
+    }
+
+    /// Field offsets are relative: every field's address is base + offset, and
+    /// the profile-0 form is exactly the offset itself.
+    func testEveryFieldIsProfileRelative() {
+        for base in GMMKPacket.profileBases {
+            XCTAssertEqual(GMMKPacket.setMode(.fixed, profileBase: base)[4],
+                           UInt8(base + GMMKPacket.ConfigOffset.mode))
+            XCTAssertEqual(GMMKPacket.setBrightness(level: 4, profileBase: base)[4],
+                           UInt8(base + GMMKPacket.ConfigOffset.brightness))
+            XCTAssertEqual(GMMKPacket.setDelay(1, profileBase: base)[4],
+                           UInt8(base + GMMKPacket.ConfigOffset.delay))
+            XCTAssertEqual(GMMKPacket.setDirection(.left, profileBase: base)[4],
+                           UInt8(base + GMMKPacket.ConfigOffset.direction))
+            XCTAssertEqual(GMMKPacket.setRainbow(true, profileBase: base)[4],
+                           UInt8(base + GMMKPacket.ConfigOffset.rainbow))
+            XCTAssertEqual(GMMKPacket.setColor(red: 1, green: 2, blue: 3, profileBase: base)[4],
+                           UInt8(base + GMMKPacket.ConfigOffset.color))
+        }
+        // Profile 0 is the no-argument form.
+        XCTAssertEqual(GMMKPacket.setMode(.fixed), GMMKPacket.setMode(.fixed, profileBase: 0))
+    }
+
+    /// Addresses stay inside the low byte for all three profiles, so the
+    /// address-high byte is always 0.
+    func testProfileAddressesFitInOneByte() {
+        for base in GMMKPacket.profileBases {
+            XCTAssertEqual(GMMKPacket.setPollingRate(.hz1000, profileBase: base)[5], 0x00)
+        }
+    }
+
+    func testAtEveryProfileBuildsOnePacketPerBase() {
+        let packets = GMMKPacket.atEveryProfile { GMMKPacket.setMode(.fixed, profileBase: $0) }
+        XCTAssertEqual(packets.count, 3)
+        XCTAssertEqual(packets.map { $0[4] }, [0x00, 0x2A, 0x54])
+    }
+
     // MARK: - Transactions
 
     func testSingleWriteIsBracketed() {
@@ -319,24 +391,93 @@ final class PacketGoldenTests: XCTestCase {
         XCTAssertEqual(t[2], GMMKPacket.end())
     }
 
-    /// `docs/protocol.md` §2.2: solid orange at full brightness.
-    func testSolidColorTransactionMatchesDocumentedExample() {
-        let t = GMMKTransaction.solidColor(RGB(red: 0xFF, green: 0x88, blue: 0x00))
-        XCTAssertEqual(t.count, 6)
-        XCTAssertEqual(t[0], payload([0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]))
-        XCTAssertEqual(t[1], payload([0x0D, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00, 0x06]))
-        XCTAssertEqual(t[2], payload([0x0C, 0x00, 0x06, 0x01, 0x01, 0x00, 0x00, 0x04]))
-        XCTAssertEqual(t[3], payload([0x0B, 0x00, 0x06, 0x01, 0x04, 0x00, 0x00, 0x00]))
-        XCTAssertEqual(t[4], payload([0x95, 0x01, 0x06, 0x03, 0x05, 0x00, 0x00, 0xFF, 0x88, 0x00]))
-        XCTAssertEqual(t[5], payload([0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]))
+    /// One field, three bases, bracketed — `docs/protocol-tkl-notes.md` §8.2.
+    func testSetModeTransactionWritesEveryProfile() {
+        let t = GMMKTransaction.setMode(.fixed)
+        XCTAssertEqual(t, [
+            payload([0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]),
+            payload([0x0D, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00, 0x06]),
+            payload([0x37, 0x00, 0x06, 0x01, 0x2A, 0x00, 0x00, 0x06]),
+            payload([0x61, 0x00, 0x06, 0x01, 0x54, 0x00, 0x00, 0x06]),
+            payload([0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]),
+        ])
     }
 
-    func testCustomColorTransactionSetsModeFirst() {
+    /// Rainbow off across the three profiles: addresses 0x04, 0x2E, 0x58.
+    func testSetRainbowTransaction() {
+        let t = GMMKTransaction.setRainbow(false)
+        XCTAssertEqual(t, [
+            payload([0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]),
+            payload([0x0B, 0x00, 0x06, 0x01, 0x04, 0x00, 0x00, 0x00]),
+            payload([0x35, 0x00, 0x06, 0x01, 0x2E, 0x00, 0x00, 0x00]),
+            payload([0x5F, 0x00, 0x06, 0x01, 0x58, 0x00, 0x00, 0x00]),
+            payload([0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]),
+        ])
+    }
+
+    /// Setting a colour also clears the rainbow flag, so it is two fields ×
+    /// three bases, field-major.
+    func testSetColorTransactionClearsRainbowFirst() {
+        let t = GMMKTransaction.setColor(RGB(red: 0xFF, green: 0x88, blue: 0x00))
+        XCTAssertEqual(t.count, 8)
+        XCTAssertEqual(t[1...3].map { $0[4] }, [0x04, 0x2E, 0x58])   // rainbow
+        XCTAssertEqual(t[4...6].map { $0[4] }, [0x05, 0x2F, 0x59])   // colour
+        XCTAssertEqual(t[1], payload([0x0B, 0x00, 0x06, 0x01, 0x04, 0x00, 0x00, 0x00]))
+        XCTAssertEqual(t[5], payload([0xBF, 0x01, 0x06, 0x03, 0x2F, 0x00, 0x00, 0xFF, 0x88, 0x00]))
+    }
+
+    /// The whole smoke test, byte for byte: mode, brightness, rainbow, colour —
+    /// each at 0x00 / 0x2A / 0x54 — inside one START/END pair. The profile-0
+    /// packets are the `docs/protocol.md` §2.2 example unchanged.
+    func testSolidColorTransactionIsFieldMajorAcrossProfiles() {
+        let t = GMMKTransaction.solidColor(RGB(red: 0xFF, green: 0x88, blue: 0x00))
+        XCTAssertEqual(t, [
+            payload([0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]),                       // START
+            payload([0x0D, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00, 0x06]),                 // mode
+            payload([0x37, 0x00, 0x06, 0x01, 0x2A, 0x00, 0x00, 0x06]),
+            payload([0x61, 0x00, 0x06, 0x01, 0x54, 0x00, 0x00, 0x06]),
+            payload([0x0C, 0x00, 0x06, 0x01, 0x01, 0x00, 0x00, 0x04]),                 // brightness
+            payload([0x36, 0x00, 0x06, 0x01, 0x2B, 0x00, 0x00, 0x04]),
+            payload([0x60, 0x00, 0x06, 0x01, 0x55, 0x00, 0x00, 0x04]),
+            payload([0x0B, 0x00, 0x06, 0x01, 0x04, 0x00, 0x00, 0x00]),                 // rainbow off
+            payload([0x35, 0x00, 0x06, 0x01, 0x2E, 0x00, 0x00, 0x00]),
+            payload([0x5F, 0x00, 0x06, 0x01, 0x58, 0x00, 0x00, 0x00]),
+            payload([0x95, 0x01, 0x06, 0x03, 0x05, 0x00, 0x00, 0xFF, 0x88, 0x00]),     // colour
+            payload([0xBF, 0x01, 0x06, 0x03, 0x2F, 0x00, 0x00, 0xFF, 0x88, 0x00]),
+            payload([0xE9, 0x01, 0x06, 0x03, 0x59, 0x00, 0x00, 0xFF, 0x88, 0x00]),
+            payload([0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]),                       // END
+        ])
+    }
+
+    /// Every operation is bracketed exactly once and writes 3 packets per field.
+    func testEveryOperationIsBracketedAndTripled() {
+        let operations: [(String, [[UInt8]], Int)] = [
+            ("setMode",       GMMKTransaction.setMode(.fixed), 1),
+            ("setModeID",     GMMKTransaction.setModeID(0x06), 1),
+            ("setBrightness", GMMKTransaction.setBrightness(level: 2), 1),
+            ("setDelay",      GMMKTransaction.setDelay(1), 1),
+            ("setDirection",  GMMKTransaction.setDirection(.left), 1),
+            ("setRainbow",    GMMKTransaction.setRainbow(true), 1),
+            ("setColor",      GMMKTransaction.setColor(.black), 2),
+            ("solidColor",    GMMKTransaction.solidColor(.black), 4),
+        ]
+        for (name, packets, fieldCount) in operations {
+            XCTAssertEqual(packets.count, 2 + fieldCount * 3, "\(name) packet count")
+            XCTAssertEqual(packets.first, GMMKPacket.start(), "\(name) START")
+            XCTAssertEqual(packets.last, GMMKPacket.end(), "\(name) END")
+            for packet in packets.dropFirst().dropLast() {
+                XCTAssertEqual(packet[2], GMMKPacket.Command.writeConfig, "\(name) command")
+            }
+        }
+    }
+
+    func testCustomColorTransactionSetsModeAtEveryProfileFirst() {
         let t = GMMKTransaction.customColors(startKeyIndex: 1, colors: [RGB.black])
-        XCTAssertEqual(t.count, 3 + 1)
+        XCTAssertEqual(t.count, 3 + 3)
         XCTAssertEqual(t[0], GMMKPacket.start())
-        XCTAssertEqual(t[1], GMMKPacket.setMode(.custom))
-        XCTAssertEqual(t[2][2], 0x11)
-        XCTAssertEqual(t[3], GMMKPacket.end())
+        XCTAssertEqual(Array(t[1...3]),
+                       GMMKPacket.atEveryProfile { GMMKPacket.setMode(.custom, profileBase: $0) })
+        XCTAssertEqual(t[4][2], 0x11)
+        XCTAssertEqual(t[5], GMMKPacket.end())
     }
 }

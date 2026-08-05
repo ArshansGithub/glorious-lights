@@ -26,6 +26,20 @@ import Foundation
 ///
 /// The checksum is nonetheless defined over the *wire* form (bytes 3…63), which
 /// is exactly payload bytes 2…62 — i.e. every byte after the checksum field.
+///
+/// > Transport note: the transport re-attaches the `0x04` byte before calling
+/// > `IOHIDDeviceSetReport`, because macOS does **not** prepend the report ID on
+/// > this vendor pipe — see ``GMMKHID/GMMKKeyboard/send(payload:)`` and
+/// > `docs/protocol.md` §6. Builders stay at 63 bytes; only the transport knows.
+///
+/// ## Profile-relative addressing
+///
+/// Config-RAM addresses are **offsets within a profile block**, not absolute
+/// addresses. There are three 42-byte (`0x2A`) blocks at ``profileBases``, and
+/// the effect engine reads its parameters from whichever profile the board is
+/// currently running. Since nothing on this firmware reliably reports *which*
+/// profile that is (see ``Command/readProfile``), the library writes every
+/// logical change at all three bases — see ``GMMKTransaction``.
 public enum GMMKPacket {
 
     /// The HID report ID all lighting commands use (wire byte 0).
@@ -95,9 +109,14 @@ public enum GMMKPacket {
         public static let start: UInt8 = 0x01
         /// End / commit a transaction.
         public static let end: UInt8 = 0x02
-        /// Read a profile block.
+        /// Read a 44-byte block.
+        ///
+        /// On the GMMK 1 TKL running firmware 1.08 this does **not** return the
+        /// config block the community tools describe: it answers with a
+        /// device-info block (`55 aa` magic, VID/PID, firmware version, then the
+        /// list of supported mode IDs). Use ``readConfig`` to read config RAM.
         public static let readProfile: UInt8 = 0x03
-        /// Read config RAM.
+        /// Read config RAM by address. Works as documented on firmware 1.08.
         public static let readConfig: UInt8 = 0x05
         /// Write config RAM (all lighting parameters).
         public static let writeConfig: UInt8 = 0x06
@@ -107,8 +126,11 @@ public enum GMMKPacket {
         public static let writeCustomColors: UInt8 = 0x11
     }
 
-    /// Config-RAM addresses within profile 1. See `docs/protocol.md` §2.
-    public enum ConfigAddress {
+    /// Field offsets **within a profile block**. See `docs/protocol.md` §2.
+    ///
+    /// A field's wire address is `profileBase + offset`; the offsets alone are
+    /// only valid for profile 0.
+    public enum ConfigOffset {
         public static let mode: UInt16 = 0x00
         public static let brightness: UInt16 = 0x01
         public static let delay: UInt16 = 0x02
@@ -117,6 +139,33 @@ public enum GMMKPacket {
         public static let color: UInt16 = 0x05
         public static let reactiveVariant: UInt16 = 0x08
         public static let pollingRate: UInt16 = 0x0F
+    }
+
+    // MARK: - Profiles
+
+    /// Distance between consecutive profile blocks in config RAM: 42 bytes.
+    ///
+    /// Not to be confused with the 44-byte (`0x2C`) transfer size commands
+    /// `0x03`/`0x04` use — that is a block transfer length, not a stride.
+    public static let profileStride: UInt16 = 0x2A
+
+    /// Config-RAM base address of each onboard profile: `0x0000`, `0x002A`,
+    /// `0x0054`.
+    ///
+    /// The board applies the fields of whichever profile it is running, and on
+    /// firmware 1.08 there is no reliable way to ask which one that is — command
+    /// `0x03` returns a device-info block rather than the config block that
+    /// holds the active-profile byte. Writing a field at every base sidesteps
+    /// the question entirely and is what ``GMMKTransaction`` does.
+    public static let profileBases: [UInt16] = [0, profileStride, profileStride * 2]
+
+    /// Applies a profile-base-taking builder once per entry in ``profileBases``.
+    ///
+    /// ```swift
+    /// GMMKPacket.atEveryProfile { GMMKPacket.setMode(.fixed, profileBase: $0) }
+    /// ```
+    public static func atEveryProfile(_ build: (UInt16) -> [UInt8]) -> [[UInt8]] {
+        profileBases.map(build)
     }
 
     // MARK: - Transaction bracketing
@@ -133,82 +182,94 @@ public enum GMMKPacket {
 
     // MARK: - Config writes
 
-    /// Sets the onboard effect mode (config `0x00`).
-    public static func setMode(_ mode: LightingMode) -> [UInt8] {
-        make(command: Command.writeConfig, address: ConfigAddress.mode, data: [mode.rawValue])
+    /// Writes one config field at `profileBase + offset`.
+    private static func writeConfig(_ offset: UInt16,
+                                    _ profileBase: UInt16,
+                                    _ data: [UInt8]) -> [UInt8] {
+        make(command: Command.writeConfig, address: profileBase &+ offset, data: data)
     }
 
-    /// Sets the raw effect-mode ID (config `0x00`). Valid IDs are `0x01`…`0x14`.
-    public static func setModeID(_ id: UInt8) -> [UInt8] {
-        make(command: Command.writeConfig, address: ConfigAddress.mode, data: [id])
+    /// Sets the onboard effect mode (config offset `0x00`).
+    ///
+    /// - Parameter profileBase: one of ``profileBases``; defaults to profile 0.
+    ///   Only the *running* profile's mode is displayed, so prefer
+    ///   ``GMMKTransaction/setMode(_:)`` over calling this for one base.
+    public static func setMode(_ mode: LightingMode, profileBase: UInt16 = 0) -> [UInt8] {
+        writeConfig(ConfigOffset.mode, profileBase, [mode.rawValue])
     }
 
-    /// Sets brightness (config `0x01`).
+    /// Sets the raw effect-mode ID (config offset `0x00`). Valid IDs are `0x01`…`0x14`.
+    public static func setModeID(_ id: UInt8, profileBase: UInt16 = 0) -> [UInt8] {
+        writeConfig(ConfigOffset.mode, profileBase, [id])
+    }
+
+    /// Sets brightness (config offset `0x01`).
+    ///
+    /// Verified to apply live and globally on firmware 1.08, unlike mode and
+    /// colour, which are read from the running profile.
     ///
     /// - Parameter level: `0`…`4`; **`0` is off**, `4` is maximum. Clamped.
-    public static func setBrightness(level: UInt8) -> [UInt8] {
-        make(command: Command.writeConfig,
-             address: ConfigAddress.brightness,
-             data: [min(level, Brightness.max)])
+    public static func setBrightness(level: UInt8, profileBase: UInt16 = 0) -> [UInt8] {
+        writeConfig(ConfigOffset.brightness, profileBase, [min(level, Brightness.max)])
     }
 
-    /// Sets the animation delay (config `0x02`).
+    /// Sets the animation delay (config offset `0x02`).
     ///
     /// This is a *delay*, not a speed: **higher is slower**. `0`…`3` are the
     /// values known to be meaningful; larger values are accepted by the
     /// firmware but untested. Clamped to `0`…`3`.
-    public static func setDelay(_ delay: UInt8) -> [UInt8] {
-        make(command: Command.writeConfig,
-             address: ConfigAddress.delay,
-             data: [min(delay, Delay.max)])
+    public static func setDelay(_ delay: UInt8, profileBase: UInt16 = 0) -> [UInt8] {
+        writeConfig(ConfigOffset.delay, profileBase, [min(delay, Delay.max)])
     }
 
-    /// Sets the effect direction (config `0x03`).
+    /// Sets the effect direction (config offset `0x03`).
     ///
     /// The concrete meaning is per-effect: some effects read it as up/down or
     /// inward/outward rather than left/right.
-    public static func setDirection(_ direction: Direction) -> [UInt8] {
-        make(command: Command.writeConfig,
-             address: ConfigAddress.direction,
-             data: [direction.rawValue])
+    public static func setDirection(_ direction: Direction, profileBase: UInt16 = 0) -> [UInt8] {
+        writeConfig(ConfigOffset.direction, profileBase, [direction.rawValue])
     }
 
-    /// Sets the "colorful" / rainbow flag (config `0x04`).
+    /// Sets the "colorful" / rainbow flag (config offset `0x04`).
     ///
     /// When on, the effect cycles hues and ignores the solid colour; when off
-    /// it uses the colour at config `0x05`.
-    public static func setRainbow(_ on: Bool) -> [UInt8] {
-        make(command: Command.writeConfig,
-             address: ConfigAddress.rainbow,
-             data: [on ? 0x01 : 0x00])
+    /// it uses the colour at config offset `0x05`.
+    public static func setRainbow(_ on: Bool, profileBase: UInt16 = 0) -> [UInt8] {
+        writeConfig(ConfigOffset.rainbow, profileBase, [on ? 0x01 : 0x00])
     }
 
-    /// Sets the solid / animation colour (config `0x05`…`0x07`).
+    /// Sets the solid / animation colour (config offsets `0x05`…`0x07`).
     ///
-    /// Only visible when the rainbow flag is off.
-    public static func setColor(red: UInt8, green: UInt8, blue: UInt8) -> [UInt8] {
-        make(command: Command.writeConfig,
-             address: ConfigAddress.color,
-             data: [red, green, blue])
+    /// Byte order is R, G, B — verified on hardware. Only visible when the
+    /// rainbow flag is off.
+    public static func setColor(red: UInt8, green: UInt8, blue: UInt8,
+                                profileBase: UInt16 = 0) -> [UInt8] {
+        writeConfig(ConfigOffset.color, profileBase, [red, green, blue])
     }
 
-    /// Sets the reactive-colour variant (config `0x08`), meaningful only in
-    /// mode `0x11` (reactive colour).
-    public static func setReactiveVariant(_ variant: ReactiveVariant) -> [UInt8] {
-        make(command: Command.writeConfig,
-             address: ConfigAddress.reactiveVariant,
-             data: [variant.rawValue])
+    /// Sets the reactive-colour variant (config offset `0x08`), meaningful only
+    /// in mode `0x11` (reactive colour).
+    public static func setReactiveVariant(_ variant: ReactiveVariant,
+                                          profileBase: UInt16 = 0) -> [UInt8] {
+        writeConfig(ConfigOffset.reactiveVariant, profileBase, [variant.rawValue])
     }
 
-    /// Sets the USB polling rate (config `0x0F`). Not a lighting setting;
+    /// Sets the USB polling rate (config offset `0x0F`). Not a lighting setting;
     /// exposed for completeness only.
-    public static func setPollingRate(_ rate: PollingRate) -> [UInt8] {
-        make(command: Command.writeConfig,
-             address: ConfigAddress.pollingRate,
-             data: [rate.rawValue])
+    public static func setPollingRate(_ rate: PollingRate, profileBase: UInt16 = 0) -> [UInt8] {
+        writeConfig(ConfigOffset.pollingRate, profileBase, [rate.rawValue])
     }
 
     // MARK: - Per-key colours
+
+    /// > Unresolved on firmware 1.08. The board **ACKs** `0x11` writes with
+    /// > status `0x00`, but nothing observed on the display path changes —
+    /// > writes at `address = keyIndex * 3` had no visible effect even in mode
+    /// > `0x14` (custom) with the whole array painted. Either the address space
+    /// > differs from the full-size boards these builders were derived from, or
+    /// > another step is needed to latch LED RAM. The builders below are kept
+    /// > because they are byte-correct against the community tools, but nothing
+    /// > in the app exposes them. See `docs/protocol-tkl-notes.md` §13.
 
     /// Maximum data bytes in one `0x11` packet: `(64 - 8) / 3 * 3`.
     public static let maxCustomColorBytesPerPacket = 54
