@@ -62,6 +62,24 @@ public final class GMMKKeyboard {
     /// especially during a per-key burst.
     public var interPacketDelay: TimeInterval = 0.002
 
+    /// Which USB channel carries command packets. `.vendorOutput` is the
+    /// documented default (Output report, ID 4, vendor interface). The other
+    /// cases are hardware bring-up probes for firmware revisions that only
+    /// listen on a different channel.
+    public enum TransportProbe: String {
+        /// Output report, ID 4, 63-byte payload, vendor interface (default).
+        case vendorOutput = "vendor-output"
+        /// Feature report, ID 4, 63-byte payload, vendor interface.
+        case vendorFeature = "vendor-feature"
+        /// Feature report, no report ID, full 64-byte packet (leading 0x04 is
+        /// a *data* byte), sent to the boot-keyboard interface's 64-byte
+        /// feature report instead of the vendor interface.
+        case bootFeature = "boot-feature"
+    }
+
+    /// Bring-up escape hatch; leave at `.vendorOutput` in production.
+    public var transportProbe: TransportProbe = .vendorOutput
+
     public init() {
         // `kIOHIDManagerOptionIndependentDevices` keeps `IOHIDManagerOpen` from
         // being propagated to every VID/PID match — otherwise starting the
@@ -86,7 +104,13 @@ public final class GMMKKeyboard {
     public func open() throws {
         if isConnected { return }
         IOHIDManagerSetDeviceMatching(manager, Self.matchingDictionary() as CFDictionary)
-        guard let found = Self.findVendorInterface(in: manager) else {
+        let wanted: IOHIDDevice?
+        if case .bootFeature = transportProbe {
+            wanted = Self.findBootConfigInterface(in: manager)
+        } else {
+            wanted = Self.findVendorInterface(in: manager)
+        }
+        guard let found = wanted else {
             throw GMMKHIDError.deviceNotFound
         }
         let result = IOHIDDeviceOpen(found, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -172,10 +196,30 @@ public final class GMMKKeyboard {
         }
         guard let device, isConnected else { throw GMMKHIDError.notConnected }
 
-        let result = payload.withUnsafeBufferPointer { buffer -> IOReturn in
+        let reportType: IOHIDReportType
+        let reportID: CFIndex
+        let bytes: [UInt8]
+        switch transportProbe {
+        case .vendorOutput:
+            reportType = kIOHIDReportTypeOutput
+            reportID = Self.reportID
+            bytes = payload
+        case .vendorFeature:
+            reportType = kIOHIDReportTypeFeature
+            reportID = Self.reportID
+            bytes = payload
+        case .bootFeature:
+            // No report ID on the boot interface's feature report; the wire
+            // packet's 0x04 is an ordinary data byte there.
+            reportType = kIOHIDReportTypeFeature
+            reportID = 0
+            bytes = [UInt8(Self.reportID)] + payload
+        }
+
+        let result = bytes.withUnsafeBufferPointer { buffer -> IOReturn in
             IOHIDDeviceSetReport(device,
-                                 kIOHIDReportTypeOutput,
-                                 Self.reportID,
+                                 reportType,
+                                 reportID,
                                  buffer.baseAddress!,
                                  buffer.count)
         }
@@ -268,6 +312,18 @@ public final class GMMKKeyboard {
     private static func findVendorInterface(in manager: IOHIDManager) -> IOHIDDevice? {
         guard let set = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return nil }
         return set.first(where: isVendorInterface)
+    }
+
+    /// The boot-keyboard interface that carries the 64-byte no-ID feature
+    /// report (bring-up probe target): same VID/PID, *not* the vendor
+    /// interface, and `MaxFeatureReportSize == 64`.
+    private static func findBootConfigInterface(in manager: IOHIDManager) -> IOHIDDevice? {
+        guard let set = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return nil }
+        return set.first { device in
+            guard !isVendorInterface(device) else { return false }
+            let size = IOHIDDeviceGetProperty(device, kIOHIDMaxFeatureReportSizeKey as CFString) as? Int
+            return size == 64
+        }
     }
 
     /// True if the device's usage pairs include usage page `0xFF1C` usage `0x92`.

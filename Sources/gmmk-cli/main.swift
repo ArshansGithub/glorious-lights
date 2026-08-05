@@ -57,6 +57,16 @@ let usage = """
 
 func withKeyboard(_ body: (GMMKKeyboard) throws -> Void) -> Never {
     let keyboard = GMMKKeyboard()
+    // Bring-up overrides; must be applied before `open()`, which selects the
+    // interface based on `transportProbe`.
+    if let raw = ProcessInfo.processInfo.environment["GMMK_PACKET_DELAY_MS"],
+       let ms = Double(raw) {
+        keyboard.interPacketDelay = ms / 1000.0
+    }
+    if let raw = ProcessInfo.processInfo.environment["GMMK_TRANSPORT"],
+       let probe = GMMKKeyboard.TransportProbe(rawValue: raw) {
+        keyboard.transportProbe = probe
+    }
     do {
         try keyboard.open()
     } catch let error as GMMKHIDError {
@@ -83,9 +93,18 @@ func withKeyboard(_ body: (GMMKKeyboard) throws -> Void) -> Never {
 }
 
 /// Sends a START-bracketed transaction and exits.
+///
+/// Timing overrides for hardware bring-up (both in milliseconds):
+/// `GMMK_PACKET_DELAY_MS` — pause between packets (default 2).
+/// `GMMK_SETTLE_MS` — pause after the last packet before the device is
+/// closed, so a queued OUT report can't be cancelled by the close (default 0).
 func send(_ packets: [[UInt8]], describing description: String) -> Never {
     withKeyboard { keyboard in
         try keyboard.send(packets: packets)
+        if let raw = ProcessInfo.processInfo.environment["GMMK_SETTLE_MS"],
+           let ms = Double(raw), ms > 0 {
+            Thread.sleep(forTimeInterval: ms / 1000.0)
+        }
         print(description)
     }
 }
@@ -192,6 +211,47 @@ case "rainbow":
     }
     send(GMMKTransaction.single(GMMKPacket.setRainbow(on)),
          describing: "rainbow -> \(on ? "on" : "off")")
+
+case "read":
+    // Bring-up/debug: read config RAM (command 0x05) and print the reply.
+    // Usage: read [addr-hex] [count-hex] — defaults: 0000, 38.
+    let addr = UInt16(rest.count > 0 ? rest[0] : "0000", radix: 16) ?? 0
+    let count = UInt8(rest.count > 1 ? rest[1] : "38", radix: 16) ?? 0x38
+    let keyboard = GMMKKeyboard()
+    if let raw = ProcessInfo.processInfo.environment["GMMK_TRANSPORT"],
+       let probe = GMMKKeyboard.TransportProbe(rawValue: raw) {
+        keyboard.transportProbe = probe
+    }
+    var sawReply = false
+    keyboard.onInputReport = { bytes in
+        sawReply = true
+        let hex = bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
+        print("reply (\(bytes.count) bytes): \(hex)")
+    }
+    keyboard.onConnect = {
+        do {
+            try keyboard.send(payload:
+                GMMKPacket.makeRead(command: GMMKPacket.Command.readConfig,
+                                    address: addr, count: count))
+            print("sent read: cmd 0x05 addr 0x\(String(format: "%04x", addr)) count 0x\(String(format: "%02x", count))")
+        } catch {
+            FileHandle.standardError.write("send failed: \(error)\n".data(using: .utf8)!)
+            exit(ExitCode.transport.rawValue)
+        }
+    }
+    keyboard.onOpenFailure = { error in
+        FileHandle.standardError.write("open failed: \(error.description)\n".data(using: .utf8)!)
+        exit(ExitCode.transport.rawValue)
+    }
+    keyboard.start(on: .current, mode: .defaultMode)
+    let deadline = Date(timeIntervalSinceNow: 2.0)
+    while Date() < deadline {
+        RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+        if sawReply { /* keep listening briefly for multi-packet replies */ }
+    }
+    if !sawReply { print("no reply within 2s") }
+    keyboard.stop()
+    exit(sawReply ? ExitCode.ok.rawValue : ExitCode.transport.rawValue)
 
 case "raw":
     guard !rest.isEmpty else {

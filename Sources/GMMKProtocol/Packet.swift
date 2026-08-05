@@ -69,6 +69,24 @@ public enum GMMKPacket {
         return p
     }
 
+    /// Builds a read-request packet: `count` is the number of bytes requested
+    /// starting at `address`; the data area is empty. The firmware answers on
+    /// the vendor Input report with the same framing.
+    ///
+    /// Only use with the read commands (`Command.readConfig`,
+    /// `Command.readProfile`, `Command.readCustomColors`).
+    public static func makeRead(command: UInt8, address: UInt16, count: UInt8) -> [UInt8] {
+        var p = [UInt8](repeating: 0, count: payloadLength)
+        p[2] = command
+        p[3] = count
+        p[4] = UInt8(address & 0xFF)
+        p[5] = UInt8((address >> 8) & 0xFF)
+        let sum = checksum(payloadBody: p[2...])
+        p[0] = UInt8(sum & 0xFF)
+        p[1] = UInt8((sum >> 8) & 0xFF)
+        return p
+    }
+
     // MARK: - Commands
 
     /// Command bytes (wire offset 3). Remap/macro commands are deliberately absent.
