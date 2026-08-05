@@ -659,10 +659,13 @@ The firmware echoes every command on **input report ID 4** with a **status byte
 at wire offset 7**: `0x00` = OK, `0xFF`/`0xFE` = error. This confirms Part 1 §2.5
 from the device side.
 
-Replies are **not required for a write to apply**: sequences that opened the
-device multiple times and never drained the input queue still applied instantly.
-Read them as a pass/fail oracle during bring-up; do not build the send path
-around them.
+Replies are **not required for a write to reach config RAM**: sequences that
+opened the device multiple times and never drained the input queue still took
+effect.
+
+> ⚠️ Refined by §13.7. A write being *stored* and a write being *applied* to the
+> running effect engine are different things, and pacing on these replies turns
+> out to be what makes the second happen. The send path **is** built around them.
 
 ## 13.3 Config writes are profile-relative — write all three bases
 
@@ -736,3 +739,41 @@ invariants the code is built around:
    for without them.
 
 `GMMKPacket.Command` deliberately does not name any of these.
+
+## 13.7 Packets must be paced, or writes are stored but never applied
+
+**This is a requirement, not a politeness.** A blind burst of config writes with
+2 ms gaps is accepted (every packet ACKs `0x00`) and lands in config RAM — a
+subsequent `0x05` read returns what was written — but the running effect engine
+**does not pick it up**. The lighting only changes at some later latch.
+
+Two pacings were observed to make the identical packets apply *instantly*:
+
+1. **~350 ms wall-clock gaps** between packets. Works, but a
+   solid-colour transaction is 14 packets, so this is ~5 s of latency.
+2. **Reply pacing** — after every `SetReport`, wait for the firmware's echo on
+   input report ID 4 before sending the next packet. **Verified end-to-end**
+   (`gmmk-cli probe2`) and this is what the official editor does: write, then
+   `hid_read` with a 300 ms timeout, retrying the same packet up to 4 times.
+   Echoes come back within a few milliseconds, so a whole transaction is still
+   imperceptible.
+
+(2) is the library's default, in `GMMKKeyboard.send(packets:)` via `ReplyPacer`.
+It supersedes the "replies are advisory" reading of §13.2: replies are not
+required for a write to be *stored*, which is what §13.2 observed, but they are
+what paces the sequence so it is *applied*.
+
+Implementation notes worth keeping:
+
+* A missed echo is **not** an error. The packet is re-sent up to 4 times and
+  then skipped, because a missed reply does not mean a missed write. Only an
+  explicit `0xFF`/`0xFE` status fails the transaction.
+* Once one packet has exhausted its attempts, the rest of the transaction falls
+  back to pacing (1) rather than waiting out a 300 ms timeout per packet —
+  otherwise one unresponsive device blocks the caller for ~17 s.
+* The device is scheduled on the run loop in a **private run-loop mode**, and
+  only that mode is pumped while waiting. Pumping the default mode from the
+  app's main thread would re-enter UI event delivery mid-transaction, letting a
+  second menu action start while the first is still going out.
+* `interPacketDelay` survives as an additional floor (default 0, CLI override
+  `GMMK_PACKET_DELAY_MS`), as does the 10 ms sleep before `END`.
