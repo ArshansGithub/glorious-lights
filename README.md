@@ -45,6 +45,7 @@ gmmk-cli color ffaa00        # solid color (also disables hue-cycling)
 gmmk-cli brightness 80       # 0–100
 gmmk-cli speed 4             # 1–5
 gmmk-cli direction l         # l / r
+gmmk-cli paint ffaa00        # custom mode: paint every per-key LED
 ```
 
 On first use macOS will ask for **Input Monitoring** permission

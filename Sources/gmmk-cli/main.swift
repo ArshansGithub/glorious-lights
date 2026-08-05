@@ -48,6 +48,8 @@ let usage = """
       color <RRGGBB>        Set the solid colour and turn the rainbow flag off
       direction <l|r>       Set the effect direction
       rainbow <on|off>      Set the rainbow (hue-cycling) flag
+      paint <RRGGBB>        Switch to custom mode (0x14) and paint every per-key
+                            LED that colour
 
       Each of these opens with a 0x03 "hello" read — without a recent one the
       firmware stores writes but never applies them — and then sends one
@@ -75,8 +77,10 @@ let usage = """
                             testing that macOS does not prepend the report ID.
       probe2                Replicate the official editor's session: one open,
                             read-before-write, reply drained after every packet.
-      probe3                Paint the whole per-key colour RAM (cmd 0x11). ACKed
-                            by the firmware but no display change was observed.
+      probe3                Paint the whole per-key colour RAM (cmd 0x11) over a
+                            hand-rolled transport. Superseded by `paint`, which
+                            does the same thing through the library; kept because
+                            it prints a per-packet status byte.
       raw <hex bytes...>    Send raw payload bytes — the escape hatch.
 
     RAW:
@@ -229,6 +233,17 @@ case "color", "colour":
     // keeps cycling hues and ignores the colour entirely.
     send(GMMKTransaction.setColor(rgb),
          describing: "color -> #\(rgb.hexString) (rainbow off)")
+
+case "paint":
+    let value = requireOneArgument("paint", "a hex colour, RRGGBB")
+    guard let rgb = RGB(hex: value) else {
+        fail("colour must be 6 hex digits (RRGGBB), got '\(value)'", .usage)
+    }
+    // Per-key colours are only visible in mode 0x14, which the transaction sets
+    // at all three profile bases before the colour run.
+    send(GMMKTransaction.paintUniform(rgb),
+         describing: "paint -> #\(rgb.hexString) on LED indices "
+                     + "\(GMMKKeyMap.minLEDIndex)-\(GMMKKeyMap.maxLEDIndex) (mode custom)")
 
 case "direction":
     let value = requireOneArgument("direction", "l or r")
