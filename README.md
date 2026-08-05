@@ -1,0 +1,96 @@
+# GMMK Lights
+
+Control the RGB lighting of the original **GMMK 1** (Glorious Modular Mechanical
+Keyboard, 2018–2021, SONiX `0x0C45:0x652F`) from macOS — the keyboard Glorious
+Core doesn't support and the official GMMK Editor (Windows-only) left behind.
+
+A native Swift menu-bar app plus a CLI. No drivers, no kernel extensions.
+
+## Why this exists
+
+Glorious CORE does not speak to the GMMK 1 at all (its device database starts at
+the GMMK Pro), and the legacy GMMK Editor is Windows-only. On a Mac, this
+keyboard was a brick, RGB-wise. This project reverse-engineered the missing
+pieces and implements the full lighting protocol natively.
+
+Along the way we discovered several things nobody had documented (see
+[`docs/protocol-tkl-notes.md`](docs/protocol-tkl-notes.md)):
+
+- macOS does **not** prepend the HID report ID on this device's output pipe —
+  every packet must be sent as the full 64-byte wire frame. Sent short, the
+  firmware's error replies get misparsed by macOS as **phantom keypresses**.
+- Config writes must target **all three onboard profile blocks** (42-byte
+  stride) to apply regardless of the active profile.
+- Writes only *latch* into the running effect after a **`0x03` device-info
+  "hello" read** — the session-opener the official editor sends on connect.
+- The firmware echoes every command with a **status byte** (offset 7):
+  `0x00` OK, `0xFF`/`0xFE` error. The transport paces on these echoes,
+  exactly like the official editor does.
+
+## Install
+
+```sh
+git clone <this repo>
+cd gmmk-lights
+swift build -c release
+```
+
+- **Menu-bar app:** `swift run -c release GMMKLightsApp` — effect picker,
+  brightness/speed sliders, color picker, hot-plug aware.
+- **CLI:** `swift run -c release gmmk-cli help`
+
+```sh
+gmmk-cli mode wave1          # any of the 20 onboard effects
+gmmk-cli color ffaa00        # solid color (also disables hue-cycling)
+gmmk-cli brightness 80       # 0–100
+gmmk-cli speed 4             # 1–5
+gmmk-cli direction l         # l / r
+```
+
+On first use macOS will ask for **Input Monitoring** permission
+(System Settings → Privacy & Security → Input Monitoring) — that's the gate for
+opening any HID interface of a keyboard-class device. Grant it and relaunch.
+
+## Compatibility
+
+Developed and hardware-verified against a **GMMK 1 TKL ANSI, firmware 1.08**.
+Full-size and Compact GMMK 1 boards share the same USB identity and protocol
+family and should work; per-effect color rendering varies between LED batches.
+GMMK Pro / GMMK 2 / GMMK 3 are **not** supported — those speak different
+protocols and have official macOS support via Glorious CORE.
+
+## Safety
+
+The GMMK 1's SN32 microcontroller exposes its flash bootloader via feature
+reports on the boot-keyboard interface. This project **never** sends feature
+reports there, never sends the keymap/macro command family, and never sends the
+four undocumented no-argument commands — see
+[`docs/protocol-tkl-notes.md`](docs/protocol-tkl-notes.md) §4 and §10 for what
+those hazards are. If your lighting ever ends up in a weird state, unplug and
+replug the keyboard; factory reset is `FN+ESC` then `F1+F3+F5`.
+
+## Project layout
+
+| Target | What it is |
+|---|---|
+| `GMMKProtocol` | Pure packet builders + checksum; golden-byte unit tests |
+| `GMMKHID` | IOKit HID transport: vendor-interface matching, 64-byte frames, hello-read session opener, echo-paced sends |
+| `gmmk-cli` | User commands plus the bring-up/debug toolkit (`probe0`–`probe3`, `read`, `raw`) |
+| `GMMKLightsApp` | The menu-bar app |
+| `docs/` | The protocol references — likely the most complete public documentation of this keyboard's protocol |
+
+## Attribution
+
+The wire protocol was reverse-engineered with the help of three earlier
+open-source projects — [`paulguy/gmmkctl`](https://github.com/paulguy/gmmkctl)
+(GPL-3.0), [`dokutan/rgb_keyboard`](https://github.com/dokutan/rgb_keyboard)
+(GPL-3.0-or-later, whose effect names this project's UI uses), and
+[`hangrydave/GKeyboardController`](https://github.com/hangrydave/GKeyboardController)
+(GPL-3.0) — and by static analysis of the official (freely distributed) GMMK
+Editor for interoperability. **No code from any of them was copied**; every
+line here is original Swift, and the macOS-specific findings are new. Details in
+[`docs/attribution.md`](docs/attribution.md).
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
