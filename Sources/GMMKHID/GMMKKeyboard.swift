@@ -92,7 +92,18 @@ public final class GMMKKeyboard {
     /// the firmware ever answering. The write has probably still landed in
     /// config RAM, but it may not have been applied — worth surfacing in a
     /// bring-up log, not worth failing a transaction over.
+    ///
+    /// `packetIndex` is the packet's position in the transaction, or
+    /// ``sessionOpenerIndex`` for the hello read that precedes it.
     public var onUnacknowledgedPacket: ((_ packetIndex: Int, _ attempts: Int) -> Void)?
+
+    /// What the keyboard last said about itself, from the session opener's
+    /// reply. `nil` until one has succeeded.
+    public private(set) var deviceInfo: GMMKDeviceInfo?
+
+    /// The `packetIndex` reported for the session opener, which has no position
+    /// in the caller's transaction.
+    public static let sessionOpenerIndex = -1
 
     /// Which USB channel carries command packets. `.vendorOutput` is the
     /// documented default (Output report, ID 4, vendor interface). The other
@@ -275,16 +286,93 @@ public final class GMMKKeyboard {
         }
     }
 
-    /// Sends a sequence of payloads (e.g. a whole `START` … `END` transaction),
-    /// **waiting for each packet's echo before sending the next**.
+    /// The hello read every session opens with: command `0x03`, count `0x2C`,
+    /// address 0 — the device-info read the official editor issues on connect.
+    public static let sessionOpenerPacket = GMMKPacket.makeRead(
+        command: GMMKPacket.Command.readProfile, address: 0, count: 0x2C)
+
+    /// What one paced packet produced.
+    private struct PacedResult {
+        /// The firmware's reply, if one arrived.
+        var reply: [UInt8]?
+        /// Whether this packet exhausted its attempts without any reply.
+        var wentSilent: Bool
+    }
+
+    /// Sends one packet and waits for its echo, per ``ReplyPacer``.
     ///
-    /// The pacing is not politeness, it is what makes the write take effect.
-    /// Firmware 1.08 stores a blindly-bursted config write into config RAM but
-    /// does not latch it into the running effect engine; the same packets apply
-    /// instantly when each one waits for its echo. Echoes arrive within a few
-    /// milliseconds, so a transaction still completes in well under the time a
-    /// user would notice. See ``ReplyPacer`` and `docs/protocol-tkl-notes.md`
-    /// §13.7.
+    /// - Parameter blind: skip waiting entirely — used once the firmware has
+    ///   stopped answering, when a wait can only cost time.
+    /// - Throws: ``GMMKHIDError/commandRejected(status:packetIndex:)`` if the
+    ///   firmware refuses the packet.
+    private func sendPaced(_ packet: [UInt8],
+                           packetIndex: Int,
+                           blind: Bool = false) throws -> PacedResult {
+        var received: [UInt8]?
+        let outcome = try ReplyPacer.send(
+            maxAttempts: blind ? 1 : maxSendAttempts,
+            transmit: { [self] in
+                latestReply = nil
+                try send(payload: packet)
+            },
+            awaitReply: { [self] in
+                guard !blind else { return nil }
+                received = awaitReply(timeout: replyTimeout)
+                return received
+            })
+        switch outcome {
+        case .acknowledged:
+            return PacedResult(reply: received, wentSilent: false)
+        case .rejected(let status, _):
+            throw GMMKHIDError.commandRejected(status: status, packetIndex: packetIndex)
+        case .unacknowledged(let attempts):
+            onUnacknowledgedPacket?(packetIndex, attempts)
+            return PacedResult(reply: nil, wentSilent: true)
+        }
+    }
+
+    /// Sends the session-opening hello read and records ``deviceInfo``.
+    ///
+    /// **Config writes only latch if the firmware has recently answered a
+    /// `0x03` read.** A write-only transaction is accepted and stored in config
+    /// RAM but never applied to the running effect; the same transaction
+    /// preceded by this read applies instantly. Verified twice on fw 1.08, and
+    /// it is what the official editor does on connect.
+    ///
+    /// ``send(packets:)`` calls this itself, so callers rarely need to.
+    ///
+    /// - Returns: the parsed info block, or `nil` if the keyboard did not answer
+    ///   or answered with something that is not an info block. Both are
+    ///   non-fatal: the read has still been *issued*, which is what the latch
+    ///   depends on.
+    @discardableResult
+    public func openSession() throws -> GMMKDeviceInfo? {
+        try openSessionReportingSilence().info
+    }
+
+    /// ``openSession()``, also reporting whether the keyboard answered at all.
+    private func openSessionReportingSilence() throws -> (info: GMMKDeviceInfo?, wentSilent: Bool) {
+        let result = try sendPaced(Self.sessionOpenerPacket,
+                                   packetIndex: Self.sessionOpenerIndex)
+        if let reply = result.reply, let info = GMMKDeviceInfo(reply: reply) {
+            deviceInfo = info
+            return (info, result.wentSilent)
+        }
+        return (nil, result.wentSilent)
+    }
+
+    /// Sends a sequence of payloads (e.g. a whole `START` … `END` transaction),
+    /// preceded by the session-opening hello read and **waiting for each
+    /// packet's echo before sending the next**.
+    ///
+    /// Two things here are load-bearing rather than polite, both verified on
+    /// firmware 1.08:
+    ///
+    /// * **The hello read.** Without a recent `0x03` read the writes are stored
+    ///   in config RAM and never applied. See ``openSession()``.
+    /// * **The pacing.** Echoes arrive within a few milliseconds, so a whole
+    ///   transaction still completes faster than a user would notice. See
+    ///   ``ReplyPacer`` and `docs/protocol-tkl-notes.md` §13.7–13.8.
     ///
     /// A packet the firmware never answers is re-sent up to ``maxSendAttempts``
     /// times and then skipped — ``onUnacknowledgedPacket`` reports it — because
@@ -305,38 +393,27 @@ public final class GMMKKeyboard {
         // ~350 ms gap, no waiting.
         var replyChannelIsSilent = false
         do {
+            // The hello read comes first, and its own silence is worth
+            // respecting: a board that will not answer this will not answer the
+            // writes either.
+            replyChannelIsSilent = try openSessionReportingSilence().wentSilent
+
             for (index, packet) in packets.enumerated() {
-                if index > 0 {
-                    let floor = replyChannelIsSilent
-                        ? Swift.max(interPacketDelay, Self.blindPacingDelay)
-                        : interPacketDelay
-                    if floor > 0 { Thread.sleep(forTimeInterval: floor) }
-                }
+                let floor = replyChannelIsSilent
+                    ? Swift.max(interPacketDelay, Self.blindPacingDelay)
+                    : interPacketDelay
+                if floor > 0 { Thread.sleep(forTimeInterval: floor) }
                 // The official editor sleeps 10 ms before END (the commit) —
                 // docs/protocol-tkl-notes.md §2.6. Match it.
                 if index > 0, packet.count == GMMKPacket.payloadLength,
                    packet[2] == GMMKPacket.Command.end, packet[3] == 0 {
                     Thread.sleep(forTimeInterval: 0.010)
                 }
-                let outcome = try ReplyPacer.send(
-                    maxAttempts: replyChannelIsSilent ? 1 : maxSendAttempts,
-                    transmit: { [self] in
-                        latestReply = nil
-                        try send(payload: packet)
-                        sentAny = true
-                    },
-                    awaitReply: { [self] in
-                        replyChannelIsSilent ? nil : awaitReply(timeout: replyTimeout)
-                    })
-                switch outcome {
-                case .acknowledged:
-                    break
-                case .rejected(let status, _):
-                    throw GMMKHIDError.commandRejected(status: status, packetIndex: index)
-                case .unacknowledged(let attempts):
-                    replyChannelIsSilent = true
-                    onUnacknowledgedPacket?(index, attempts)
-                }
+                sentAny = true
+                let result = try sendPaced(packet,
+                                           packetIndex: index,
+                                           blind: replyChannelIsSilent)
+                if result.wentSilent { replyChannelIsSilent = true }
             }
         } catch {
             if sentAny, packets.first == GMMKPacket.start(), packets.last == GMMKPacket.end() {
@@ -344,6 +421,32 @@ public final class GMMKKeyboard {
             }
             throw error
         }
+    }
+
+    // MARK: - Reading
+
+    /// Sends a read command and returns the firmware's reply as delivered.
+    ///
+    /// Synchronous: the reply is collected by pumping the private reply mode,
+    /// the same way ``send(packets:)`` paces, so this works from a caller that
+    /// never runs its own run loop.
+    ///
+    /// - Parameters:
+    ///   - command: a read command. `0x05` reads config RAM by address; `0x03`
+    ///     returns the device-info block on firmware 1.08, not the config block.
+    ///   - address: 16-bit address, little-endian on the wire.
+    ///   - count: number of bytes requested.
+    /// - Returns: the reply report, normally 64 bytes with the report ID intact.
+    /// - Throws: ``GMMKHIDError/noReply(attempts:)`` if the keyboard never
+    ///   answered — unlike a write, a read with no reply has produced nothing.
+    public func readRaw(command: UInt8, address: UInt16, count: UInt8) throws -> [UInt8] {
+        let result = try sendPaced(
+            GMMKPacket.makeRead(command: command, address: address, count: count),
+            packetIndex: 0)
+        guard let reply = result.reply else {
+            throw GMMKHIDError.noReply(attempts: maxSendAttempts)
+        }
+        return reply
     }
 
     /// Blocks until an input report arrives or `timeout` elapses, running only

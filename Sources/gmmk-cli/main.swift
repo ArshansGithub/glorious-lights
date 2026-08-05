@@ -49,9 +49,12 @@ let usage = """
       direction <l|r>       Set the effect direction
       rainbow <on|off>      Set the rainbow (hue-cycling) flag
 
-      Each of these sends one START/END transaction that writes its fields at all
-      three profile bases (0x00, 0x2A, 0x54), so the change applies whichever
-      profile the board is running. See docs/protocol-tkl-notes.md §13.
+      Each of these opens with a 0x03 "hello" read — without a recent one the
+      firmware stores writes but never applies them — and then sends one
+      START/END transaction writing its fields at all three profile bases (0x00,
+      0x2A, 0x54), so the change applies whichever profile the board is running.
+      Packets are paced on the firmware's replies. See docs/protocol-tkl-notes.md
+      §13.
 
     DEBUG / BRING-UP:
       These exist to investigate the protocol, not to use the keyboard. They talk
@@ -59,12 +62,13 @@ let usage = """
 
       read [addr] [count] [cmd]
                             Read and dump the reply (hex args; defaults 0000 38 05).
-                            cmd 05 reads config RAM by address and works as
-                            documented. cmd 03 does NOT return the config block on
-                            firmware 1.08 — it answers with a device-info block
-                            (55 aa magic, VID/PID, firmware version, supported
-                            mode IDs), so it cannot be used to read the active
-                            profile.
+                            Sent raw, without the hello read the user commands
+                            open with. cmd 05 reads config RAM by address and
+                            works as documented. cmd 03 does NOT return the config
+                            block on firmware 1.08 — it answers with a device-info
+                            block, which this command decodes (VID/PID, firmware
+                            version, supported mode IDs), so it cannot be used to
+                            read the active profile.
       probe0                Enumerate every HID service for 0c45:652f and find
                             which one answers on the input report.
       probe1                Send a 2-byte config write as a full 64-byte frame,
@@ -248,45 +252,27 @@ case "rainbow":
 case "read":
     // Bring-up/debug: read from the keyboard and print the reply.
     // Usage: read [addr-hex] [count-hex] [cmd-hex] — defaults: 0000, 38, 05.
-    // cmd 05 = config RAM by address; cmd 03 = 44-byte block (byte 10 of the
-    // block is the active-profile index — see docs/protocol-tkl-notes.md §9).
+    // cmd 05 = config RAM by address; cmd 03 = the device-info block on fw 1.08,
+    // NOT the config block — see docs/protocol-tkl-notes.md §13.4.
     let addr = UInt16(rest.count > 0 ? rest[0] : "0000", radix: 16) ?? 0
     let count = UInt8(rest.count > 1 ? rest[1] : "38", radix: 16) ?? 0x38
     let readCmd = UInt8(rest.count > 2 ? rest[2] : "05", radix: 16) ?? GMMKPacket.Command.readConfig
-    let keyboard = GMMKKeyboard()
-    if let raw = ProcessInfo.processInfo.environment["GMMK_TRANSPORT"],
-       let probe = GMMKKeyboard.TransportProbe(rawValue: raw) {
-        keyboard.transportProbe = probe
-    }
-    var sawReply = false
-    keyboard.onInputReport = { bytes in
-        sawReply = true
-        let hex = bytes.map { String(format: "%02x", $0) }.joined(separator: " ")
-        print("reply (\(bytes.count) bytes): \(hex)")
-    }
-    keyboard.onConnect = {
-        do {
-            try keyboard.send(payload:
-                GMMKPacket.makeRead(command: readCmd, address: addr, count: count))
-            print("sent read: cmd 0x\(String(format: "%02x", readCmd)) addr 0x\(String(format: "%04x", addr)) count 0x\(String(format: "%02x", count))")
-        } catch {
-            FileHandle.standardError.write("send failed: \(error)\n".data(using: .utf8)!)
-            exit(ExitCode.transport.rawValue)
+    withKeyboard { keyboard in
+        print("sent read: cmd 0x\(String(format: "%02x", readCmd)) "
+              + "addr 0x\(String(format: "%04x", addr)) "
+              + "count 0x\(String(format: "%02x", count))")
+        let reply = try keyboard.readRaw(command: readCmd, address: addr, count: count)
+        let hex = reply.map { String(format: "%02x", $0) }.joined(separator: " ")
+        print("reply (\(reply.count) bytes): \(hex)")
+        print("status: \(GMMKPacket.replyStatus(inReport: reply))")
+        if let info = GMMKDeviceInfo(reply: reply) {
+            print("device info: \(String(format: "%04x:%04x", info.vendorID, info.productID)) "
+                  + "fw \(info.firmwareVersionString)")
+            print("supported modes (\(info.supportedModeIDs.count)): "
+                  + info.supportedModeIDs.map { String(format: "0x%02x", $0) }
+                        .joined(separator: " "))
         }
     }
-    keyboard.onOpenFailure = { error in
-        FileHandle.standardError.write("open failed: \(error.description)\n".data(using: .utf8)!)
-        exit(ExitCode.transport.rawValue)
-    }
-    keyboard.start(on: .current, mode: .defaultMode)
-    let deadline = Date(timeIntervalSinceNow: 2.0)
-    while Date() < deadline {
-        RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
-        if sawReply { /* keep listening briefly for multi-packet replies */ }
-    }
-    if !sawReply { print("no reply within 2s") }
-    keyboard.stop()
-    exit(sawReply ? ExitCode.ok.rawValue : ExitCode.transport.rawValue)
 
 case "probe0":
     // Reply-channel diagnostic (docs/protocol-tkl-notes.md §6 Probe 0).

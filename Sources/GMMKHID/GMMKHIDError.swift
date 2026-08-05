@@ -18,6 +18,8 @@ public enum GMMKHIDError: Error, CustomStringConvertible {
     /// instead of accepting it. `packetIndex` is the packet's position in the
     /// transaction that was being sent.
     case commandRejected(status: UInt8, packetIndex: Int)
+    /// A read was sent `attempts` times and the keyboard never answered.
+    case noReply(attempts: Int)
 
     public var description: String {
         switch self {
@@ -51,6 +53,12 @@ public enum GMMKHIDError: Error, CustomStringConvertible {
                 \(String(format: "%02x", status)). The packet reached the firmware and \
                 was refused, so this is a malformed or unsupported command rather than a \
                 transport problem.
+                """
+        case .noReply(let attempts):
+            return """
+                The keyboard did not answer a read after \(attempts) attempts. The command \
+                was accepted by IOKit, so either the firmware ignored it or input reports \
+                are not reaching this process.
                 """
         }
     }
