@@ -135,8 +135,12 @@ profile block.
 
 Profile blocks are `0x2A` (42) bytes apart: profile 1 at `0x00`, profile 2 at
 `0x2A`, profile 3 at `0x54` (`rgb_keyboard/include/writers.cpp`).
-**`gmmkctl` only ever touches profile 1.** Use base `0x00` unless you
-deliberately want another profile.
+**`gmmkctl` only ever touches profile 1.**
+
+> ⚠️ Writing profile 1 only is **not** sufficient on the GMMK 1 TKL. The board
+> displays whichever profile it is running, and fw 1.08 will not tell you which
+> that is. Write every field at all three bases — see
+> [`protocol-tkl-notes.md`](protocol-tkl-notes.md) §13.
 
 The same map is confirmed from the other direction by `readers.cpp`, which
 issues `04 3d 00 05 38 00 00 00` (read 0x38 bytes at addr 0x0000) and then
@@ -374,38 +378,50 @@ The Linux tools use raw libusb interrupt transfers on interface 1, endpoint
   pairs include `(0xFF1C, 0x92)`** — that is interface B (NKRO + vendor).
   Never talk to the boot-keyboard interface.
 * Open with `kIOHIDOptionsTypeNone` (non-seizing).
-* Send with:
+* Send the **full 64-byte wire packet, leading `0x04` included**:
 
 ```c
 IOHIDDeviceSetReport(device,
                      kIOHIDReportTypeOutput,   // report type Output
                      4,                        // reportID = 4
-                     payload,                  // WITHOUT the leading 0x04
-                     63);                      // 63 bytes
+                     packet,                   // INCLUDING the leading 0x04
+                     64);                      // 64 bytes
 ```
 
-* **Strip the leading `0x04`.** The 64-byte wire packet's byte 0 *is* the
-  report ID; IOKit takes it as a separate argument. Pass `packet + 1` with
-  length `63`. (hidapi does exactly this internally, which is why hidapi-based
-  code passes 64 bytes with `data[0] = 0x04`.)
-* **Offsets shift by one** in the payload you hand to IOKit:
+* ⚠️ **Do not strip the leading `0x04`** — verified on hardware, fw 1.08.
+  The usual IOKit rule is that the report ID is passed as a separate argument
+  and omitted from the buffer, and an earlier revision of this document said to
+  pass `packet + 1` with length 63. That is **wrong for this pipe**: macOS does
+  not prepend the ID on the vendor interrupt OUT endpoint, so a 63-byte buffer
+  arrives at the firmware one byte short and every field is shifted.
+  Pass all 64 bytes with `0x04` first and the ID argument *also* set to 4.
+* The failure mode is distinctive and worth recognising: a short packet makes
+  the firmware answer with an error echo (status `0xFF`) that carries no report
+  ID prefix, which macOS then parses against the keyboard's *input* descriptor —
+  the symptom is a burst of **phantom keypresses**, not a silent no-op.
+* Offsets in the buffer are therefore just the wire offsets, unshifted:
 
-  | wire offset | macOS payload offset | field |
-  |---|---|---|
-  | 0 | — | report ID (parameter) |
-  | 1–2 | 0–1 | checksum LE |
-  | 3 | 2 | command |
-  | 4 | 3 | count |
-  | 5–6 | 4–5 | address LE |
-  | 7 | 6 | pad `0x00` |
-  | 8+ | 7+ | payload |
+  | wire / buffer offset | field |
+  |---|---|
+  | 0 | report ID `0x04` |
+  | 1–2 | checksum LE |
+  | 3 | command |
+  | 4 | count |
+  | 5–6 | address LE |
+  | 7 | pad `0x00` |
+  | 8+ | payload |
 
-* **Compute the checksum over the 64-byte form** (bytes 3–63), i.e. over
-  payload bytes 2–62, *before* stripping. Getting this wrong is the most
-  likely silent failure.
-* Replies arrive as Input reports with report ID 4, 63 bytes. Register an
-  `IOHIDDeviceRegisterInputReportCallback` if you want them; they are not
-  required for writes.
+* **Compute the checksum over bytes 3–63** of that same 64-byte buffer.
+  Getting this wrong is the most likely silent failure.
+* Replies arrive as Input reports with report ID 4. Register an
+  `IOHIDDeviceRegisterInputReportCallback` if you want them; they are **not**
+  required for writes to apply — verified on hardware, config writes take effect
+  immediately whether or not anything drains the input queue. The status byte is
+  at wire offset 7: `0x00` = OK, `0xFF` / `0xFE` = error.
+
+> An implementation may still keep its *builders* at 63 bytes and have the
+> transport re-attach the `0x04` — that is what this repo does — but what
+> reaches `IOHIDDeviceSetReport` must be 64 bytes.
 * macOS may require **Input Monitoring** (TCC) permission for the host process
   to open a HID keyboard device.
 * Pace the packets. The Linux tools do a blocking IN read after every OUT,

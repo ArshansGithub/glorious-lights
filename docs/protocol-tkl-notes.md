@@ -630,3 +630,109 @@ that we are writing to a non-active profile which the firmware never flushes.
 firmware honours profiles 1/2 for every field; whether config `0x0A` really is
 the profile byte in the `0x06` address space as well as through the `0x03`
 block (the RGB2-at-`+9` overlap in §9 is unresolved).
+
+---
+
+# Part 3 — Verified on hardware (2026-08-05, fw 1.08)
+
+Parts 1 and 2 are static analysis and inference. **This part is empirical**:
+everything below was observed on a GMMK 1 TKL, `0C45:652F`, firmware 1.08, and
+it takes precedence wherever it contradicts the earlier parts. It is also the
+behaviour the library in `Sources/` implements.
+
+## 13.1 Transport — 64 bytes, output report, vendor interface
+
+The only channel that works is an **Output report, report ID 4, on the vendor
+interface** (usage pair `0xFF1C`/`0x92`), where the `SetReport` payload is the
+**full 64-byte wire packet including the leading `0x04`**.
+
+macOS does *not* prepend the report ID on this pipe. Passing the bare 63 bytes —
+the ordinary IOKit convention, and what `protocol.md` §6 originally documented —
+delivers a packet one byte short, and the firmware answers with an **unprefixed
+error echo that macOS misparses as phantom keypresses**. That symptom is the
+signature of this specific mistake; it does not mean the board is rejecting the
+command's contents. Fixed in `GMMKKeyboard.send(payload:)`, `.vendorOutput` case.
+
+## 13.2 Replies are informative, not required
+
+The firmware echoes every command on **input report ID 4** with a **status byte
+at wire offset 7**: `0x00` = OK, `0xFF`/`0xFE` = error. This confirms Part 1 §2.5
+from the device side.
+
+Replies are **not required for a write to apply**: sequences that opened the
+device multiple times and never drained the input queue still applied instantly.
+Read them as a pass/fail oracle during bring-up; do not build the send path
+around them.
+
+## 13.3 Config writes are profile-relative — write all three bases
+
+Confirms Part 2 §8.1 empirically. A config field's address is
+`profileBase + fieldOffset`, with three bases **`0x0000`, `0x002A`, `0x0054`**
+(stride `0x2A` = 42). Field offsets are `protocol.md` §2: `+0` mode,
+`+1` brightness, `+2` delay, `+3` direction, `+4` rainbow, `+5` RGB (3 bytes,
+**R-G-B order verified**).
+
+The board applies the fields of the profile it is *running*, and §13.4 removes
+the only way to ask which that is. So **every logical operation writes its fields
+at all three bases inside one `START`/`END` transaction.** With that, mode,
+colour and rainbow all apply instantly; brightness applies globally and live
+regardless (its repetition is redundant but keeps the three profiles
+consistent). This resolves the Part 2 §9.1 symptom — mode changes that appeared
+to do nothing were landing in a profile the board was not running.
+
+Verified wire examples (checksum = sum of bytes 3‥63, little-endian at 1‥2):
+
+```
+mode 0x06 @ profile 1     04 37 00 06 01 2a 00 00 06
+rainbow off @ profile 1   04 35 00 06 01 2e 00 00 00
+RGB ff8800  @ profile 1   04 bf 01 06 03 2f 00 00 ff 88 00
+```
+
+## 13.4 Command `0x03` returns a device-info block on this firmware
+
+**This supersedes Part 2 §9.** On fw 1.08, `0x03` with count `0x2C` does **not**
+return the 44-byte config block. It returns a **device-info block**: `55 aa`
+magic, `ff`, one unidentified byte, VID and PID little-endian, firmware version
+little-endian, then the list of supported mode IDs.
+
+Consequences:
+
+* There is no active-profile byte to read, hence §13.3.
+* **Do not implement `SetActiveProfile` as a `0x03`/`0x04` read-modify-write.**
+  The Part 2 §9.2 sequence was decoded correctly from the official binary, but
+  its semantics do not hold on this firmware, and a `0x04` block write built
+  from a misread `0x03` reply would write 44 bytes of device-info garbage into
+  config RAM.
+* `0x05` (read config RAM by address) works as documented. Use it for reads.
+
+## 13.5 Per-key colour RAM (`0x11`) — ACKed, display path unresolved
+
+`0x11` writes are accepted with status `0x00`, including a full sweep of indices
+1‥126 at `address = keyIndex * 3`, but **nothing on the display changed** — not
+even with mode `0x14` (custom) set at all three profile bases first. So either
+the LED address space differs from the full-size boards the community key maps
+describe, or some further step latches LED RAM.
+
+The per-key builders stay in the library because they are byte-correct against
+those tools, and they are marked unresolved in their doc comments. **No UI
+exposes them.** Resolving this needs a from-blank, one-index-at-a-time sweep.
+
+## 13.6 Safety invariants — enforced, keep them enforced
+
+Unchanged from Part 1 §4 and Part 2 §10, restated because they are the
+invariants the code is built around:
+
+1. **Never send feature reports to the boot interface (interface 0).** That is
+   the SN32 ISP bootloader door and the path to a soft-brick. The transport
+   matches on the vendor usage pair only, and the `boot-feature` probe that
+   briefly existed during bring-up was deliberately deleted rather than left
+   behind a flag.
+2. **Never send commands `0x07`–`0x0A`** (keymap / macro tables) — out of scope,
+   and corrupting them is a bad day.
+3. **Never send commands `0x0B`–`0x0E`** — no-argument commands that the
+   official editor never sends. A no-argument command cannot be sent
+   "harmlessly small", and this is exactly where factory-reset and erase
+   functions live. There is nothing to gain: the full apply path is accounted
+   for without them.
+
+`GMMKPacket.Command` deliberately does not name any of these.
