@@ -309,6 +309,61 @@ final class PacketGoldenTests: XCTestCase {
         XCTAssertEqual(packets[2][4], 0x6F)
     }
 
+    // MARK: - Reply status
+
+    /// Builds a reply as the firmware delivers it: 64 bytes, report ID intact,
+    /// status at wire offset 7.
+    private func reply(status: UInt8, length: Int = 64) -> [UInt8] {
+        var report = [UInt8](repeating: 0, count: length)
+        let index = length == GMMKPacket.payloadLength
+            ? GMMKPacket.replyStatusOffset - 1
+            : GMMKPacket.replyStatusOffset
+        report[index] = status
+        return report
+    }
+
+    func testStatusOffsetIsSeven() {
+        XCTAssertEqual(GMMKPacket.replyStatusOffset, 7)
+    }
+
+    func testReplyStatusOK() {
+        XCTAssertEqual(GMMKPacket.replyStatus(inReport: reply(status: 0x00)), .ok)
+    }
+
+    /// The two values the official software treats as errors.
+    func testReplyStatusRejected() {
+        XCTAssertEqual(GMMKPacket.replyStatus(inReport: reply(status: 0xFF)), .rejected(0xFF))
+        XCTAssertEqual(GMMKPacket.replyStatus(inReport: reply(status: 0xFE)), .rejected(0xFE))
+    }
+
+    /// Anything else is reported distinctly but is not an error — the official
+    /// software only special-cases 0xFF and 0xFE.
+    func testReplyStatusOther() {
+        XCTAssertEqual(GMMKPacket.replyStatus(inReport: reply(status: 0x42)), .other(0x42))
+    }
+
+    /// A 63-byte delivery (report ID stripped) shifts the status one earlier.
+    /// Which form arrives is the OS's choice, not the protocol's.
+    func testReplyStatusInAnIDLessReport() {
+        let short = reply(status: 0xFF, length: GMMKPacket.payloadLength)
+        XCTAssertEqual(short[6], 0xFF)
+        XCTAssertEqual(GMMKPacket.replyStatus(inReport: short), .rejected(0xFF))
+    }
+
+    func testReplyStatusOfATooShortReport() {
+        XCTAssertEqual(GMMKPacket.replyStatus(inReport: []), .malformed)
+        XCTAssertEqual(GMMKPacket.replyStatus(inReport: [0x04, 0x00, 0x00]), .malformed)
+    }
+
+    /// A plain echo of a command carries the outgoing packet's zero pad at
+    /// offset 7, which reads as "accepted" — the same byte serves both
+    /// directions.
+    func testEchoOfAWriteReadsAsOK() {
+        let echo = [GMMKPacket.reportID] + GMMKPacket.setMode(.fixed, profileBase: 0x2A)
+        XCTAssertEqual(echo.count, 64)
+        XCTAssertEqual(GMMKPacket.replyStatus(inReport: echo), .ok)
+    }
+
     // MARK: - Profile bases
 
     /// Three 42-byte blocks at 0x0000 / 0x002A / 0x0054.

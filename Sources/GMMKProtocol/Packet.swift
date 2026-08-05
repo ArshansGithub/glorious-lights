@@ -168,6 +168,49 @@ public enum GMMKPacket {
         profileBases.map(build)
     }
 
+    // MARK: - Replies
+
+    /// What the firmware's echo says about the command that produced it.
+    public enum ReplyStatus: Equatable, Sendable {
+        /// The firmware accepted the command (status `0x00`).
+        case ok
+        /// The firmware rejected it: `0xFF` or `0xFE`.
+        case rejected(UInt8)
+        /// A status byte that is neither. Treated as accepted — the official
+        /// software only special-cases `0xFF` and `0xFE` — but reported
+        /// distinctly so bring-up can notice it.
+        case other(UInt8)
+        /// The report was too short to contain a status byte.
+        case malformed
+    }
+
+    /// Wire offset of the status byte in a reply. Same framing as a command:
+    /// the byte that is a zero pad on the way out is the status on the way back.
+    public static let replyStatusOffset = 7
+
+    /// Reads the status byte out of an input report.
+    ///
+    /// Firmware 1.08 echoes every command on input report ID 4 with the status
+    /// at wire offset 7. Input reports on this pipe arrive with the leading
+    /// `0x04` intact — the same asymmetry that makes ``payloadLength`` wrong for
+    /// `SetReport`, see `docs/protocol.md` §6 — so for a 64-byte report the
+    /// status is at index 7. A 63-byte report (ID stripped) is also accepted and
+    /// read one earlier, since which form arrives is a property of the OS rather
+    /// than of the protocol.
+    public static func replyStatus(inReport report: [UInt8]) -> ReplyStatus {
+        let index: Int
+        switch report.count {
+        case payloadLength: index = replyStatusOffset - 1
+        case let n where n > payloadLength: index = replyStatusOffset
+        default: return .malformed
+        }
+        switch report[index] {
+        case 0x00: return .ok
+        case 0xFF, 0xFE: return .rejected(report[index])
+        case let byte: return .other(byte)
+        }
+    }
+
     // MARK: - Transaction bracketing
 
     /// `04 01 00 01 00 …` — opens a transaction. Byte-exact and invariant.
