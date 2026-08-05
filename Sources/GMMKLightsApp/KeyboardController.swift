@@ -92,16 +92,17 @@ final class KeyboardController {
     }
 
     /// Switches to mode `custom` and paints every LED the target colour, with
-    /// the marked keys compensated — see ``SwitchCompensation``.
+    /// the marked keys compensated — see ``SwitchCompensation``, including what
+    /// the sign of `strength` means.
     ///
     /// Twelve packets rather than the usual five, so it gets its own throttle
     /// key: a strength drag must not be able to cancel a pending colour write.
     func paintCompensated(target: RGB,
-                          lynxLEDIndices: Set<UInt16>,
+                          markedLEDIndices: Set<UInt16>,
                           strength: Double,
                           throttleKey: String? = "paint") {
         send(GMMKTransaction.paintCompensated(target: target,
-                                              lynxLEDIndices: lynxLEDIndices,
+                                              markedLEDIndices: markedLEDIndices,
                                               strength: strength),
              throttleKey: throttleKey)
     }

@@ -1,22 +1,33 @@
 import XCTest
 @testable import GMMKProtocol
 
-/// The compensation curve, and the paint it feeds.
+/// The compensation curve — both directions — and the paint it feeds.
 final class SwitchCompensationTests: XCTestCase {
 
     private let orange = RGB(red: 0xFF, green: 0x88, blue: 0x00)
 
-    // MARK: - The curve
+    // MARK: - The no-op
 
-    /// Strength 0 is the identity: nothing is compensated.
+    /// Strength 0 is the identity in both branches, and it is where the slider
+    /// starts: opening the tuner must not change how the board looks.
     func testStrengthZeroLeavesTheColorAlone() {
-        for color in [orange, .black, RGB(red: 0x12, green: 0x34, blue: 0x56)] {
+        for color in [orange, .black, RGB(red: 0x12, green: 0x34, blue: 0x56),
+                      RGB(red: 0xFF, green: 0xFF, blue: 0xFF)] {
             XCTAssertEqual(SwitchCompensation.compensate(color, strength: 0), color)
+            XCTAssertEqual(SwitchCompensation.compensate(color, strength: -0.0), color)
         }
     }
 
-    /// Strength 1 pushes red to full and green and blue to nothing.
-    func testStrengthOneIsPureRed() {
+    func testDefaultStrengthIsNoCompensation() {
+        XCTAssertEqual(SwitchCompensation.defaultStrength, 0)
+        XCTAssertTrue(SwitchCompensation.strengthRange.contains(SwitchCompensation.defaultStrength))
+        XCTAssertEqual(SwitchCompensation.strengthRange, -1...1)
+    }
+
+    // MARK: - Positive: the marked keys are the tinted ones
+
+    /// Strength +1 pushes red to full and green and blue to nothing.
+    func testPositiveFullStrengthIsPureRed() {
         XCTAssertEqual(SwitchCompensation.compensate(orange, strength: 1),
                        RGB(red: 0xFF, green: 0x00, blue: 0x00))
         XCTAssertEqual(SwitchCompensation.compensate(.black, strength: 1),
@@ -25,69 +36,119 @@ final class SwitchCompensationTests: XCTestCase {
 
     /// r' = r + (255 - r)·s, g' = g·(1 - s), b' = b·(1 - s), rounded.
     /// For 80/40/20 at s = 0.5: 80 + 87.5 = 167.5 → 168; 20; 10.
-    func testHalfStrength() {
+    func testPositiveHalfStrength() {
         XCTAssertEqual(
             SwitchCompensation.compensate(RGB(red: 80, green: 40, blue: 20), strength: 0.5),
             RGB(red: 168, green: 20, blue: 10))
     }
 
     /// ff8800 at s = 0.25: red is already full, green 136 × 0.75 = 102.
-    func testQuarterStrengthOnOrange() {
+    func testPositiveQuarterStrengthOnOrange() {
         XCTAssertEqual(SwitchCompensation.compensate(orange, strength: 0.25),
                        RGB(red: 0xFF, green: 102, blue: 0))
     }
+
+    // MARK: - Negative: the marked keys are the true-colour ones
+
+    /// Strength −1 pulls red to nothing and pushes green to full. Blue is left
+    /// alone in this direction.
+    func testNegativeFullStrengthIsRedlessAndFullGreen() {
+        XCTAssertEqual(SwitchCompensation.compensate(orange, strength: -1),
+                       RGB(red: 0x00, green: 0xFF, blue: 0x00))
+        XCTAssertEqual(SwitchCompensation.compensate(RGB(red: 10, green: 20, blue: 30),
+                                                     strength: -1),
+                       RGB(red: 0, green: 255, blue: 30))
+    }
+
+    /// r' = r·(1 - |s|), g' = g + (255 - g)·|s|, b' = b.
+    /// For 80/40/20 at s = −0.5: 40; 40 + 107.5 = 147.5 → 148; 20 unchanged.
+    func testNegativeHalfStrength() {
+        XCTAssertEqual(
+            SwitchCompensation.compensate(RGB(red: 80, green: 40, blue: 20), strength: -0.5),
+            RGB(red: 40, green: 148, blue: 20))
+    }
+
+    /// The two directions genuinely differ: the same magnitude either way must
+    /// not produce the same colour.
+    func testTheTwoDirectionsDisagree() {
+        XCTAssertNotEqual(SwitchCompensation.compensate(orange, strength: 0.5),
+                          SwitchCompensation.compensate(orange, strength: -0.5))
+    }
+
+    /// Blue survives a negative compensation and is attenuated by a positive
+    /// one — the one asymmetry between the branches.
+    func testBlueIsUntouchedOnlyGoingNegative() {
+        let teal = RGB(red: 0x00, green: 0x80, blue: 0xC0)
+        XCTAssertEqual(SwitchCompensation.compensate(teal, strength: -0.5).blue, 0xC0)
+        XCTAssertEqual(SwitchCompensation.compensate(teal, strength: 0.5).blue, 96)
+    }
+
+    // MARK: - Rounding, range, clamping
 
     /// Rounding is to nearest, not truncation: 1 × 0.5 = 0.5 → 1.
     func testRoundingIsToNearest() {
         XCTAssertEqual(SwitchCompensation.compensate(RGB(red: 0, green: 1, blue: 3),
                                                      strength: 0.5),
                        RGB(red: 128, green: 1, blue: 2))   // 127.5 → 128, 1.5 → 2
+        // Negative: 1 × 0.5 = 0.5 → 1 for red, 254 + 0.5 = 254.5 → 255 for green.
+        XCTAssertEqual(SwitchCompensation.compensate(RGB(red: 1, green: 254, blue: 3),
+                                                     strength: -0.5),
+                       RGB(red: 1, green: 255, blue: 3))
     }
 
-    /// Red can only approach 255, never overflow it, and no channel underflows.
+    /// Neither branch overflows or underflows a channel, at any strength, and
+    /// both endpoints are exact.
     func testChannelsStayInRange() {
-        for step in 0...20 {
+        let extremes = [RGB(red: 255, green: 255, blue: 255), .black,
+                        RGB(red: 254, green: 1, blue: 1)]
+        for step in -20...20 {
             let s = Double(step) / 20.0
-            let c = SwitchCompensation.compensate(RGB(red: 254, green: 1, blue: 1), strength: s)
-            XCTAssertGreaterThanOrEqual(c.red, 254)
+            for color in extremes {
+                let c = SwitchCompensation.compensate(color, strength: s)
+                XCTAssertTrue((0...255).contains(Int(c.red)))
+                XCTAssertTrue((0...255).contains(Int(c.green)))
+                XCTAssertTrue((0...255).contains(Int(c.blue)))
+            }
         }
         XCTAssertEqual(SwitchCompensation.compensate(RGB(red: 255, green: 255, blue: 255),
                                                      strength: 1),
                        RGB(red: 255, green: 0, blue: 0))
+        XCTAssertEqual(SwitchCompensation.compensate(RGB(red: 255, green: 255, blue: 255),
+                                                     strength: -1),
+                       RGB(red: 0, green: 255, blue: 255))
     }
 
-    /// Out-of-range strengths clamp rather than producing nonsense.
+    /// Out-of-range strengths clamp at both ends rather than producing nonsense.
     func testStrengthIsClamped() {
-        XCTAssertEqual(SwitchCompensation.compensate(orange, strength: -3),
-                       SwitchCompensation.compensate(orange, strength: 0))
         XCTAssertEqual(SwitchCompensation.compensate(orange, strength: 42),
                        SwitchCompensation.compensate(orange, strength: 1))
-    }
-
-    func testDefaultStrengthIsInRange() {
-        XCTAssertEqual(SwitchCompensation.defaultStrength, 0.5)
-        XCTAssertTrue(SwitchCompensation.strengthRange.contains(SwitchCompensation.defaultStrength))
+        XCTAssertEqual(SwitchCompensation.compensate(orange, strength: -42),
+                       SwitchCompensation.compensate(orange, strength: -1))
     }
 
     // MARK: - Per-LED selection
 
     func testOnlyMarkedIndicesAreCompensated() {
-        let lynx: Set<UInt16> = [1, 89]
-        for index: UInt16 in [1, 89] {
-            XCTAssertEqual(SwitchCompensation.color(forLEDIndex: index, target: orange,
-                                                    lynxLEDIndices: lynx, strength: 0.5),
-                           SwitchCompensation.compensate(orange, strength: 0.5))
+        let marked: Set<UInt16> = [1, 89]
+        for strength in [0.5, -0.5] {
+            for index: UInt16 in [1, 89] {
+                XCTAssertEqual(SwitchCompensation.color(forLEDIndex: index, target: orange,
+                                                        markedLEDIndices: marked,
+                                                        strength: strength),
+                               SwitchCompensation.compensate(orange, strength: strength))
+            }
+            XCTAssertEqual(SwitchCompensation.color(forLEDIndex: 2, target: orange,
+                                                    markedLEDIndices: marked,
+                                                    strength: strength),
+                           orange)
         }
-        XCTAssertEqual(SwitchCompensation.color(forLEDIndex: 2, target: orange,
-                                                lynxLEDIndices: lynx, strength: 0.5),
-                       orange)
     }
 
     // MARK: - Whole-board colours
 
     func testUniformColorsCoverThePaintableRange() {
         let colors = SwitchCompensation.uniformColors(target: orange,
-                                                      lynxLEDIndices: [],
+                                                      markedLEDIndices: [],
                                                       strength: 0.5)
         XCTAssertEqual(colors.count, GMMKKeyMap.paintableLEDIndices.count)
         XCTAssertTrue(colors.allSatisfy { $0 == orange })
@@ -99,9 +160,9 @@ final class SwitchCompensationTests: XCTestCase {
         let esc = GMMKKeyMap.ansiTKL.first { $0.label == "Esc" }!
         let space = GMMKKeyMap.ansiTKL.first { $0.label == "Space" }!
         let colors = SwitchCompensation.uniformColors(target: orange,
-                                                      lynxLEDIndices: [space.ledIndex],
-                                                      strength: 0.5)
-        let compensated = SwitchCompensation.compensate(orange, strength: 0.5)
+                                                      markedLEDIndices: [space.ledIndex],
+                                                      strength: -0.5)
+        let compensated = SwitchCompensation.compensate(orange, strength: -0.5)
         XCTAssertEqual(colors[Int(space.ledIndex - GMMKKeyMap.minLEDIndex)], compensated)
         XCTAssertEqual(colors[Int(esc.ledIndex - GMMKKeyMap.minLEDIndex)], orange)
         XCTAssertEqual(colors.filter { $0 == compensated }.count, 1)
@@ -126,25 +187,39 @@ final class SwitchCompensationTests: XCTestCase {
     }
 
     func testPaintCompensatedMatchesUniformWhenNothingIsMarked() {
+        for strength in [0.75, -0.75] {
+            XCTAssertEqual(GMMKTransaction.paintCompensated(target: orange,
+                                                            markedLEDIndices: [],
+                                                            strength: strength),
+                           GMMKTransaction.paintUniform(orange))
+        }
+    }
+
+    /// At strength 0 a marked key is painted exactly like an unmarked one.
+    func testPaintCompensatedAtZeroStrengthIsUniform() {
         XCTAssertEqual(GMMKTransaction.paintCompensated(target: orange,
-                                                        lynxLEDIndices: [],
-                                                        strength: 0.75),
+                                                        markedLEDIndices: [1, 52, 89],
+                                                        strength: 0),
                        GMMKTransaction.paintUniform(orange))
     }
 
-    /// Marking one key changes exactly the three bytes of that LED's triplet.
+    /// Marking one key changes exactly the three bytes of that LED's triplet,
+    /// whichever way the slider went.
     func testPaintCompensatedChangesOnlyMarkedKeys() {
         let plain = GMMKTransaction.paintUniform(orange)
-        let marked = GMMKTransaction.paintCompensated(target: orange,
-                                                      lynxLEDIndices: [1],
-                                                      strength: 1)
-        XCTAssertEqual(plain.count, marked.count)
-        let differing = zip(plain, marked).filter { $0 != $1 }
-        XCTAssertEqual(differing.count, 1)
         // LED 1 is the first triplet of the first colour packet: data starts at
         // payload offset 7.
-        XCTAssertEqual(Array(marked[4][7..<10]), [0xFF, 0x00, 0x00])
         XCTAssertEqual(Array(plain[4][7..<10]), [0xFF, 0x88, 0x00])
+
+        for (strength, expected) in [(1.0, [0xFF, 0x00, 0x00] as [UInt8]),
+                                     (-1.0, [0x00, 0xFF, 0x00])] {
+            let marked = GMMKTransaction.paintCompensated(target: orange,
+                                                          markedLEDIndices: [1],
+                                                          strength: strength)
+            XCTAssertEqual(plain.count, marked.count)
+            XCTAssertEqual(zip(plain, marked).filter { $0 != $1 }.count, 1)
+            XCTAssertEqual(Array(marked[4][7..<10]), expected, "strength \(strength)")
+        }
     }
 
     /// A single-key paint is one bracketed `0x11` write and nothing else — no

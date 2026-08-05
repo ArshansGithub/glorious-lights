@@ -124,15 +124,16 @@ public enum GMMKTransaction {
                                    count: GMMKKeyMap.paintableLEDIndices.count))
     }
 
-    /// Paints every LED the target colour, except the ones marked as sitting
-    /// under a Lynx switch, which get ``SwitchCompensation/compensate(_:strength:)``
-    /// applied — see ``SwitchCompensation``.
+    /// Paints every LED the target colour, except the ones the user marked as
+    /// having the odd-one-out switch housing, which get
+    /// ``SwitchCompensation/compensate(_:strength:)`` applied — see
+    /// ``SwitchCompensation``, including what the sign of `strength` means.
     public static func paintCompensated(target: RGB,
-                                        lynxLEDIndices: Set<UInt16>,
+                                        markedLEDIndices: Set<UInt16>,
                                         strength: Double) -> [[UInt8]] {
         customColors(startKeyIndex: GMMKKeyMap.minLEDIndex,
                      colors: SwitchCompensation.uniformColors(target: target,
-                                                              lynxLEDIndices: lynxLEDIndices,
+                                                              markedLEDIndices: markedLEDIndices,
                                                               strength: strength))
     }
 

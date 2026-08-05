@@ -203,9 +203,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openTuner(_ sender: NSMenuItem) {
-        tuner.onChange = { [weak self] lynxLEDIndices, strength in
+        tuner.onChange = { [weak self] markedLEDIndices, strength in
             guard let self else { return }
-            self.settings.lynxLEDIndices = lynxLEDIndices
+            self.settings.markedLEDIndices = markedLEDIndices
             self.settings.compensationStrength = strength
             self.settings.save()
         }
@@ -217,13 +217,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.save()
         refreshEnablement()
         tuner.present(target: settings.color,
-                      lynxLEDIndices: settings.lynxLEDIndices,
+                      markedLEDIndices: settings.markedLEDIndices,
                       strength: settings.compensationStrength)
     }
 
     private func paintCompensated() {
         controller.paintCompensated(target: settings.color,
-                                    lynxLEDIndices: settings.lynxLEDIndices,
+                                    markedLEDIndices: settings.markedLEDIndices,
                                     strength: settings.compensationStrength)
     }
 

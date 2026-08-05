@@ -6,13 +6,19 @@ import GMMKProtocol
 /// Two phases, both live on the hardware:
 ///
 /// * **Marking.** While this window is key, every key press toggles that key's
-///   membership of the Lynx set and immediately repaints its LED — bright white
-///   when marked, back to the target colour when unmarked. That is the feedback
-///   the user needs to mark the right keys, and it doubles as a check of
-///   ``GMMKKeyMap``: if a press lights the wrong LED, the table is wrong there
-///   and the user can see exactly where.
+///   membership of the marked set and immediately repaints its LED — bright
+///   white when marked, back to the target colour when unmarked. That is the
+///   feedback the user needs to mark the right keys, and it doubles as a check
+///   of ``GMMKKeyMap``: if a press lights the wrong LED, the table is wrong
+///   there and the user can see exactly where.
+///
+///   What to mark is *whichever housing there are fewer of* — the odd ones out.
+///   The board may be mostly tinted with a few clear switches or the other way
+///   round, and marking is one press per key, so the UI asks for the minority
+///   either way and lets the slider's sign say which it was.
 /// * **Tuning.** The strength slider repaints all marked keys, debounced, so the
-///   user drags until the board looks uniform.
+///   user drags — in either direction, see ``SwitchCompensation`` — until the
+///   board looks uniform.
 ///
 /// Key presses are read with a **local** `NSEvent` monitor, which sees only this
 /// app's own events and needs no Accessibility or Input Monitoring grant beyond
@@ -28,23 +34,37 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
     /// Colour a key flashes to when it is marked.
     static let markedColor = RGB(red: 0xFF, green: 0xFF, blue: 0xFF)
 
+    /// Half-width, in slider percent, of the detent at zero. Zero is the one
+    /// value worth being able to hit exactly — it is "no compensation" — and a
+    /// 200-step slider will not land on it by hand.
+    static let zeroDetentPercent = 4
+
+    /// Fixed window width; the height follows from how the instructions wrap.
+    private static let contentWidth: CGFloat = 400
+
     private let controller: KeyboardController
 
     private var target: RGB = .black
-    private var lynxLEDIndices: Set<UInt16> = []
+    private var markedLEDIndices: Set<UInt16> = []
     private var strength = SwitchCompensation.defaultStrength
 
     /// Reports the marked set and strength back so they can be persisted.
     var onChange: ((Set<UInt16>, Double) -> Void)?
 
     private let instructionLabel = NSTextField(wrappingLabelWithString: """
-        Press every key that has a Lynx switch. Marked keys light up white; \
-        press one again to unmark it. Then drag the slider until the board \
-        looks like one colour.
+        Press every key whose switch is the odd one out — whichever kind of \
+        housing your board has fewer of. Marked keys light up white; press one \
+        again to unmark it.
+
+        Then drag the slider until the whole board looks like one colour. It \
+        goes both ways: one direction corrects marked keys that tint the light, \
+        the other matches marked keys to a board that does.
         """)
     private let statusLabel = NSTextField(labelWithString: "")
     private lazy var strengthRow = SliderRowView(title: "Compensation Strength",
-                                                 range: 0...100) { "\($0)%" }
+                                                 range: -100...100) {
+        $0 == 0 ? "none" : String(format: "%+d%%", $0)
+    }
 
     private var keyMonitor: Any?
     /// Modifier key codes currently held down. `flagsChanged` fires on both
@@ -58,7 +78,7 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
     init(controller: KeyboardController) {
         self.controller = controller
 
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 220),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: Self.contentWidth, height: 260),
                               styleMask: [.titled, .closable],
                               backing: .buffered,
                               defer: false)
@@ -69,7 +89,11 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
         super.init(window: window)
 
         window.delegate = self
-        window.contentView = buildContentView()
+        let content = buildContentView()
+        window.contentView = content
+        // The instructions wrap, so their height depends on the width — let
+        // auto layout say how tall the window needs to be rather than guessing.
+        window.setContentSize(content.fittingSize)
     }
 
     @available(*, unavailable)
@@ -105,9 +129,10 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
         stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 220))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: Self.contentWidth, height: 260))
         content.addSubview(stack)
         NSLayoutConstraint.activate([
+            content.widthAnchor.constraint(equalToConstant: Self.contentWidth),
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             stack.topAnchor.constraint(equalTo: content.topAnchor),
@@ -126,9 +151,9 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
     ///
     /// The paint is also what puts the board in mode `custom`, which the
     /// single-key writes during marking rely on.
-    func present(target: RGB, lynxLEDIndices: Set<UInt16>, strength: Double) {
+    func present(target: RGB, markedLEDIndices: Set<UInt16>, strength: Double) {
         self.target = target
-        self.lynxLEDIndices = lynxLEDIndices
+        self.markedLEDIndices = markedLEDIndices
         self.strength = strength
 
         strengthRow.setValue(Int((strength * 100).rounded()))
@@ -156,10 +181,10 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
     }
 
     @objc private func clearMarks() {
-        lynxLEDIndices.removeAll()
+        markedLEDIndices.removeAll()
         heldModifierKeyCodes.removeAll()
         updateStatus()
-        onChange?(lynxLEDIndices, strength)
+        onChange?(markedLEDIndices, strength)
         repaintAll()
     }
 
@@ -209,17 +234,17 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
         }
 
         let isMarked: Bool
-        if lynxLEDIndices.contains(key.ledIndex) {
-            lynxLEDIndices.remove(key.ledIndex)
+        if markedLEDIndices.contains(key.ledIndex) {
+            markedLEDIndices.remove(key.ledIndex)
             isMarked = false
         } else {
-            lynxLEDIndices.insert(key.ledIndex)
+            markedLEDIndices.insert(key.ledIndex)
             isMarked = true
         }
 
         statusLabel.stringValue = markedSummary
             + " — \(key.label) \(isMarked ? "marked" : "unmarked") (LED \(key.ledIndex))"
-        onChange?(lynxLEDIndices, strength)
+        onChange?(markedLEDIndices, strength)
 
         // One packet, straight away: white while marked, back to the plain
         // target while not. A marked key stays white until the next whole-board
@@ -231,8 +256,15 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
     // MARK: - Strength
 
     private func strengthChanged(percent: Int) {
-        strength = Double(percent) / 100.0
-        onChange?(lynxLEDIndices, strength)
+        // Snap the thumb to the centre inside the detent, so "no compensation"
+        // is reachable by dragging rather than only by never having dragged.
+        var snapped = percent
+        if abs(snapped) <= Self.zeroDetentPercent {
+            snapped = 0
+            strengthRow.setValue(0)
+        }
+        strength = Double(snapped) / 100.0
+        onChange?(markedLEDIndices, strength)
         pendingRepaint?.cancel()
         let item = DispatchWorkItem { [weak self] in
             self?.pendingRepaint = nil
@@ -246,12 +278,12 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
 
     private func repaintAll() {
         controller.paintCompensated(target: target,
-                                    lynxLEDIndices: lynxLEDIndices,
+                                    markedLEDIndices: markedLEDIndices,
                                     strength: strength)
     }
 
     private var markedSummary: String {
-        let count = lynxLEDIndices.count
+        let count = markedLEDIndices.count
         return "\(count) key\(count == 1 ? "" : "s") marked"
     }
 

@@ -39,8 +39,10 @@ swift build -c release
   brightness/speed sliders, color picker, hot-plug aware.
 - **Switch compensation:** if the board mixes clear and tinted switch housings
   (Glorious Lynx housings are cyan, so they eat red and tint everything green),
-  *Tune Switch Compensation…* has you press each tinted key — it lights white as
-  you go — then drag one slider until the board reads as a single colour.
+  *Tune Switch Compensation…* has you press whichever kind you have fewer of —
+  each lights white as you go — then drag one slider until the board reads as a
+  single colour. The slider runs both ways, so it doesn't matter whether the
+  keys you marked are the tinted ones or the clear ones.
   *Uniform Color (Compensated)* then paints per-key with that correction.
 - **CLI:** `swift run -c release gmmk-cli help`
 

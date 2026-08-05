@@ -18,8 +18,11 @@ struct Settings {
         static let colorHex = "lighting.colorHex"
         static let rainbow = "lighting.rainbow"
         static let compensated = "compensation.enabled"
-        static let lynxLEDIndices = "compensation.lynxLEDIndices"
+        static let markedLEDIndices = "compensation.markedLEDIndices"
         static let compensationStrength = "compensation.strength"
+        /// What ``markedLEDIndices`` was called when the marked set could only
+        /// mean "the Lynx-switch keys". Read once, for migration.
+        static let legacyLynxLEDIndices = "compensation.lynxLEDIndices"
     }
 
     var mode: LightingMode = .fixed
@@ -35,11 +38,12 @@ struct Settings {
     /// rather than an onboard effect. Both end up in mode ``LightingMode/custom``
     /// on the device, so the flag is what tells them apart in the UI.
     var compensated: Bool = false
-    /// LED indices (``GMMKKeyMap``) the user marked as sitting under a Lynx
-    /// switch. Survives across launches — re-marking 87 keys is not something to
-    /// ask twice.
-    var lynxLEDIndices: Set<UInt16> = []
-    /// How hard to compensate those keys, `0`…`1`.
+    /// LED indices (``GMMKKeyMap``) the user marked as having the odd-one-out
+    /// switch housing. Survives across launches — marking keys one press at a
+    /// time is not something to ask twice.
+    var markedLEDIndices: Set<UInt16> = []
+    /// How hard to compensate those keys, **signed**, `-1`…`1`. The sign says
+    /// which kind of switch was marked — see ``SwitchCompensation``.
     var compensationStrength: Double = SwitchCompensation.defaultStrength
 
     private let defaults: UserDefaults
@@ -65,17 +69,24 @@ struct Settings {
         if let stored = defaults.object(forKey: Key.compensated) as? Bool {
             compensated = stored
         }
-        if let stored = defaults.array(forKey: Key.lynxLEDIndices) as? [Int] {
+        // The marked set moved key when the strength became signed and the set
+        // stopped meaning specifically "the Lynx keys". The values themselves
+        // did not change, so the old key is read as a fallback.
+        if let stored = (defaults.array(forKey: Key.markedLEDIndices)
+                         ?? defaults.array(forKey: Key.legacyLynxLEDIndices)) as? [Int] {
             // Anything outside the addressable range is dropped rather than
             // trusted: a stale or hand-edited default must not send the
             // firmware an index it has never been asked about.
-            lynxLEDIndices = Set(stored.compactMap { value -> UInt16? in
+            markedLEDIndices = Set(stored.compactMap { value -> UInt16? in
                 guard let index = UInt16(exactly: value),
                       GMMKKeyMap.paintableLEDIndices.contains(index) else { return nil }
                 return index
             })
         }
         if let stored = defaults.object(forKey: Key.compensationStrength) as? Double {
+            // A strength written before the range gained its negative half was
+            // in 0…1 and meant the same thing it does now, so clamping is the
+            // whole migration.
             compensationStrength = min(max(stored, SwitchCompensation.strengthRange.lowerBound),
                                        SwitchCompensation.strengthRange.upperBound)
         }
@@ -89,7 +100,7 @@ struct Settings {
         defaults.set(color.hexString, forKey: Key.colorHex)
         defaults.set(rainbow, forKey: Key.rainbow)
         defaults.set(compensated, forKey: Key.compensated)
-        defaults.set(lynxLEDIndices.sorted().map(Int.init), forKey: Key.lynxLEDIndices)
+        defaults.set(markedLEDIndices.sorted().map(Int.init), forKey: Key.markedLEDIndices)
         defaults.set(compensationStrength, forKey: Key.compensationStrength)
     }
 }
