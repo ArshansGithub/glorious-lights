@@ -61,37 +61,34 @@ final class KeyboardController {
 
     // MARK: - Commands
 
+    // Each of these is one ``GMMKTransaction`` operation: START, the field
+    // written at all three profile bases, END. See `GMMKTransaction` for why
+    // the repetition is necessary.
+
     func setMode(_ mode: LightingMode) {
-        send(GMMKTransaction.single(GMMKPacket.setMode(mode)))
+        send(GMMKTransaction.setMode(mode))
     }
 
     /// `percent` is 0–100; the device gets 0–4.
     func setBrightness(percent: Int, throttleKey: String? = "brightness") {
-        let packet = GMMKPacket.setBrightness(level: Brightness.level(fromPercent: percent))
-        send(GMMKTransaction.single(packet), throttleKey: throttleKey)
+        send(GMMKTransaction.setBrightness(level: Brightness.level(fromPercent: percent)),
+             throttleKey: throttleKey)
     }
 
     /// `speed` is 1 (slowest) – 5 (fastest); the device gets delay 3–0.
     func setSpeed(_ speed: Int, throttleKey: String? = "speed") {
-        let packet = GMMKPacket.setDelay(Delay.delay(fromSpeed: speed))
-        send(GMMKTransaction.single(packet), throttleKey: throttleKey)
+        send(GMMKTransaction.setDelay(Delay.delay(fromSpeed: speed)), throttleKey: throttleKey)
     }
 
-    /// Sends the colour with rainbow explicitly off in the same transaction.
-    ///
-    /// Same reasoning as the CLI's `color` command: with the rainbow flag set
-    /// the effect ignores the solid colour entirely, so a colour write on its
-    /// own reads to the user as "nothing happened".
+    /// Sends the colour with rainbow explicitly off in the same transaction —
+    /// with the flag set the effect ignores the colour entirely, so a colour
+    /// write on its own reads to the user as "nothing happened".
     func setColor(_ color: RGB, throttleKey: String? = "color") {
-        let packets = GMMKTransaction.bracket([
-            GMMKPacket.setRainbow(false),
-            GMMKPacket.setColor(red: color.red, green: color.green, blue: color.blue),
-        ])
-        send(packets, throttleKey: throttleKey)
+        send(GMMKTransaction.setColor(color), throttleKey: throttleKey)
     }
 
     func setRainbow(_ on: Bool) {
-        send(GMMKTransaction.single(GMMKPacket.setRainbow(on)))
+        send(GMMKTransaction.setRainbow(on))
     }
 
     // MARK: - Sending
