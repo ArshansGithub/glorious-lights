@@ -6,6 +6,8 @@ Core doesn't support and the official GMMK Editor (Windows-only) left behind.
 
 A native Swift menu-bar app plus a CLI. No drivers, no kernel extensions.
 
+<img width="383" height="357" alt="image" src="https://github.com/user-attachments/assets/9dc20f23-8a51-429c-ad26-1b70d75b57ca" />
+
 ## Why this exists
 
 Glorious CORE does not speak to the GMMK 1 at all (its device database starts at
