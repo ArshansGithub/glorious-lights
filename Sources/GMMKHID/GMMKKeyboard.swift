@@ -40,6 +40,17 @@ public final class GMMKKeyboard {
     /// so it must not be a temporary from `withUnsafeMutableBufferPointer`.
     private let inputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
     private let inputBufferCapacity = 64
+    /// The most recent input report, consumed by ``awaitReply(timeout:)``.
+    private var latestReply: [UInt8]?
+
+    /// Run-loop mode the device is *also* scheduled in, so ``send(packets:)``
+    /// can pump for replies without running anything else.
+    ///
+    /// Pumping `.defaultMode` from the app's main thread would re-enter UI event
+    /// delivery in the middle of a send — a menu action could run while its own
+    /// transaction is still going out. A private mode contains exactly one
+    /// source: this device's input reports.
+    private static let replyMode = CFRunLoopMode("com.gmmklights.hid.reply" as CFString)
 
     /// Whether a matching device is currently open and ready for ``send(payload:)``.
     public private(set) var isConnected = false
@@ -55,12 +66,33 @@ public final class GMMKKeyboard {
     /// Replies are not required for writes to take effect.
     public var onInputReport: (([UInt8]) -> Void)?
 
-    /// Delay inserted between consecutive packets in ``send(packets:)``.
+    /// Extra delay inserted between consecutive packets in ``send(packets:)``,
+    /// *on top of* the wait for each packet's echo.
     ///
-    /// The Linux tools throttle naturally by doing a blocking IN read after
-    /// every OUT; without that a small pause keeps the firmware's queue happy,
-    /// especially during a per-key burst.
-    public var interPacketDelay: TimeInterval = 0.002
+    /// Zero by default: waiting for the echo is itself the pacing, and it is
+    /// what the Linux tools get accidentally from their blocking IN read. Raise
+    /// it (the CLI's `GMMK_PACKET_DELAY_MS`) only to test timing hypotheses.
+    public var interPacketDelay: TimeInterval = 0
+
+    /// How long to wait for one packet's echo before re-sending it.
+    public var replyTimeout: TimeInterval = ReplyPacer.defaultReplyTimeout
+
+    /// Transmissions per packet before moving on without an echo.
+    public var maxSendAttempts: Int = ReplyPacer.defaultMaxAttempts
+
+    /// Gap between packets once the firmware has stopped answering and
+    /// ``send(packets:)`` falls back to blind sending.
+    ///
+    /// ~350 ms wall-clock gaps were the other pacing observed to make config
+    /// writes latch on firmware 1.08. Much slower than reply pacing, which is
+    /// why it is the fallback and not the default.
+    private static let blindPacingDelay: TimeInterval = 0.350
+
+    /// Called for every packet that was sent ``maxSendAttempts`` times without
+    /// the firmware ever answering. The write has probably still landed in
+    /// config RAM, but it may not have been applied — worth surfacing in a
+    /// bring-up log, not worth failing a transaction over.
+    public var onUnacknowledgedPacket: ((_ packetIndex: Int, _ attempts: Int) -> Void)?
 
     /// Which USB channel carries command packets. `.vendorOutput` is the
     /// documented default (Output report, ID 4, vendor interface). The other
@@ -103,8 +135,14 @@ public final class GMMKKeyboard {
 
     // MARK: - One-shot use (CLI)
 
-    /// Finds and opens the vendor interface synchronously, without scheduling
-    /// a run loop or hot-plug callbacks.
+    /// Finds and opens the vendor interface synchronously, without hot-plug
+    /// callbacks.
+    ///
+    /// The device is scheduled on the *current* run loop in the private reply
+    /// mode and its input-report callback registered, because ``send(packets:)``
+    /// paces on those replies and would otherwise wait out a full timeout per
+    /// packet. Nothing is scheduled in a public mode, so this does not disturb
+    /// a caller that never runs its run loop.
     ///
     /// - Throws: ``GMMKHIDError/deviceNotFound`` or ``GMMKHIDError/openFailed(_:)``.
     public func open() throws {
@@ -119,6 +157,9 @@ public final class GMMKKeyboard {
         }
         device = found
         isConnected = true
+        registerInputReportCallback(on: found)
+        scheduledRunLoop = CFRunLoopGetCurrent()
+        IOHIDDeviceScheduleWithRunLoop(found, CFRunLoopGetCurrent(), Self.replyMode.rawValue)
     }
 
     /// Whether a matching vendor interface is currently attached. Does not open it.
@@ -167,21 +208,27 @@ public final class GMMKKeyboard {
     public func stop() {
         if let device {
             if let scheduledRunLoop {
-                IOHIDDeviceUnscheduleFromRunLoop(device, scheduledRunLoop, scheduledMode.rawValue)
+                // Both modes the device may have been scheduled in: the caller's
+                // (hot-plug path only) and the private reply mode (always).
+                if isStarted {
+                    IOHIDDeviceUnscheduleFromRunLoop(device, scheduledRunLoop, scheduledMode.rawValue)
+                }
+                IOHIDDeviceUnscheduleFromRunLoop(device, scheduledRunLoop, Self.replyMode.rawValue)
             }
             IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
             self.device = nil
         }
         isConnected = false
+        latestReply = nil
         if isStarted {
             if let scheduledRunLoop {
                 IOHIDManagerUnscheduleFromRunLoop(manager, scheduledRunLoop, scheduledMode.rawValue)
             }
             IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-            scheduledRunLoop = nil
-            scheduledMode = .defaultMode
             isStarted = false
         }
+        scheduledRunLoop = nil
+        scheduledMode = .defaultMode
     }
 
     // MARK: - Sending
@@ -229,17 +276,41 @@ public final class GMMKKeyboard {
     }
 
     /// Sends a sequence of payloads (e.g. a whole `START` … `END` transaction),
-    /// pausing ``interPacketDelay`` between them.
+    /// **waiting for each packet's echo before sending the next**.
+    ///
+    /// The pacing is not politeness, it is what makes the write take effect.
+    /// Firmware 1.08 stores a blindly-bursted config write into config RAM but
+    /// does not latch it into the running effect engine; the same packets apply
+    /// instantly when each one waits for its echo. Echoes arrive within a few
+    /// milliseconds, so a transaction still completes in well under the time a
+    /// user would notice. See ``ReplyPacer`` and `docs/protocol-tkl-notes.md`
+    /// §13.7.
+    ///
+    /// A packet the firmware never answers is re-sent up to ``maxSendAttempts``
+    /// times and then skipped — ``onUnacknowledgedPacket`` reports it — because
+    /// a missed echo does not mean a missed write. A packet the firmware
+    /// *rejects* throws ``GMMKHIDError/commandRejected(status:packetIndex:)``.
     ///
     /// If a packet fails part way through a `START` … `END` run, a best-effort
     /// `END` is sent before rethrowing: the `END` is the commit, so aborting
     /// without one leaves the keyboard mid-transaction until it is replugged.
     public func send(packets: [[UInt8]]) throws {
         var sentAny = false
+        // Set once the firmware has stopped answering. Waiting the full timeout
+        // on every remaining packet would block this thread for
+        // packets × attempts × timeout — 17 s for a solid-colour transaction,
+        // on the main thread in the app. Once one packet has exhausted its
+        // attempts the reply channel is not coming back mid-transaction, so the
+        // rest go out on the other pacing that was observed to work: a fixed
+        // ~350 ms gap, no waiting.
+        var replyChannelIsSilent = false
         do {
             for (index, packet) in packets.enumerated() {
-                if index > 0, interPacketDelay > 0 {
-                    Thread.sleep(forTimeInterval: interPacketDelay)
+                if index > 0 {
+                    let floor = replyChannelIsSilent
+                        ? Swift.max(interPacketDelay, Self.blindPacingDelay)
+                        : interPacketDelay
+                    if floor > 0 { Thread.sleep(forTimeInterval: floor) }
                 }
                 // The official editor sleeps 10 ms before END (the commit) —
                 // docs/protocol-tkl-notes.md §2.6. Match it.
@@ -247,8 +318,25 @@ public final class GMMKKeyboard {
                    packet[2] == GMMKPacket.Command.end, packet[3] == 0 {
                     Thread.sleep(forTimeInterval: 0.010)
                 }
-                try send(payload: packet)
-                sentAny = true
+                let outcome = try ReplyPacer.send(
+                    maxAttempts: replyChannelIsSilent ? 1 : maxSendAttempts,
+                    transmit: { [self] in
+                        latestReply = nil
+                        try send(payload: packet)
+                        sentAny = true
+                    },
+                    awaitReply: { [self] in
+                        replyChannelIsSilent ? nil : awaitReply(timeout: replyTimeout)
+                    })
+                switch outcome {
+                case .acknowledged:
+                    break
+                case .rejected(let status, _):
+                    throw GMMKHIDError.commandRejected(status: status, packetIndex: index)
+                case .unacknowledged(let attempts):
+                    replyChannelIsSilent = true
+                    onUnacknowledgedPacket?(index, attempts)
+                }
             }
         } catch {
             if sentAny, packets.first == GMMKPacket.start(), packets.last == GMMKPacket.end() {
@@ -256,6 +344,29 @@ public final class GMMKKeyboard {
             }
             throw error
         }
+    }
+
+    /// Blocks until an input report arrives or `timeout` elapses, running only
+    /// the private reply mode so nothing else on this run loop is serviced.
+    ///
+    /// Returns `nil` on timeout. Reports that arrive between sends are consumed
+    /// here too: ``latestReply`` is cleared immediately before each
+    /// transmission, so a stale echo can never satisfy the next packet's wait.
+    private func awaitReply(timeout: TimeInterval) -> [UInt8]? {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while latestReply == nil {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { return nil }
+            let result = CFRunLoopRunInMode(Self.replyMode, min(remaining, 0.010), true)
+            // `.finished` means the mode has no sources — the device is not
+            // scheduled here at all, so waiting cannot help. Sleep out the
+            // remaining time rather than spinning a hot loop on a live CPU.
+            if result == .finished, latestReply == nil {
+                Thread.sleep(forTimeInterval: min(remaining, 0.010))
+            }
+        }
+        defer { latestReply = nil }
+        return latestReply
     }
 
     // MARK: - Hot-plug handling
@@ -272,9 +383,13 @@ public final class GMMKKeyboard {
         registerInputReportCallback(on: candidate)
         // The manager is created with `kIOHIDManagerOptionIndependentDevices`,
         // so its scheduling is not propagated: schedule the device by hand or
-        // its input reports never arrive.
+        // its input reports never arrive. Two modes, both on this run loop —
+        // the caller's, so handlers see replies during ordinary run-loop
+        // running, and the private reply mode, which is the only one
+        // `send(packets:)` pumps.
         if let scheduledRunLoop {
             IOHIDDeviceScheduleWithRunLoop(candidate, scheduledRunLoop, scheduledMode.rawValue)
+            IOHIDDeviceScheduleWithRunLoop(candidate, scheduledRunLoop, Self.replyMode.rawValue)
         }
         onConnect?()
     }
@@ -295,8 +410,11 @@ public final class GMMKKeyboard {
             { context, _, _, _, _, report, length in
                 guard let context else { return }
                 let keyboard = Unmanaged<GMMKKeyboard>.fromOpaque(context).takeUnretainedValue()
-                guard let handler = keyboard.onInputReport else { return }
-                handler(Array(UnsafeBufferPointer(start: report, count: length)))
+                let bytes = Array(UnsafeBufferPointer(start: report, count: length))
+                // Recorded unconditionally: `send(packets:)` paces on these,
+                // whether or not anyone installed an `onInputReport` handler.
+                keyboard.latestReply = bytes
+                keyboard.onInputReport?(bytes)
             },
             context)
     }

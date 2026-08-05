@@ -14,6 +14,10 @@ public enum GMMKHIDError: Error, CustomStringConvertible {
     case setReportFailed(IOReturn)
     /// The payload was not the expected 63 bytes.
     case invalidPayloadLength(Int)
+    /// The firmware echoed a packet with an error status (`0xFF` or `0xFE`)
+    /// instead of accepting it. `packetIndex` is the packet's position in the
+    /// transaction that was being sent.
+    case commandRejected(status: UInt8, packetIndex: Int)
 
     public var description: String {
         switch self {
@@ -41,6 +45,13 @@ public enum GMMKHIDError: Error, CustomStringConvertible {
                 """
         case .invalidPayloadLength(let n):
             return "Expected a 63-byte payload without the leading 0x04 report ID, got \(n)."
+        case .commandRejected(let status, let index):
+            return """
+                The keyboard rejected packet \(index) of the transaction with status 0x\
+                \(String(format: "%02x", status)). The packet reached the firmware and \
+                was refused, so this is a malformed or unsupported command rather than a \
+                transport problem.
+                """
         }
     }
 

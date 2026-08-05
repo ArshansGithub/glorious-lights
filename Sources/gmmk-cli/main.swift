@@ -128,8 +128,10 @@ func withKeyboard(_ body: (GMMKKeyboard) throws -> Void) -> Never {
 
 /// Sends a START-bracketed transaction and exits.
 ///
-/// Timing overrides for hardware bring-up (both in milliseconds):
-/// `GMMK_PACKET_DELAY_MS` — pause between packets (default 2).
+/// Packets are paced by waiting for each one's echo, so no fixed delay is
+/// needed. Timing overrides for hardware bring-up (both in milliseconds):
+/// `GMMK_PACKET_DELAY_MS` — *extra* pause between packets on top of the echo
+/// wait (default 0), for testing timing hypotheses.
 /// `GMMK_SETTLE_MS` — pause after the last packet before the device is
 /// closed, so a queued OUT report can't be cancelled by the close (default 0).
 func send(_ packets: [[UInt8]], describing description: String) -> Never {

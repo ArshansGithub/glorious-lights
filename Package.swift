@@ -16,5 +16,6 @@ let package = Package(
         .executableTarget(name: "gmmk-cli", dependencies: ["GMMKProtocol", "GMMKHID"]),
         .executableTarget(name: "GMMKLightsApp", dependencies: ["GMMKProtocol", "GMMKHID"]),
         .testTarget(name: "GMMKProtocolTests", dependencies: ["GMMKProtocol"]),
+        .testTarget(name: "GMMKHIDTests", dependencies: ["GMMKHID"]),
     ]
 )
