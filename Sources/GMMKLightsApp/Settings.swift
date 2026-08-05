@@ -17,6 +17,9 @@ struct Settings {
         static let speed = "lighting.speed"
         static let colorHex = "lighting.colorHex"
         static let rainbow = "lighting.rainbow"
+        static let compensated = "compensation.enabled"
+        static let lynxLEDIndices = "compensation.lynxLEDIndices"
+        static let compensationStrength = "compensation.strength"
     }
 
     var mode: LightingMode = .fixed
@@ -24,8 +27,20 @@ struct Settings {
     var brightnessPercent: Int = 100
     /// 1 (slowest) – 5 (fastest), mapped onto the device's delay 3–0 when sent.
     var speed: Int = 3
+    /// Doubles as the target colour of the compensated uniform paint.
     var color: RGB = RGB(red: 0xFF, green: 0x88, blue: 0x00)
     var rainbow: Bool = false
+
+    /// Whether the last thing the user chose was the compensated uniform paint
+    /// rather than an onboard effect. Both end up in mode ``LightingMode/custom``
+    /// on the device, so the flag is what tells them apart in the UI.
+    var compensated: Bool = false
+    /// LED indices (``GMMKKeyMap``) the user marked as sitting under a Lynx
+    /// switch. Survives across launches — re-marking 87 keys is not something to
+    /// ask twice.
+    var lynxLEDIndices: Set<UInt16> = []
+    /// How hard to compensate those keys, `0`…`1`.
+    var compensationStrength: Double = SwitchCompensation.defaultStrength
 
     private let defaults: UserDefaults
 
@@ -47,6 +62,23 @@ struct Settings {
         if let stored = defaults.object(forKey: Key.rainbow) as? Bool {
             rainbow = stored
         }
+        if let stored = defaults.object(forKey: Key.compensated) as? Bool {
+            compensated = stored
+        }
+        if let stored = defaults.array(forKey: Key.lynxLEDIndices) as? [Int] {
+            // Anything outside the addressable range is dropped rather than
+            // trusted: a stale or hand-edited default must not send the
+            // firmware an index it has never been asked about.
+            lynxLEDIndices = Set(stored.compactMap { value -> UInt16? in
+                guard let index = UInt16(exactly: value),
+                      GMMKKeyMap.paintableLEDIndices.contains(index) else { return nil }
+                return index
+            })
+        }
+        if let stored = defaults.object(forKey: Key.compensationStrength) as? Double {
+            compensationStrength = min(max(stored, SwitchCompensation.strengthRange.lowerBound),
+                                       SwitchCompensation.strengthRange.upperBound)
+        }
     }
 
     /// Writes the whole struct back. Cheap enough to call on every change.
@@ -56,5 +88,8 @@ struct Settings {
         defaults.set(speed, forKey: Key.speed)
         defaults.set(color.hexString, forKey: Key.colorHex)
         defaults.set(rainbow, forKey: Key.rainbow)
+        defaults.set(compensated, forKey: Key.compensated)
+        defaults.set(lynxLEDIndices.sorted().map(Int.init), forKey: Key.lynxLEDIndices)
+        defaults.set(compensationStrength, forKey: Key.compensationStrength)
     }
 }

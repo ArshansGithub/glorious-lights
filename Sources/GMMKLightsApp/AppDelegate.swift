@@ -14,8 +14,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let effectItem = NSMenuItem(title: "Effect", action: nil, keyEquivalent: "")
     private let effectMenu = NSMenu()
     private let rainbowItem = NSMenuItem(title: "Rainbow", action: nil, keyEquivalent: "")
+    private let compensatedItem = NSMenuItem(title: "Uniform Color (Compensated)",
+                                             action: nil, keyEquivalent: "")
     /// True while the shared `NSColorPanel` is targeted at this delegate.
     private var ownsColorPanel = false
+    /// Kept across openings so the tuner reopens with its state intact.
+    private lazy var tuner = SwitchCompensationWindowController(controller: controller)
 
     private lazy var brightnessRow = SliderRowView(title: "Brightness",
                                                    range: 0...100) { "\($0)%" }
@@ -75,6 +79,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rainbowItem.action = #selector(toggleRainbow(_:))
         rainbowItem.target = self
         menu.addItem(rainbowItem)
+
+        compensatedItem.action = #selector(applyCompensated(_:))
+        compensatedItem.target = self
+        menu.addItem(compensatedItem)
+
+        let tuneItem = NSMenuItem(title: "Tune Switch Compensation…",
+                                  action: #selector(openTuner(_:)),
+                                  keyEquivalent: "")
+        tuneItem.target = self
+        menu.addItem(tuneItem)
         menu.addItem(.separator())
 
         brightnessRow.onChange = { [weak self] percent in
@@ -122,17 +136,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshEnablement() {
         for item in effectMenu.items {
             let mode = item.representedObject as? LightingMode
-            item.state = (mode == settings.mode) ? .on : .off
+            item.state = (mode == settings.mode && !settings.compensated) ? .on : .off
         }
-        effectItem.title = "Effect: \(settings.mode.displayName)"
+        effectItem.title = settings.compensated
+            ? "Effect: " + compensatedItem.title
+            : "Effect: \(settings.mode.displayName)"
+        compensatedItem.state = settings.compensated ? .on : .off
         rainbowItem.state = settings.rainbow ? .on : .off
         rainbowItem.isEnabled = settings.mode.usesSolidColor
 
         speedRow.isControlEnabled = settings.mode.isAnimated
         // A colour write only shows up when the mode uses the solid colour and
         // the rainbow flag is off — clicking through to the panel otherwise
-        // would look like the app was broken.
-        let colorEnabled = settings.mode.usesSolidColor && !settings.rainbow
+        // would look like the app was broken. The compensated paint is the
+        // exception: it is in mode `custom`, which ignores the config colour,
+        // but the same swatch is its target.
+        let colorEnabled = settings.compensated
+            || (settings.mode.usesSolidColor && !settings.rainbow)
         colorRow.setEnabled(colorEnabled)
         // An already-open panel outlives the row that spawned it, so detach it
         // too; otherwise dragging in it keeps writing colour while the menu
@@ -163,9 +183,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func selectEffect(_ sender: NSMenuItem) {
         guard let mode = sender.representedObject as? LightingMode else { return }
         settings.mode = mode
+        settings.compensated = false
         settings.save()
         refreshEnablement()
         controller.setMode(mode)
+    }
+
+    /// Paints the whole board one colour with the marked keys compensated.
+    ///
+    /// This is mode `custom` on the device — the same mode as the plain effect
+    /// of that name — so the app's own ``Settings/compensated`` flag is what
+    /// distinguishes them in the menu.
+    @objc private func applyCompensated(_ sender: NSMenuItem) {
+        settings.mode = .custom
+        settings.compensated = true
+        settings.save()
+        refreshEnablement()
+        paintCompensated()
+    }
+
+    @objc private func openTuner(_ sender: NSMenuItem) {
+        tuner.onChange = { [weak self] lynxLEDIndices, strength in
+            guard let self else { return }
+            self.settings.lynxLEDIndices = lynxLEDIndices
+            self.settings.compensationStrength = strength
+            self.settings.save()
+        }
+        // Opening the tuner paints, which leaves the board in mode `custom`
+        // showing the compensated colours — so record that as the current state
+        // rather than letting the menu keep claiming the old effect.
+        settings.mode = .custom
+        settings.compensated = true
+        settings.save()
+        refreshEnablement()
+        tuner.present(target: settings.color,
+                      lynxLEDIndices: settings.lynxLEDIndices,
+                      strength: settings.compensationStrength)
+    }
+
+    private func paintCompensated() {
+        controller.paintCompensated(target: settings.color,
+                                    lynxLEDIndices: settings.lynxLEDIndices,
+                                    strength: settings.compensationStrength)
     }
 
     @objc private func toggleRainbow(_ sender: NSMenuItem) {
@@ -201,16 +260,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func colorPanelChanged(_ sender: NSColorPanel) {
         // The row can be disabled while the panel is still on screen.
-        guard settings.mode.usesSolidColor else { return }
+        guard settings.compensated || settings.mode.usesSolidColor else { return }
         guard let rgb = self.rgb(from: sender.color) else { return }
         settings.color = rgb
-        // The rainbow flag is cleared by the same transaction the colour rides
-        // in, so reflect that in the persisted UI state too.
-        settings.rainbow = false
+        if !settings.compensated {
+            // The rainbow flag is cleared by the same transaction the colour
+            // rides in, so reflect that in the persisted UI state too.
+            settings.rainbow = false
+        }
         settings.save()
         colorRow.setColor(nsColor(rgb), hexText: "#" + rgb.hexString)
         refreshEnablement()
-        controller.setColor(rgb)
+        if settings.compensated {
+            paintCompensated()
+        } else {
+            controller.setColor(rgb)
+        }
     }
 
     // MARK: - Colour conversion

@@ -91,6 +91,30 @@ final class KeyboardController {
         send(GMMKTransaction.setRainbow(on))
     }
 
+    /// Switches to mode `custom` and paints every LED the target colour, with
+    /// the marked keys compensated — see ``SwitchCompensation``.
+    ///
+    /// Twelve packets rather than the usual five, so it gets its own throttle
+    /// key: a strength drag must not be able to cancel a pending colour write.
+    func paintCompensated(target: RGB,
+                          lynxLEDIndices: Set<UInt16>,
+                          strength: Double,
+                          throttleKey: String? = "paint") {
+        send(GMMKTransaction.paintCompensated(target: target,
+                                              lynxLEDIndices: lynxLEDIndices,
+                                              strength: strength),
+             throttleKey: throttleKey)
+    }
+
+    /// Paints one LED. Sent unthrottled — it is a single write, and it is the
+    /// feedback for a key press, so dropping one would read as a dead key.
+    ///
+    /// Only visible if the board is already in mode `custom`; the tuner paints
+    /// the whole board when it opens, which is what puts it there.
+    func paintKey(ledIndex: UInt16, color: RGB) {
+        send(GMMKTransaction.paintKey(ledIndex: ledIndex, color: color))
+    }
+
     // MARK: - Sending
 
     /// Sends immediately, or throttles on `throttleKey` when one is given.

@@ -37,6 +37,11 @@ swift build -c release
 
 - **Menu-bar app:** `swift run -c release GMMKLightsApp` — effect picker,
   brightness/speed sliders, color picker, hot-plug aware.
+- **Switch compensation:** if the board mixes clear and tinted switch housings
+  (Glorious Lynx housings are cyan, so they eat red and tint everything green),
+  *Tune Switch Compensation…* has you press each tinted key — it lights white as
+  you go — then drag one slider until the board reads as a single colour.
+  *Uniform Color (Compensated)* then paints per-key with that correction.
 - **CLI:** `swift run -c release gmmk-cli help`
 
 ```sh
