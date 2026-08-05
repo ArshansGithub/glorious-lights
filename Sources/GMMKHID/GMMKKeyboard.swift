@@ -68,13 +68,19 @@ public final class GMMKKeyboard {
     /// listen on a different channel.
     public enum TransportProbe: String {
         /// Output report, ID 4, 63-byte payload, vendor interface (default).
+        /// Confirmed correct by static analysis of the official editor
+        /// (docs/protocol-tkl-notes.md §2.2).
         case vendorOutput = "vendor-output"
         /// Feature report, ID 4, 63-byte payload, vendor interface.
+        /// Known to STALL on GMMK 1 firmware; kept only for bring-up notes.
         case vendorFeature = "vendor-feature"
-        /// Feature report, no report ID, full 64-byte packet (leading 0x04 is
-        /// a *data* byte), sent to the boot-keyboard interface's 64-byte
-        /// feature report instead of the vendor interface.
-        case bootFeature = "boot-feature"
+
+        // A "boot-feature" case (feature reports on the boot-keyboard
+        // interface) existed briefly during bring-up and was REMOVED on
+        // purpose: that channel is the SN32 ISP-bootloader command door
+        // (docs/protocol-tkl-notes.md §4). Never send feature reports to
+        // interface 0 — the wrong 8 bytes reboot the board into the
+        // bootloader and can lead to a soft-brick.
     }
 
     /// Bring-up escape hatch; leave at `.vendorOutput` in production.
@@ -104,13 +110,7 @@ public final class GMMKKeyboard {
     public func open() throws {
         if isConnected { return }
         IOHIDManagerSetDeviceMatching(manager, Self.matchingDictionary() as CFDictionary)
-        let wanted: IOHIDDevice?
-        if case .bootFeature = transportProbe {
-            wanted = Self.findBootConfigInterface(in: manager)
-        } else {
-            wanted = Self.findVendorInterface(in: manager)
-        }
-        guard let found = wanted else {
+        guard let found = Self.findVendorInterface(in: manager) else {
             throw GMMKHIDError.deviceNotFound
         }
         let result = IOHIDDeviceOpen(found, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -203,17 +203,17 @@ public final class GMMKKeyboard {
         case .vendorOutput:
             reportType = kIOHIDReportTypeOutput
             reportID = Self.reportID
-            bytes = payload
+            // Verified on hardware (fw 1.08): macOS does NOT prepend the
+            // report ID on this interrupt pipe, and the firmware requires the
+            // full 64-byte wire frame. Sending the bare 63-byte payload
+            // arrives one byte short: the firmware then echoes an error reply
+            // (status 0xFF) *without* an ID prefix, which macOS misparses as
+            // phantom keypresses. Always send all 64 bytes, 0x04 first.
+            bytes = [GMMKPacket.reportID] + payload
         case .vendorFeature:
             reportType = kIOHIDReportTypeFeature
             reportID = Self.reportID
             bytes = payload
-        case .bootFeature:
-            // No report ID on the boot interface's feature report; the wire
-            // packet's 0x04 is an ordinary data byte there.
-            reportType = kIOHIDReportTypeFeature
-            reportID = 0
-            bytes = [UInt8(Self.reportID)] + payload
         }
 
         let result = bytes.withUnsafeBufferPointer { buffer -> IOReturn in
@@ -240,6 +240,12 @@ public final class GMMKKeyboard {
             for (index, packet) in packets.enumerated() {
                 if index > 0, interPacketDelay > 0 {
                     Thread.sleep(forTimeInterval: interPacketDelay)
+                }
+                // The official editor sleeps 10 ms before END (the commit) —
+                // docs/protocol-tkl-notes.md §2.6. Match it.
+                if index > 0, packet.count == GMMKPacket.payloadLength,
+                   packet[2] == GMMKPacket.Command.end, packet[3] == 0 {
+                    Thread.sleep(forTimeInterval: 0.010)
                 }
                 try send(payload: packet)
                 sentAny = true
@@ -312,18 +318,6 @@ public final class GMMKKeyboard {
     private static func findVendorInterface(in manager: IOHIDManager) -> IOHIDDevice? {
         guard let set = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return nil }
         return set.first(where: isVendorInterface)
-    }
-
-    /// The boot-keyboard interface that carries the 64-byte no-ID feature
-    /// report (bring-up probe target): same VID/PID, *not* the vendor
-    /// interface, and `MaxFeatureReportSize == 64`.
-    private static func findBootConfigInterface(in manager: IOHIDManager) -> IOHIDDevice? {
-        guard let set = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return nil }
-        return set.first { device in
-            guard !isVendorInterface(device) else { return false }
-            let size = IOHIDDeviceGetProperty(device, kIOHIDMaxFeatureReportSizeKey as CFString) as? Int
-            return size == 64
-        }
     }
 
     /// True if the device's usage pairs include usage page `0xFF1C` usage `0x92`.
