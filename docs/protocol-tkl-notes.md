@@ -712,6 +712,10 @@ Consequences:
 
 ## 13.5 Per-key colour RAM (`0x11`) — ACKed, display path unresolved
 
+> ⚠️ **Superseded by §13.9.** Per-key colours do display; this section records
+> the state of the investigation before the hello read (§13.8) was in the send
+> path, which is what the writes below were missing.
+
 `0x11` writes are accepted with status `0x00`, including a full sweep of indices
 1‥126 at `address = keyIndex * 3`, but **nothing on the display changed** — not
 even with mode `0x14` (custom) set at all three profile bases first. So either
@@ -839,3 +843,34 @@ The mode list is **19 IDs** in the firmware's own order, which is not sorted
 (`08` before `07`, `0b` before `0a`). **`0x13` (off) is not advertised** — worth
 knowing before a UI offers it as an effect; the same result is better had by
 setting brightness 0.
+
+## 13.9 Per-key colours do display — §13.5 resolved
+
+**Verified on hardware.** Mode `0x14` (custom) displays the per-key colour RAM,
+and `0x11` writes reach it exactly as `protocol.md` §4 describes:
+
+* command `0x11`, `address = keyIndex * 3` little-endian at bytes 5–6,
+* R-G-B triplets from wire offset 8, 18 keys (54 bytes) per packet,
+* the whole run inside **one** `START` / `END` pair,
+* preceded — like every other transaction — by the §13.8 hello read.
+
+The hello read is the difference between this and §13.5. The earlier sweep was
+issued before the transport opened every session with `0x03`, so the writes
+landed in LED RAM the same way config writes did, and went unapplied for the
+same reason.
+
+`gmmk-cli paint <RRGGBB>` is the minimal reproduction: one transaction, mode
+`0x14` at all three profile bases, then indices 1‥126 painted one colour.
+
+### Key indexing
+
+`protocol.md` uncertainty #1 is settled in favour of option (a): **the TKL uses
+the same LED address space as the full-size board, with the numpad indices
+simply absent.** `GMMKKeyMap.ansiTKL` is the resulting 87-key table — the §4
+full-size map minus indices 31–33, 48–50, 65–67, 82–84, 99–101, 116, 117 — with
+each key's macOS virtual key code alongside, so a key press can be turned into
+an LED index.
+
+Indices 118–126 remain of unknown effect (`protocol.md` uncertainty #9); a
+whole-board paint writes them because contiguous chunking is simpler, and doing
+so has been observed to be harmless.

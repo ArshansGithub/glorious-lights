@@ -106,11 +106,43 @@ public enum GMMKTransaction {
     /// Per-key colours: mode `custom` at every profile, then the colour run,
     /// all inside a single transaction.
     ///
-    /// - Note: **unresolved on firmware 1.08** — these writes are ACKed but had
-    ///   no visible effect during bring-up. See ``GMMKPacket/setCustomColors(startKeyIndex:colors:)``
-    ///   and `docs/protocol-tkl-notes.md` §13.
+    /// Verified on hardware: mode `0x14` displays the per-key colour RAM these
+    /// packets write. See `docs/protocol-tkl-notes.md` §13.9.
     public static func customColors(startKeyIndex: UInt16, colors: [RGB]) -> [[UInt8]] {
         bracket(GMMKPacket.atEveryProfile { GMMKPacket.setMode(.custom, profileBase: $0) }
                 + GMMKPacket.customColorPackets(startKeyIndex: startKeyIndex, colors: colors))
+    }
+
+    /// Paints every LED one colour, in mode `custom`.
+    ///
+    /// Covers ``GMMKKeyMap/paintableLEDIndices`` rather than only the 87 keys a
+    /// TKL has: writing straight through the unpopulated gaps keeps the packets
+    /// contiguous and clears any colour left in them by a previous paint.
+    public static func paintUniform(_ color: RGB) -> [[UInt8]] {
+        customColors(startKeyIndex: GMMKKeyMap.minLEDIndex,
+                     colors: Array(repeating: color,
+                                   count: GMMKKeyMap.paintableLEDIndices.count))
+    }
+
+    /// Paints every LED the target colour, except the ones marked as sitting
+    /// under a Lynx switch, which get ``SwitchCompensation/compensate(_:strength:)``
+    /// applied — see ``SwitchCompensation``.
+    public static func paintCompensated(target: RGB,
+                                        lynxLEDIndices: Set<UInt16>,
+                                        strength: Double) -> [[UInt8]] {
+        customColors(startKeyIndex: GMMKKeyMap.minLEDIndex,
+                     colors: SwitchCompensation.uniformColors(target: target,
+                                                              lynxLEDIndices: lynxLEDIndices,
+                                                              strength: strength))
+    }
+
+    /// Paints a single LED, without touching the effect mode.
+    ///
+    /// One packet in its own transaction: the cheapest possible write, for live
+    /// feedback while the user marks keys. The caller is responsible for the
+    /// board already being in mode `custom` — otherwise the write lands in LED
+    /// RAM but the running effect keeps overwriting it.
+    public static func paintKey(ledIndex: UInt16, color: RGB) -> [[UInt8]] {
+        bracket([GMMKPacket.setCustomColors(startKeyIndex: ledIndex, colors: [color])])
     }
 }

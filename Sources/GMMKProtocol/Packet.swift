@@ -327,14 +327,12 @@ public enum GMMKPacket {
 
     // MARK: - Per-key colours
 
-    /// > Unresolved on firmware 1.08. The board **ACKs** `0x11` writes with
-    /// > status `0x00`, but nothing observed on the display path changes —
-    /// > writes at `address = keyIndex * 3` had no visible effect even in mode
-    /// > `0x14` (custom) with the whole array painted. Either the address space
-    /// > differs from the full-size boards these builders were derived from, or
-    /// > another step is needed to latch LED RAM. The builders below are kept
-    /// > because they are byte-correct against the community tools, but nothing
-    /// > in the app exposes them. See `docs/protocol-tkl-notes.md` §13.
+    /// > Verified on hardware (fw 1.08): mode `0x14` (custom) displays the
+    /// > per-key colour RAM these builders write, at
+    /// > `address = keyIndex * 3`, 18 keys per packet, inside one `START`/`END`
+    /// > pair. An earlier bring-up run concluded the display path was
+    /// > unresolved; that was before the transport opened every session with
+    /// > the `0x03` hello read. See `docs/protocol-tkl-notes.md` §13.9.
 
     /// Maximum data bytes in one `0x11` packet: `(64 - 8) / 3 * 3`.
     public static let maxCustomColorBytesPerPacket = 54
@@ -351,7 +349,7 @@ public enum GMMKPacket {
     ///   - colors: up to 18 RGB triplets.
     /// - Precondition: `colors.count <= 18`.
     /// - Note: the colours only become visible in mode `0x14` (custom).
-    ///   Key indexing on the TKL board is unverified — see `docs/protocol.md` §7.1.
+    ///   ``GMMKKeyMap`` maps the TKL's keys onto these indices.
     public static func setCustomColors(startKeyIndex: UInt16, colors: [RGB]) -> [UInt8] {
         precondition(colors.count <= maxKeysPerPacket,
                      "at most \(maxKeysPerPacket) keys fit in one packet")
