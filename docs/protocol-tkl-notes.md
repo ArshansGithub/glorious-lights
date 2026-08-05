@@ -707,6 +707,8 @@ Consequences:
   from a misread `0x03` reply would write 44 bytes of device-info garbage into
   config RAM.
 * `0x05` (read config RAM by address) works as documented. Use it for reads.
+* It is nonetheless the most important command in the protocol: issuing it is
+  what allows subsequent writes to latch. See §13.8.
 
 ## 13.5 Per-key colour RAM (`0x11`) — ACKed, display path unresolved
 
@@ -740,9 +742,15 @@ invariants the code is built around:
 
 `GMMKPacket.Command` deliberately does not name any of these.
 
-## 13.7 Packets must be paced, or writes are stored but never applied
+## 13.7 Packet pacing
 
-**This is a requirement, not a politeness.** A blind burst of config writes with
+> ⚠️ **Superseded as the explanation by §13.8.** The observations below are
+> real, but the *cause* was misattributed: the sequences that applied had all
+> been preceded by a `0x03` read earlier in the same session. Reply pacing is
+> still what the library does and what the official editor does; it is just not
+> what makes a write latch. Read §13.8 with this.
+
+A blind burst of config writes with
 2 ms gaps is accepted (every packet ACKs `0x00`) and lands in config RAM — a
 subsequent `0x05` read returns what was written — but the running effect engine
 **does not pick it up**. The lighting only changes at some later latch.
@@ -777,3 +785,57 @@ Implementation notes worth keeping:
   second menu action start while the first is still going out.
 * `interPacketDelay` survives as an additional floor (default 0, CLI override
   `GMMK_PACKET_DELAY_MS`), as does the 10 ms sleep before `END`.
+
+## 13.8 Writes only latch after a `0x03` read — the session opener
+
+**This is the primary latch mechanism, and it supersedes §13.7's account.**
+Verified twice on the board: config writes apply to the *running* effect only if
+the firmware has recently received a **command `0x03` read (count `0x2C`,
+address 0)** — the device-info "hello" the official editor issues on connect.
+
+* A write-only transaction — START, field writes, END, nothing else — is
+  accepted (every packet ACKs `0x00`) and lands in config RAM, but the display
+  does not change.
+* The *same* transaction preceded by a `0x03` read applies instantly.
+
+This also explains the earlier §13.7 results rather than contradicting them. The
+350 ms-gap and multi-open successes were all measured in bring-up sessions where
+a `0x03` read had happened minutes earlier; the gaps were not what made those
+writes latch. So:
+
+> **Reply pacing is not sufficient on a fresh session.** It is still worth doing
+> — it is what the official editor does, `probe2` confirmed it works well, and it
+> gives a per-packet acknowledgement — but the hello read is what makes writes
+> apply.
+
+`GMMKKeyboard.send(packets:)` therefore begins every invocation with the hello
+read and waits for its reply before the caller's packets go out, so the CLI and
+the app both inherit it. The single-packet `send(payload:)` escape hatch does
+**not** — a raw debug send stays raw.
+
+### The `0x03` reply is a device-info block
+
+Parsed into `GMMKDeviceInfo`, exposed as `keyboard.deviceInfo` after the first
+successful hello. Offsets are into the reply's data area, which starts at wire
+offset 8. Real capture from the TKL on fw 1.08:
+
+```
+55 aa ff 02 45 0c 2f 65 08 01 00 08 00 00 00 00 01 02 … 14 ff
+^^^^^ magic  ^^^^^ VID  ^^^^^ fw          mode IDs ^^^^^^^^^^^
+       ^^^^^ ?         ^^^^^ PID   ^^^^^^^^^^^^^^ ?
+```
+
+| data offset | wire offset | field |
+|---|---|---|
+| 0–1 | 8–9 | magic `55 aa` |
+| 2–3 | 10–11 | unidentified (`ff 02`) |
+| 4–5 | 12–13 | USB vendor ID, LE — `0x0C45` |
+| 6–7 | 14–15 | USB product ID, LE — `0x652F` |
+| 8–9 | 16–17 | firmware version, LE — `0x0108` = 1.08 |
+| 10–15 | 18–23 | unidentified (`00 08 00 00 00 00`) |
+| 16… | 24… | supported effect-mode IDs, `0xFF`-terminated |
+
+The mode list is **19 IDs** in the firmware's own order, which is not sorted
+(`08` before `07`, `0b` before `0a`). **`0x13` (off) is not advertised** — worth
+knowing before a UI offers it as an effect; the same result is better had by
+setting brightness 0.
