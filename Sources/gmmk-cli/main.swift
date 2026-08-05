@@ -67,15 +67,18 @@ func withKeyboard(_ body: (GMMKKeyboard) throws -> Void) -> Never {
     } catch {
         fail("\(error)", .transport)
     }
-    defer { keyboard.stop() }
-
+    // Every path out of here is `exit()`, which does not unwind `defer` blocks
+    // or run deinits — so close the device explicitly on each one.
     do {
         try body(keyboard)
     } catch let error as GMMKHIDError {
+        keyboard.stop()
         fail(error.description, .transport)
     } catch {
+        keyboard.stop()
         fail("\(error)", .transport)
     }
+    keyboard.stop()
     exit(ExitCode.ok.rawValue)
 }
 

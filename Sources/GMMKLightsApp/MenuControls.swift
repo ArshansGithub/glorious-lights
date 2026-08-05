@@ -11,8 +11,8 @@ enum MenuMetrics {
 /// A labelled slider hosted inside an `NSMenuItem`.
 ///
 /// The slider is continuous; ``onChange`` fires on every intermediate value and
-/// the controller debounces, so dragging produces a live preview on the
-/// keyboard without flooding the HID endpoint.
+/// the controller throttles (leading edge plus a trailing send), so dragging
+/// produces a live preview on the keyboard without flooding the HID endpoint.
 final class SliderRowView: NSView {
 
     private let titleLabel = NSTextField(labelWithString: "")
@@ -201,14 +201,41 @@ final class ColorRowView: NSView {
     }
 
     override func mouseExited(with event: NSEvent) {
+        clearHighlight()
+    }
+
+    private func clearHighlight() {
         isHighlighted = false
         titleLabel.textColor = isControlEnabled ? .labelColor : .disabledControlTextColor
         needsDisplay = true
     }
 
+    /// The menu can also be dismissed (Escape, a click elsewhere) with the
+    /// cursor still over the row, so drop the highlight when the row leaves the
+    /// window rather than relying on `mouseExited` alone.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { clearHighlight() }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        // `separatorColor` is dynamic; a `cgColor` resolved at init would stay
+        // frozen at whichever appearance was current then.
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            swatch.layer?.borderColor = NSColor.separatorColor.cgColor
+        }
+    }
+
     override func mouseUp(with event: NSEvent) {
         guard isControlEnabled else { return }
+        // `cancelTracking` only *requests* dismissal; the menu's tracking loop
+        // exits on a later pass. Ordering a window in from inside that loop is
+        // the same trap this row exists to avoid, so hop to the next main-queue
+        // turn. Clear the highlight here too — `mouseExited` never arrives when
+        // the menu is dismissed with the cursor over the row.
         enclosingMenuItem?.menu?.cancelTracking()
-        onClick?()
+        clearHighlight()
+        DispatchQueue.main.async { [onClick] in onClick?() }
     }
 }

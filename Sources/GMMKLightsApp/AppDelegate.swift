@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let effectItem = NSMenuItem(title: "Effect", action: nil, keyEquivalent: "")
     private let effectMenu = NSMenu()
     private let rainbowItem = NSMenuItem(title: "Rainbow", action: nil, keyEquivalent: "")
+    /// True while the shared `NSColorPanel` is targeted at this delegate.
+    private var ownsColorPanel = false
 
     private lazy var brightnessRow = SliderRowView(title: "Brightness",
                                                    range: 0...100) { "\($0)%" }
@@ -130,7 +132,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // A colour write only shows up when the mode uses the solid colour and
         // the rainbow flag is off — clicking through to the panel otherwise
         // would look like the app was broken.
-        colorRow.setEnabled(settings.mode.usesSolidColor && !settings.rainbow)
+        let colorEnabled = settings.mode.usesSolidColor && !settings.rainbow
+        colorRow.setEnabled(colorEnabled)
+        // An already-open panel outlives the row that spawned it, so detach it
+        // too; otherwise dragging in it keeps writing colour while the menu
+        // says the control is unavailable.
+        if !colorEnabled { dismissColorPanel() }
     }
 
     private func refreshConnectionItem() {
@@ -174,11 +181,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.color = nsColor(settings.color)
         panel.setTarget(self)
         panel.setAction(#selector(colorPanelChanged(_:)))
+        ownsColorPanel = true
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
     }
 
+    /// Detaches (and hides) the shared colour panel if we are the one driving it.
+    private func dismissColorPanel() {
+        guard ownsColorPanel, NSColorPanel.sharedColorPanelExists else {
+            ownsColorPanel = false
+            return
+        }
+        let panel = NSColorPanel.shared
+        panel.setTarget(nil)
+        panel.setAction(nil)
+        if panel.isVisible { panel.orderOut(nil) }
+        ownsColorPanel = false
+    }
+
     @objc private func colorPanelChanged(_ sender: NSColorPanel) {
+        // The row can be disabled while the panel is still on screen.
+        guard settings.mode.usesSolidColor else { return }
         guard let rgb = self.rgb(from: sender.color) else { return }
         settings.color = rgb
         // The rainbow flag is cleared by the same transaction the colour rides
@@ -186,7 +209,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.rainbow = false
         settings.save()
         colorRow.setColor(nsColor(rgb), hexText: "#" + rgb.hexString)
-        rainbowItem.state = .off
+        refreshEnablement()
         controller.setColor(rgb)
     }
 

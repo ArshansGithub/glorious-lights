@@ -31,6 +31,10 @@ public final class GMMKKeyboard {
     private let manager: IOHIDManager
     private var device: IOHIDDevice?
     private var isStarted = false
+    /// Run loop and mode ``start(on:mode:)`` scheduled on, so ``stop()`` can
+    /// unschedule from exactly the same place instead of guessing.
+    private var scheduledRunLoop: CFRunLoop?
+    private var scheduledMode: CFRunLoopMode = .defaultMode
     /// Backing store for input reports. Heap-allocated and owned for the
     /// lifetime of the instance: IOKit keeps the pointer after registration,
     /// so it must not be a temporary from `withUnsafeMutableBufferPointer`.
@@ -59,7 +63,12 @@ public final class GMMKKeyboard {
     public var interPacketDelay: TimeInterval = 0.002
 
     public init() {
-        manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        // `kIOHIDManagerOptionIndependentDevices` keeps `IOHIDManagerOpen` from
+        // being propagated to every VID/PID match — otherwise starting the
+        // manager would also open Interface A, the boot keyboard, which the
+        // spec forbids. Devices are opened and scheduled by hand instead.
+        manager = IOHIDManagerCreate(kCFAllocatorDefault,
+                                     IOHIDManagerOptions.independentDevices.rawValue)
         inputBuffer.initialize(repeating: 0, count: inputBufferCapacity)
     }
 
@@ -118,22 +127,35 @@ public final class GMMKKeyboard {
                 .handleDeviceRemoved(device)
         }, context)
 
-        IOHIDManagerScheduleWithRunLoop(manager, runLoop.getCFRunLoop(), mode.rawValue)
-        IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        let cfRunLoop = runLoop.getCFRunLoop()
+        scheduledRunLoop = cfRunLoop
+        scheduledMode = mode
+        IOHIDManagerScheduleWithRunLoop(manager, cfRunLoop, mode.rawValue)
+        // Opens the manager only: with `kIOHIDManagerOptionIndependentDevices`
+        // this does not open any matched device.
+        let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        if result != kIOReturnSuccess {
+            onOpenFailure?(.openFailed(result))
+        }
     }
 
     /// Unschedules the manager, closes the device, and clears connection state.
     public func stop() {
         if let device {
+            if let scheduledRunLoop {
+                IOHIDDeviceUnscheduleFromRunLoop(device, scheduledRunLoop, scheduledMode.rawValue)
+            }
             IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
             self.device = nil
         }
         isConnected = false
         if isStarted {
-            IOHIDManagerUnscheduleFromRunLoop(manager,
-                                              CFRunLoopGetCurrent(),
-                                              CFRunLoopMode.defaultMode.rawValue)
+            if let scheduledRunLoop {
+                IOHIDManagerUnscheduleFromRunLoop(manager, scheduledRunLoop, scheduledMode.rawValue)
+            }
             IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+            scheduledRunLoop = nil
+            scheduledMode = .defaultMode
             isStarted = false
         }
     }
@@ -164,12 +186,25 @@ public final class GMMKKeyboard {
 
     /// Sends a sequence of payloads (e.g. a whole `START` … `END` transaction),
     /// pausing ``interPacketDelay`` between them.
+    ///
+    /// If a packet fails part way through a `START` … `END` run, a best-effort
+    /// `END` is sent before rethrowing: the `END` is the commit, so aborting
+    /// without one leaves the keyboard mid-transaction until it is replugged.
     public func send(packets: [[UInt8]]) throws {
-        for (index, packet) in packets.enumerated() {
-            if index > 0, interPacketDelay > 0 {
-                Thread.sleep(forTimeInterval: interPacketDelay)
+        var sentAny = false
+        do {
+            for (index, packet) in packets.enumerated() {
+                if index > 0, interPacketDelay > 0 {
+                    Thread.sleep(forTimeInterval: interPacketDelay)
+                }
+                try send(payload: packet)
+                sentAny = true
             }
-            try send(payload: packet)
+        } catch {
+            if sentAny, packets.first == GMMKPacket.start(), packets.last == GMMKPacket.end() {
+                try? send(payload: GMMKPacket.end())
+            }
+            throw error
         }
     }
 
@@ -185,6 +220,12 @@ public final class GMMKKeyboard {
         device = candidate
         isConnected = true
         registerInputReportCallback(on: candidate)
+        // The manager is created with `kIOHIDManagerOptionIndependentDevices`,
+        // so its scheduling is not propagated: schedule the device by hand or
+        // its input reports never arrive.
+        if let scheduledRunLoop {
+            IOHIDDeviceScheduleWithRunLoop(candidate, scheduledRunLoop, scheduledMode.rawValue)
+        }
         onConnect?()
     }
 
