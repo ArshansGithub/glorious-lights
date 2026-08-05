@@ -19,6 +19,7 @@ struct Settings {
         static let rainbow = "lighting.rainbow"
         static let compensated = "compensation.enabled"
         static let markedLEDIndices = "compensation.markedLEDIndices"
+        static let markedSwitches = "compensation.markedSwitches"
         static let compensationStrength = "compensation.strength"
         /// What ``markedLEDIndices`` was called when the marked set could only
         /// mean "the Lynx-switch keys". Read once, for migration.
@@ -42,8 +43,10 @@ struct Settings {
     /// switch housing. Survives across launches — marking keys one press at a
     /// time is not something to ask twice.
     var markedLEDIndices: Set<UInt16> = []
-    /// How hard to compensate those keys, **signed**, `-1`…`1`. The sign says
-    /// which kind of switch was marked — see ``SwitchCompensation``.
+    /// Which kind of switch those marks identify, which is what decides whether
+    /// the correction lands on them or on everything else.
+    var markedSwitches: SwitchCompensation.MarkedSwitches = .trueColor
+    /// How hard to correct the tinted keys, `0`…`1`.
     var compensationStrength: Double = SwitchCompensation.defaultStrength
 
     private let defaults: UserDefaults
@@ -83,11 +86,15 @@ struct Settings {
                 return index
             })
         }
+        if let raw = defaults.string(forKey: Key.markedSwitches),
+           let stored = SwitchCompensation.MarkedSwitches(rawValue: raw) {
+            markedSwitches = stored
+        }
         if let stored = defaults.object(forKey: Key.compensationStrength) as? Double {
-            // A strength written before the range gained its negative half was
-            // in 0…1 and meant the same thing it does now, so clamping is the
-            // whole migration.
-            compensationStrength = min(max(stored, SwitchCompensation.strengthRange.lowerBound),
+            // A strength written while the slider was briefly bidirectional
+            // could be negative. Magnitude is what it always meant; the
+            // direction is now ``markedSwitches``' job.
+            compensationStrength = min(max(abs(stored), SwitchCompensation.strengthRange.lowerBound),
                                        SwitchCompensation.strengthRange.upperBound)
         }
     }
@@ -101,6 +108,7 @@ struct Settings {
         defaults.set(rainbow, forKey: Key.rainbow)
         defaults.set(compensated, forKey: Key.compensated)
         defaults.set(markedLEDIndices.sorted().map(Int.init), forKey: Key.markedLEDIndices)
+        defaults.set(markedSwitches.rawValue, forKey: Key.markedSwitches)
         defaults.set(compensationStrength, forKey: Key.compensationStrength)
     }
 }

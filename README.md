@@ -42,9 +42,9 @@ swift build -c release
 - **Switch compensation:** if the board mixes clear and tinted switch housings
   (Glorious Lynx housings are cyan, so they eat red and tint everything green),
   *Tune Switch Compensation…* has you press whichever kind you have fewer of —
-  each lights white as you go — then drag one slider until the board reads as a
-  single colour. The slider runs both ways, so it doesn't matter whether the
-  keys you marked are the tinted ones or the clear ones.
+  each lights white as you go — say which kind that was, then drag one slider
+  until the board reads as the colour you actually picked. The tinted keys are
+  the ones corrected, whether they're the set you marked or the rest.
   *Uniform Color (Compensated)* then paints per-key with that correction.
 - **CLI:** `swift run -c release gmmk-cli help`
 

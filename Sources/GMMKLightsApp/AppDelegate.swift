@@ -189,7 +189,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.setMode(mode)
     }
 
-    /// Paints the whole board one colour with the marked keys compensated.
+    /// Paints the whole board the chosen colour, correcting the keys whose
+    /// housing tints it.
     ///
     /// This is mode `custom` on the device — the same mode as the plain effect
     /// of that name — so the app's own ``Settings/compensated`` flag is what
@@ -203,10 +204,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openTuner(_ sender: NSMenuItem) {
-        tuner.onChange = { [weak self] markedLEDIndices, strength in
+        tuner.onChange = { [weak self] tuning in
             guard let self else { return }
-            self.settings.markedLEDIndices = markedLEDIndices
-            self.settings.compensationStrength = strength
+            self.settings.markedLEDIndices = tuning.markedLEDIndices
+            self.settings.markedSwitches = tuning.markedSwitches
+            self.settings.compensationStrength = tuning.strength
             self.settings.save()
         }
         // Opening the tuner paints, which leaves the board in mode `custom`
@@ -217,13 +219,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.save()
         refreshEnablement()
         tuner.present(target: settings.color,
-                      markedLEDIndices: settings.markedLEDIndices,
-                      strength: settings.compensationStrength)
+                      tuning: .init(markedLEDIndices: settings.markedLEDIndices,
+                                    markedSwitches: settings.markedSwitches,
+                                    strength: settings.compensationStrength))
     }
 
     private func paintCompensated() {
         controller.paintCompensated(target: settings.color,
                                     markedLEDIndices: settings.markedLEDIndices,
+                                    markedSwitches: settings.markedSwitches,
                                     strength: settings.compensationStrength)
     }
 
