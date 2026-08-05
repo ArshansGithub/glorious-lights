@@ -393,3 +393,240 @@ Stated plainly so nobody re-runs them believing they were completed.
   flashing, which is out of scope; the three bootloader PIDs in §4 cover the
   family either way.
 * The purposes of commands `0x0B`–`0x0F` are unknown; none were sent.
+
+---
+
+# Part 2 — the apply flow, profiles, and commands `0x0B`–`0x0E`
+
+Second pass over the same TKL binary (`app_tkl.exe`, PE timestamp
+2022-01-14 06:19:08 Z), prompted by live hardware results: with correct 64-byte
+framing the board now ACKs every packet with status `0x00`, config reads return
+what we wrote, and **brightness applies visibly — but mode changes do not**, and
+nothing survives a replug.
+
+**Headline: the effect-mode write is not missing an "apply" command. It is being
+written to the wrong profile.** The board runs whichever profile is named by
+**byte 10 of the 44-byte config block**, and the official software changes that
+byte with a `0x03`/`0x04` read-modify-write. Everything else below is
+supporting detail.
+
+## 8. Answer to Q1 — the complete effect-change sequence
+
+The UI effect selector is a 20-entry jump table (`0x42C9D4`, table at
+`0x42D374`, one arm per mode `0x01`–`0x14`). Every arm is the same shape
+(`0x42C9DB` is the mode-1 arm):
+
+```c
+mode    = <selected effect, 1..0x14>;
+rainbow = (g_rainbowFlag /*0x6EEAAC*/ != 0);
+
+START();                                   // cmd 0x01
+write06(&mode,    1, g_uiProfile*0x2A + 0);  // cmd 0x06, config offset 0
+write06(&rainbow, 1, g_uiProfile*0x2A + 4);  // cmd 0x06, config offset 4
+END();                                     // cmd 0x02, after Sleep(10 ms)
+
+repaintSwatches(0);                        // 0x41B3A0 — pure UI, NO HID
+```
+
+`0x41B3A0` was checked in full: it walks a dialog control-ID array
+(`0x657DC0`‥`0x657F60`) calling a widget setter. **It sends nothing to the
+device.** There is no apply, refresh, commit, or latch command after END.
+
+**So an effect change is exactly four packets: START, mode, rainbow, END.**
+That is what we are already sending. **Confidence: high.**
+
+The generic config-write wrapper (`0x4433C0`, 38 call sites — the only `0x06`
+form actually used) is:
+
+```c
+int write06(const void *payload, int count, int addr);
+// pkt[0]=0x04  pkt[3]=0x06  pkt[4]=count  pkt[5]=addr&0xFF  pkt[6]=addr>>8
+// pkt[7]=0     pkt[8..]=payload[0..count-1]
+```
+
+### 8.1 Every config address is profile-relative
+
+**This is the finding that matters.** Every one of the 38 `0x06` call sites
+computes its address as
+
+```asm
+mov  ecx, [0x6EEAC4]      ; active/edited profile index (0, 1, 2)
+imul ecx, ecx, 0x2A       ; × 42
+add  ecx, <field offset>  ; omitted when the field offset is 0
+push ecx                  ; -> addr
+```
+
+**Profile stride is `0x2A` = 42 bytes**, confirmed at every site. (The `0x2C` =
+44 in commands `0x03`/`0x04` is the *block transfer size*, a different thing —
+42 bytes of profile 0 plus 2 trailing bytes. Part 1 conflated these; this
+supersedes it.)
+
+Field offsets observed in the wild, confirming `protocol.md` §2:
+`+0` mode, `+3` direction, `+4` rainbow, `+5` RGB (count 3), `+9` RGB2
+(count 3), `+0xF` polling rate.
+
+### 8.2 Byte-exact — same effect change, per profile
+
+```
+START                       04 01 00 01 00 00 00 00  <56 × 00>
+mode = 0x06 (static)        04 0d 00 06 01 00 00 00 06  <55 × 00>   profile 0
+                            04 37 00 06 01 2a 00 00 06  <55 × 00>   profile 1
+                            04 61 00 06 01 54 00 00 06  <55 × 00>   profile 2
+rainbow = 0                 04 0b 00 06 01 04 00 00 00  <55 × 00>   profile 0
+                            04 35 00 06 01 2e 00 00 00  <55 × 00>   profile 1
+                            04 5f 00 06 01 58 00 00 00  <55 × 00>   profile 2
+END  (Sleep 10 ms first)    04 02 00 02 00 00 00 00  <56 × 00>
+```
+
+The profile-0 mode packet `04 0d 00 06 01 00 00 00 06` is byte-identical to the
+golden capture already in `protocol.md` §2.1 — independent cross-validation that
+this decoding is right.
+
+## 9. Answer to Q3 — the active-profile selector (the actual bug)
+
+Two *different* profile notions exist in the app, and conflating them is what
+makes this confusing:
+
+| Global | Meaning | Touches the device? |
+|---|---|---|
+| `0x6EEAC4` | which profile the **UI is editing** | **no** |
+| `0x6F3468` | cached copy of the **device's active profile** | yes, via `0x03`/`0x04` |
+
+**The UI profile radio buttons send no HID traffic at all.** The three handlers
+(`0x4196B8`, `0x419706`, `0x419755`) only tick three checkboxes and store
+0/1/2 into `0x6EEAC4`. They just retarget where subsequent `0x06` writes land.
+
+The device's active profile lives in **byte 10 of the 44-byte config block**:
+
+**`GetActiveProfile()` — `0x43F6A0`**
+```c
+uint8_t blk[44];
+read44(blk);                 // cmd 0x03, count 0x2C, addr 0x0000
+g_deviceProfile = blk[10];   // [ebp-0x30]+10 == [ebp-0x26]
+```
+
+**`SetActiveProfile(int n)` — `0x43F700`** (3 call sites: `0x441285`,
+`0x44137D`, `0x4417A3`)
+```c
+uint8_t blk[44];
+if (n < 0) return -1;
+if (read44(blk) != 1) return -1;   // cmd 0x03  — read-modify-write
+blk[10] = (uint8_t)n;
+if (write44(blk) != 1) return -1;  // cmd 0x04
+g_deviceProfile = blk[10];
+```
+
+On connect (`0x431E45`) the app does exactly this read and seeds *both* globals
+from `blk[10]`, i.e. the UI opens on whatever profile the board is actually
+running.
+
+The `0x03` wrapper copies `reply[8..51]` into the caller's buffer (`lea esi,
+[ebp-0x7c]` = reply+8, `rep movsd` ×11), so **block byte 10 == reply byte 18**.
+That independently confirms `rgb_keyboard`'s "active profile … reply byte 18,
+0-based" noted in `protocol.md` uncertainty #7 — and pins it to a concrete
+config address, `0x0A`.
+
+> **`protocol.md` §2 lists config `0x09`–`0x0B` as "second RGB, purpose unknown,
+> do not send". That is wrong for `0x0A`, at least as read through the `0x03`
+> block: `0x0A` is the active-profile selector.** Note the app writes RGB2 with
+> `0x06` at `profile*0x2A + 9` (count 3), which for profile 0 would overlap
+> `0x0A`–`0x0B`. Treat the overlap as unresolved and prefer the `0x03`/`0x04`
+> block path for the profile byte.
+
+### 9.1 Why our mode change appears to do nothing
+
+Our block read shows profile 2's fields at `0x2A` holding `01 04` (wave,
+brightness 4) and the board is displaying a wave. That is consistent with
+`blk[10] == 1`, i.e. **the board is running profile index 1 while we write
+profile index 0**. Mode is read by the effect engine from the *active* profile,
+so our `0x06` write to address `0x00` lands in a profile nobody is running.
+
+Brightness appearing to work while mode does not is the one part this does not
+explain — it suggests brightness is applied globally/immediately by the
+firmware while mode is latched per-profile. Worth confirming rather than
+assuming. **Confidence: high** on the profile mechanism (read straight out of
+`SetActiveProfile`), **medium** on it being the sole cause of the symptom.
+
+### 9.2 Byte-exact — switch the board to profile 0
+
+Not bracketed by START/END — verified by a byte-level scan of all three call
+sites' neighbourhoods, which contain no calls to the START or END wrappers.
+
+```
+1) read     04 2f 00 03 2c 00 00 00  <56 × 00>
+            -> reply[8..51] = blk[0..43];  blk[10] is the active profile
+2) blk[10] = 0x00
+3) write    04 CK CK 04 2c 00 00 00  <blk[0..43]>  <12 × 00>
+            CK = sum of bytes 3..63, little-endian at 1..2
+```
+
+## 10. Answer to Q2 — `0x0B`, `0x0C`, `0x0D`, `0x0E` (and `0x0F`)
+
+**All four have exactly zero call sites.** They are compiled-in but dead —
+the official editor never sends them. Structurally they are all
+"cmd, count 0, addr 0, no payload, no arguments". The only distinguishing
+feature: **`0x0C` calls `Sleep(10 ms)` before transmitting, exactly like END
+(`0x02`)**; `0x0B`, `0x0D`, `0x0E` do not.
+
+So there is **no evidence from the official software about what they do**, and
+in particular **no evidence that any of them is the missing "apply" or "save to
+flash"** — the app applies effects and switches profiles without them.
+
+> ⚠️ **Hazard: treat `0x0B`–`0x0E` as unknown-dangerous and do not send them.**
+> Dead no-argument commands in a keyboard's vendor protocol are exactly where
+> "restore factory defaults", "erase config", "erase key/macro tables" and
+> "enter test mode" live. We cannot rule any of those out, and a command taking
+> no arguments is one that cannot be sent "harmlessly small". There is nothing
+> to gain: the full apply path is already accounted for without them.
+
+Also dead (zero callers), for completeness: the fixed-form `0x05` read-2
+(`0x4426E0`), the fixed-form `0x06` write-2 (`0x4427B0`), and `0x10` read-key-RGB
+(`0x4431F0`). Part 1 described the fixed `0x06` as "the official form" — that
+was wrong; the *generic* `0x4433C0` form is the one actually used.
+
+**`0x0F` is live** (one call site, `0x43F930`). It reads into a `0x204`-byte
+buffer and the caller then copies `0x80` dwords = **512 bytes** = `0x200`, the
+per-profile LED-RAM stride. So `0x0F` is a **bulk read of per-key colour RAM**,
+used on profile load. Read-only; not part of applying an effect.
+
+## 11. Answer to Q4 — what surrounds the `0x04` block write
+
+`0x04` has **exactly one call site in the entire binary**: inside
+`SetActiveProfile` (§9). It is used only as the write half of a
+read-modify-write of the 44-byte block, it is **not** bracketed by START/END,
+and **nothing is sent after it**. The official editor never uses `0x04` to push
+ordinary lighting settings — those always go through `0x06`.
+
+### 11.1 There is no flash-commit command
+
+Searched exhaustively across all 19 wrappers and their ~140 call sites: the
+official editor's entire device-write vocabulary is
+`0x01` START, `0x02` END, `0x03` read block, `0x04` write block,
+`0x06` write config, `0x07`–`0x0A` keymap/macros, `0x0F` read key RAM,
+`0x11` write key RAM. **No save/commit/persist command exists.** Persistence, if
+the firmware provides it, must be implicit — most plausibly on END, or on the
+`0x04` block write.
+
+That makes "our writes don't survive a replug" a genuinely open question rather
+than a missing-packet problem. The most likely explanation consistent with §9 is
+that we are writing to a non-active profile which the firmware never flushes.
+**Confidence: low-medium** — this is a hypothesis, not a decoded fact.
+
+## 12. Revised probe plan
+
+1. **Read the block and print byte 10.** `04 2f 00 03 2c 00 00 00`. This single
+   read tells you which profile the board is running and should immediately
+   confirm or kill the §9.1 diagnosis. Do this before changing anything.
+2. **Retarget writes to the active profile.** If `blk[10] == 1`, write mode to
+   `0x2A` and rainbow to `0x2E` (packets in §8.2) rather than `0x00`/`0x04`.
+   If the wave changes to static, that is the whole bug.
+3. **Or move the board to profile 0** with the §9.2 read-modify-write, then keep
+   using the profile-0 addresses you already have.
+4. **Re-test persistence** only after 2 or 3 succeeds — writing to the running
+   profile may be what makes it stick.
+5. Do **not** send `0x0B`–`0x0E` (§10), and nothing from Part 1 §4.
+
+**Still unverified:** why brightness applies while mode does not; whether the
+firmware honours profiles 1/2 for every field; whether config `0x0A` really is
+the profile byte in the `0x06` address space as well as through the `0x03`
+block (the RGB2-at-`+9` overlap in §9 is unresolved).
