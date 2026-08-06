@@ -137,6 +137,69 @@ public final class SpectrumAnalyzer {
         return expected.map { geometricMean / $0 }
     }
 
+    /// The raw FFT magnitude spectrum for a window — half the window size, one
+    /// per bin.
+    ///
+    /// Exposed because the musical layer needs the spectrum itself: onset
+    /// detection works on per-band flux and the centroid is a weighted mean over
+    /// bins, neither of which can be recovered from the 17 band means.
+    public func magnitudes(from samples: [Float]) -> [Float] {
+        var real = [Float](repeating: 0, count: Self.windowSize)
+        let count = min(samples.count, Self.windowSize)
+        real.replaceSubrange(0..<count, with: samples[0..<count])
+        vDSP_vmul(real, 1, window, 1, &real, 1, vDSP_Length(Self.windowSize))
+
+        var imaginary = [Float](repeating: 0, count: Self.windowSize)
+        var magnitudes = [Float](repeating: 0, count: Self.windowSize / 2)
+
+        real.withUnsafeMutableBufferPointer { realPointer in
+            imaginary.withUnsafeMutableBufferPointer { imaginaryPointer in
+                var split = DSPSplitComplex(realp: realPointer.baseAddress!,
+                                            imagp: imaginaryPointer.baseAddress!)
+                vDSP_fft_zip(fftSetup, &split, 1, log2n, FFTDirection(FFT_FORWARD))
+                vDSP_zvabs(&split, 1, &magnitudes, 1, vDSP_Length(Self.windowSize / 2))
+            }
+        }
+
+        var scale = 2 / Float(Self.windowSize)
+        vDSP_vsmul(magnitudes, 1, &scale, &magnitudes, 1, vDSP_Length(magnitudes.count))
+        return magnitudes
+    }
+
+    /// Band means (with the pink equalisation applied) from a magnitude
+    /// spectrum, so a caller that already has one does not transform twice.
+    public func bandLevels(fromMagnitudes magnitudes: [Float]) -> [Float] {
+        bandBins.enumerated().map { index, range in
+            let upper = min(range.upper, magnitudes.count - 1)
+            guard range.lower <= upper else { return 0 }
+            let slice = magnitudes[range.lower...upper]
+            var mean: Float = 0
+            vDSP_meanv(Array(slice), 1, &mean, vDSP_Length(slice.count))
+            return mean * bandWeights[index]
+        }
+    }
+
+    /// Inclusive bin range covering a frequency span, clamped into the spectrum.
+    public func binRange(forHz range: ClosedRange<Float>) -> (lower: Int, upper: Int) {
+        let binWidth = sampleRate / Float(Self.windowSize)
+        let lower = max(1, Int(range.lowerBound / binWidth))
+        let upper = min(Self.windowSize / 2 - 1, Int(range.upperBound / binWidth))
+        return (lower, max(lower, upper))
+    }
+
+    /// Spectral centroid in Hz — the "centre of mass" of the spectrum, and the
+    /// closest single number to how *bright* a sound is.
+    public func centroid(ofMagnitudes magnitudes: [Float]) -> Float {
+        let binWidth = sampleRate / Float(Self.windowSize)
+        var weighted: Float = 0
+        var total: Float = 0
+        for bin in 1..<magnitudes.count {
+            weighted += Float(bin) * binWidth * magnitudes[bin]
+            total += magnitudes[bin]
+        }
+        return total > 1e-9 ? weighted / total : 0
+    }
+
     /// One magnitude per band for a window of samples, each roughly `0…1` for
     /// ordinary programme material — but **not clamped**, because the caller's
     /// gain stage is what decides what counts as full scale.

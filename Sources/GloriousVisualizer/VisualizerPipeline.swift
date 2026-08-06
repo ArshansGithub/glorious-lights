@@ -13,6 +13,28 @@ import Foundation
 /// different places. The simulator calls them one after the other.
 public final class VisualizerPipeline {
 
+    /// What kind of source is being listened to, which changes how much the
+    /// analysis trusts what it hears.
+    ///
+    /// A system tap hears the mix: clean transients, no room, no typing. A
+    /// microphone hears a room — reflections smear every transient, the noise
+    /// floor moves, and someone shutting a drawer looks exactly like a snare. So
+    /// the microphone profile smooths harder, adapts more slowly and asks for
+    /// more evidence before calling an onset. It is for ambience rather than for
+    /// track visualisation, and it is labelled "Room" in the UI to say so.
+    public enum SourceProfile: String, CaseIterable, Sendable {
+        case music
+        case room
+
+        /// Multiplier on every onset detector's threshold.
+        public var onsetThresholdScale: Float { self == .room ? 1.45 : 1 }
+        /// Multiplier on the display smoothing, so a room's bars glide.
+        public var smoothingScale: Double { self == .room ? 2.0 : 1 }
+        /// Multiplier on the loudness reference's release, so a room's gain
+        /// wanders less.
+        public var gainReleaseScale: Double { self == .room ? 2.5 : 1 }
+    }
+
     /// Everything a user can turn.
     public struct Tuning: Equatable, Sendable {
         /// Input gain multiplier applied after the gate.
@@ -29,15 +51,19 @@ public final class VisualizerPipeline {
         /// Whether the analyzer flattens pink noise. Off is the pre-tuning
         /// behaviour, for measuring against.
         public var equalization: Bool
+        /// Which kind of source this is.
+        public var sourceProfile: SourceProfile
 
         public init(sensitivity: Double = 1.0,
                     autoGain: Bool = true,
                     gateMarginDB: Double = VisualizerPipeline.defaultGateMarginDB,
-                    equalization: Bool = true) {
+                    equalization: Bool = true,
+                    sourceProfile: SourceProfile = .music) {
             self.sensitivity = sensitivity
             self.autoGain = autoGain
             self.gateMarginDB = gateMarginDB
             self.equalization = equalization
+            self.sourceProfile = sourceProfile
         }
 
         /// What the visualizer did before any live-test tuning: no gate, no
@@ -93,6 +119,18 @@ public final class VisualizerPipeline {
     public let sampleRate: Float
     public let bandCount: Int
 
+    /// Analysis hop, in samples. **Not** tied to the display rate.
+    ///
+    /// Tempo is estimated by autocorrelating the onset envelope, and at 15 fps a
+    /// beat period is 7-8 samples — the nearest candidates around 120 BPM being
+    /// 112 and 128, so tempo could never be better than +/-8 BPM. Analysing on a
+    /// 512-sample hop gives a ~94 Hz envelope instead, which is what makes a
+    /// stable BPM possible at all.
+    public static let analysisHop = 512
+
+    /// How often analysis runs, in hertz.
+    public var analysisRate: Double { Double(sampleRate) / Double(Self.analysisHop) }
+
     private var analyzer: SpectrumAnalyzer
     private var smoother: LevelSmoother
     private var noiseFloor: NoiseFloorTracker
@@ -128,6 +166,24 @@ public final class VisualizerPipeline {
     private let levelsLock = NSLock()
     private var latestLevels: [Float]?
 
+    // MARK: Musical layer
+
+    private var pending: [Float] = []
+    private var onsetDetectors: [OnsetKind: OnsetDetector] = [:]
+    private var tempoTracker: TempoTracker
+    private var features = FeatureExtractor()
+    private var analysisTime: Double = 0
+    private var lastAnalysisTime: Double = 0
+    /// Onsets seen since the last display frame, coalesced by kind — the
+    /// analysis runs several times per displayed frame, so a hit must not be
+    /// lost just because it landed between them.
+    private let musicalLock = NSLock()
+    private var pendingOnsets: [OnsetKind: Float] = [:]
+    private var latestTempo = TempoEstimate()
+    private var latestCentroid: Float = 0
+    /// Previous full spectrum, for the broadband flux the tempo tracker runs on.
+    private var previousSpectrum: [Float] = []
+
     public init(sampleRate: Float, bandCount: Int, tuning: Tuning = Tuning()) {
         self.sampleRate = sampleRate
         self.bandCount = bandCount
@@ -140,6 +196,20 @@ public final class VisualizerPipeline {
         self.loudness = LoudnessReference()
         self.decisionAverage = [Float](repeating: 0, count: bandCount)
         self.gateIsOpen = [Bool](repeating: false, count: bandCount)
+        let rate = Double(sampleRate) / Double(Self.analysisHop)
+        self.tempoTracker = TempoTracker(analysisRate: rate)
+        self.smoother = LevelSmoother(
+            bandCount: bandCount,
+            releaseTime: LevelSmoother.defaultReleaseTime * tuning.sourceProfile.smoothingScale)
+        for kind in OnsetKind.allCases {
+            self.onsetDetectors[kind] = OnsetDetector(
+                analysisRate: rate,
+                thresholdRatio: kind.thresholdRatio * tuning.sourceProfile.onsetThresholdScale,
+                refractorySeconds: kind.refractorySeconds)
+        }
+        self.loudness = LoudnessReference(
+            releaseTime: LoudnessReference.defaultReleaseTime
+                * tuning.sourceProfile.gainReleaseScale)
     }
 
     /// Time constant of ``decisionAverage``. Long enough to average out the
@@ -149,18 +219,88 @@ public final class VisualizerPipeline {
 
     // MARK: - Analysis half
 
-    /// Runs the FFT and stores the result, replacing anything not yet displayed.
+    /// Feeds captured samples in and runs analysis on fixed hops.
     ///
-    /// Overwriting rather than queueing is the whole coalescing story: if the
-    /// display falls behind, the frames it missed are gone rather than piling up
-    /// into a backlog that drifts ever further behind the music.
+    /// Buffers are whatever size the capture device chose; analysis runs on
+    /// ``analysisHop`` samples regardless, so the onset envelope has a stable
+    /// rate that does not depend on the audio driver — which is what tempo
+    /// estimation needs.
+    ///
+    /// The band levels are overwritten rather than queued: if the display falls
+    /// behind, the frames it missed are gone rather than piling into a backlog
+    /// that drifts further behind the music. Onsets are the exception — they are
+    /// *accumulated* until the next displayed frame, because a drum hit that
+    /// landed between frames should still be shown.
     @discardableResult
     public func analyze(_ samples: [Float]) -> [Float] {
-        let levels = analyzer.levels(from: samples)
-        levelsLock.lock()
-        latestLevels = levels
-        levelsLock.unlock()
-        return levels
+        pending += samples
+        var lastLevels: [Float] = []
+
+        while pending.count >= SpectrumAnalyzer.windowSize {
+            let window = Array(pending.prefix(SpectrumAnalyzer.windowSize))
+            pending.removeFirst(Self.analysisHop)
+
+            let magnitudes = analyzer.magnitudes(from: window)
+            lastLevels = analyzer.bandLevels(fromMagnitudes: magnitudes)
+
+            analysisTime += Double(Self.analysisHop) / Double(sampleRate)
+            runMusicalAnalysis(magnitudes: magnitudes, at: analysisTime)
+
+            levelsLock.lock()
+            latestLevels = lastLevels
+            levelsLock.unlock()
+        }
+
+        // A long buffer with no full window yet still must not grow forever.
+        if pending.count > SpectrumAnalyzer.windowSize * 4 {
+            pending.removeFirst(pending.count - SpectrumAnalyzer.windowSize)
+        }
+        return lastLevels
+    }
+
+    private func runMusicalAnalysis(magnitudes: [Float], at time: Double) {
+        let elapsed = time - lastAnalysisTime
+        lastAnalysisTime = time
+        guard elapsed > 0 else { return }
+
+        var firedKinds: [OnsetKind: Float] = [:]
+        for kind in OnsetKind.allCases {
+            let range = analyzer.binRange(forHz: kind.range)
+            guard range.lower <= range.upper else { continue }
+            let slice = Array(magnitudes[range.lower...min(range.upper, magnitudes.count - 1)])
+            guard var detector = onsetDetectors[kind] else { continue }
+            let strength = detector.process(magnitudes: slice, time: time)
+            onsetDetectors[kind] = detector
+            if strength > 0 { firedKinds[kind] = strength }
+        }
+
+        // Broadband **flux** for the tempo envelope — the sum of positive
+        // change across the spectrum, not its energy. Feeding energy instead
+        // (as this did at first) hands the autocorrelation a signal dominated
+        // by the track's overall level rather than by its rhythm, and the tempo
+        // wanders accordingly.
+        var totalFlux: Float = 0
+        if previousSpectrum.count == magnitudes.count {
+            for index in magnitudes.indices {
+                let rise = magnitudes[index] - previousSpectrum[index]
+                if rise > 0 { totalFlux += rise }
+            }
+        }
+        previousSpectrum = magnitudes
+
+        let tempo = tempoTracker.process(fluxSum: totalFlux, elapsed: elapsed)
+        // A kick is the most reliable thing to align the grid to.
+        if firedKinds[.kick] != nil { tempoTracker.align(toOnsetAt: time) }
+
+        let centroid = analyzer.centroid(ofMagnitudes: magnitudes)
+
+        musicalLock.lock()
+        for (kind, strength) in firedKinds {
+            pendingOnsets[kind] = max(pendingOnsets[kind] ?? 0, strength)
+        }
+        latestTempo = tempo
+        latestCentroid = centroid
+        musicalLock.unlock()
     }
 
     // MARK: - Display half
@@ -248,6 +388,35 @@ public final class VisualizerPipeline {
         return heights
     }
 
+    /// One display frame's worth of musical description.
+    ///
+    /// This is what modes consume. It combines the levelled band heights with
+    /// the musical layer, and it is the only place the two meet.
+    public func musicalFrame(elapsed: Double) -> MusicalFrame {
+        let heights = advance(elapsed: elapsed)
+
+        musicalLock.lock()
+        let onsets = pendingOnsets
+        pendingOnsets.removeAll()
+        let tempo = latestTempo
+        let centroid = latestCentroid
+        musicalLock.unlock()
+
+        let derived = features.update(bandLevels: heights, centroid: centroid, elapsed: elapsed)
+
+        var frame = MusicalFrame()
+        frame.time = analysisTime
+        frame.bandLevels = heights
+        frame.onsets = onsets
+        frame.tempo = tempo
+        frame.bass = derived.bass
+        frame.mid = derived.mid
+        frame.treble = derived.treble
+        frame.loudness = derived.loudness
+        frame.brightness = derived.brightness
+        return frame
+    }
+
     /// The reference used when auto-gain is off — the point where a band
     /// standing this far above its floor fills its column.
     public static let fixedReference: Float = 0.05
@@ -298,6 +467,18 @@ public final class VisualizerPipeline {
         decisionAverage = [Float](repeating: 0, count: bandCount)
         hasSeededDecisionAverage = false
         gateIsOpen = [Bool](repeating: false, count: bandCount)
+        pending.removeAll()
+        pendingOnsets.removeAll()
+        features = FeatureExtractor()
+        tempoTracker = TempoTracker(analysisRate: analysisRate)
+        for kind in OnsetKind.allCases {
+            onsetDetectors[kind] = OnsetDetector(analysisRate: analysisRate,
+                                                 thresholdRatio: kind.thresholdRatio,
+                                                 refractorySeconds: kind.refractorySeconds)
+        }
+        previousSpectrum.removeAll()
+        analysisTime = 0
+        lastAnalysisTime = 0
         levelsLock.lock()
         latestLevels = nil
         levelsLock.unlock()
