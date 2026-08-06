@@ -50,6 +50,10 @@ let usage = """
       rainbow <on|off>      Set the rainbow (hue-cycling) flag
       paint <RRGGBB>        Switch to custom mode (0x14) and paint every per-key
                             LED that colour
+      mouse <subcommand>    Read the wired Glorious Model O / O- (258A:0036).
+                            A different device with a different protocol —
+                            feature reports, no checksum, no START/END. Run
+                            `gmmk-cli mouse` for its subcommands.
 
       Each of these opens with a 0x03 "hello" read — without a recent one the
       firmware stores writes but never applies them — and then sends one
@@ -263,6 +267,9 @@ case "rainbow":
     }
     send(GMMKTransaction.setRainbow(on),
          describing: "rainbow -> \(on ? "on" : "off")")
+
+case "mouse":
+    runMouseCommand(rest)
 
 case "read":
     // Bring-up/debug: read from the keyboard and print the reply.

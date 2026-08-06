@@ -19,7 +19,9 @@ let package = Package(
         // targets deliberately share nothing with the keyboard's.
         .target(name: "GloriousMouseProtocol"),
         .target(name: "GloriousMouseHID", dependencies: ["GloriousMouseProtocol"]),
-        .executableTarget(name: "gmmk-cli", dependencies: ["GMMKProtocol", "GMMKHID"]),
+        .executableTarget(name: "gmmk-cli",
+                          dependencies: ["GMMKProtocol", "GMMKHID",
+                                         "GloriousMouseProtocol", "GloriousMouseHID"]),
         .executableTarget(name: "GMMKLightsApp", dependencies: ["GMMKProtocol", "GMMKHID"]),
         .testTarget(name: "GMMKProtocolTests", dependencies: ["GMMKProtocol"]),
         .testTarget(name: "GMMKHIDTests", dependencies: ["GMMKHID"]),
