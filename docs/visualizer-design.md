@@ -30,10 +30,91 @@ This document specifies the replacement. It is organised as ten sections:
 7. [Transport and backpressure](#7-transport-and-backpressure)
 8. [Latency budget](#8-latency-budget)
 9. [The five modes, re-specified](#9-the-five-modes-re-specified)
+11. [Multi-timescale energy](#11-multi-timescale-energy-new-in-r2) — *new in r2*
+12. [Spatial colour and propagation](#12-spatial-colour-and-propagation-new-in-r2) — *new in r2*
 10. [Verification: the universal test battery and pass metrics](#10-verification)
+
+(§11 and §12 are numbered after §10 but placed before it, so that every existing
+cross-reference stays valid while §10 remains the last normative section.)
 
 Appendix A restates every constant in one table. Appendix B is the migration
 order.
+
+---
+
+# Revision 2 — the second verdict (new)
+
+Revision 1 shipped and runs on hardware. It fixed what it set out to fix: the
+board no longer strobes, the sine-wave onset bug is gone, gestures hold. The
+user's verdict on **r1 running live** is three new complaints, and none of them
+is a tuning error — each is a direct consequence of something r1 specified.
+
+> 1. "The keyboard updates feel off beat."
+> 2. "It's like a cliff — the moment a certain sound plays a certain colour
+>    happens, it's instantaneous triggered and then goes back to zero. There's
+>    no sort of short term accumulation."
+> 3. "The colour is concentrated in the centre and isn't diverse / well
+>    propagated."
+
+**The three root causes, stated as design faults rather than bugs:**
+
+**F1 — the pipeline is late and the design compensates for the wrong half of
+it.** §8.2 already schedules beat-locked gestures early, but by a *fixed*
+`predictionLead = 0.040` that nobody measured, applied only in
+`ModeRenderer.beatIsDue`, and only when a beat happens to fall inside the
+current frame's window. Meanwhile the total is 60–90 ms and the *variance* of
+the residual — which is what "off beat" actually feels like — is not measured
+anywhere. A constant lead cancels a constant lag; the complaint is about the
+part that is not constant. Answered by [§2.3-R](#23-tempo-and-phase--revised-r2),
+[§7-R](#7-transport-and-backpressure) and [§8-R](#8-latency-budget--revised-r2).
+
+**F2 — the cliff is what P1 specifies.** Every control signal in r1 is
+normalised against its *own* history over 4 s (`RelativeFollower.longTime = 4.0`)
+or 10 s (`PercentileNormaliser.window`), and §3.2 states outright that the
+relative values "revolve around **1.0** for any material at any volume." M6 then
+*enforces* that: `mean(AVERAGE_RELATIVE_b) ∈ [0.85, 1.20]` on every case. A
+quantity normalised over τ cannot express variation slower than τ — so the
+system is structurally incapable of representing "louder than it was ten seconds
+ago". Master brightness makes it worse: it is
+`smoothstep(0.02, 0.25, rms·gain)`, which saturates at 1.0 for anything
+genuinely playing and therefore carries no dynamics at all. Everything that
+remains is impulse-response: trigger → peak → decay to a bed that is itself a
+ratio pinned at 1.0. The cliff is not a bug. It is r1 working as written.
+Answered by [§11](#11-multi-timescale-energy-new-in-r2) and by amending P1 with
+[P9](#p9).
+
+**F3 — hue is one global scalar and the geometry piles light in the middle.**
+`ModeRenderer.colour(for:)` maps a single number — the percentile-normalised
+spectral centroid, `state.brightness` — through one ramp, for the whole board,
+every frame. The only spatial hue variation in the entire system is the ±0.08
+per-drum offset in §9.3, which colours a ring and nothing else. Geometrically:
+`paintPulse` is brightest at the centre column by construction (`shape` falls
+12 % to the edges), `paintVU` fills symmetrically outward from the centre, and
+`triggerRing` puts **every kick** — the most frequent event on almost any
+material — at exactly the centre column. Answered by
+[§12](#12-spatial-colour-and-propagation-new-in-r2).
+
+**What r2 changes, section by section:**
+
+| section | status in r2 |
+|---|---|
+| §0 principles | **amended** — P1 qualified, P9/P10/P11 added |
+| §1 threads and clocks | unchanged, still correct |
+| §2 analysis stage | capture note **revised**; §2.3 **rewritten**; §2.4 **new** (the aubio decision) |
+| §3 universal adaptation | unchanged, but now explicitly scoped to the *fast* timescale by P9 |
+| §4 ballistics | unchanged — the AHR primitive is reused by §11 |
+| §5 gestures | unchanged, plus the prediction/absorption interaction in §2.3-R |
+| §6 render stage | unchanged; §6.2 composition order gains the colour-field step |
+| §7 transport | **revised** — run-detection cost model, scattered-set fallback, budget |
+| §8 latency | **rewritten** — unavoidable vs compensated ledger, ≤ 40 ms target |
+| §9 modes | **revised** in its common layer; per-mode identities unchanged |
+| §10 verification | **extended** — M8, M9, M10; five new battery cases; one new arm |
+| §11 multi-timescale energy | **new** |
+| §12 spatial colour and propagation | **new** |
+
+§11 and §12 are numbered above §10 but placed *before* it in the document, so
+that every existing cross-reference in the codebase and in this file stays
+valid and §10 remains the last normative section.
 
 ---
 
@@ -49,6 +130,11 @@ same quantity's own recent history*. The only permissible absolute constants are
 (a) time constants in seconds, (b) perceptual constants (gamma, minimum on-time),
 and (c) numerical guards that are provably below the ADC's own noise floor
 (e.g. `1e-12` in a divisor), never used as a decision threshold.
+
+> **Amended in r2.** P1 says *what* to compare against, and r1 read it as also
+> saying *how far back*. It does not. "Its own recent history" is a family of
+> statements, one per window length, and r1 picked one window (4 s / 10 s) for
+> everything. See P9.
 
 **P2 — Wall-clock ballistics only.** Every filter coefficient is derived per
 update as `a = exp(-dt_actual / τ)` with τ in seconds and `dt_actual` measured.
@@ -83,6 +169,44 @@ band levels — never a stepped integer state advanced once per frame.
 **P8 — Compose in linear light, gamma once at the very end.** All mixing,
 envelope maths and interpolation happen in a float 0…1 perceptual/linear space.
 Exactly one gamma encode occurs, immediately before the HID byte packing.
+
+<a id="p9"></a>
+**P9 — Normalise against a window longer than the structure you want to show
+(new in r2).** A signal normalised over τ is high-pass filtered at ≈ 1/τ: it
+*cannot* express variation slower than τ, by construction. Therefore every
+displayed quantity must name the timescale it lives on, and the system must
+carry at least three:
+
+| timescale | window | what it is allowed to express | reference |
+|---|---|---|---|
+| TRANSIENT | 10–300 ms | individual hits | §4.1 accents |
+| PHRASE | 0.5–2 s | this bar is louder than the last one | §11.2 |
+| SECTION | 10–30 s | we are in the drop, not the intro | §11.3 |
+
+A quantity normalised at one timescale may not be used to drive a display
+element that is supposed to show a different one. `AVERAGE_RELATIVE` (τ = 4 s)
+is a **trigger and motion** vocabulary and nothing else; using it as the board's
+resting level — which r1 does, in every mode's bed — is why the board has no
+memory. §11 supplies the two slower references. M6's `[0.85, 1.20]` bound
+continues to apply to the *fast* relative values and explicitly does **not**
+apply to the §11 envelopes; asserting it on those would re-impose the defect.
+
+**P10 — Schedule to land, do not fire on detection (new in r2).** Any gesture
+whose correct visual instant is *predictable* — an on-grid beat, a bar line, a
+section boundary — is scheduled so that its **visible onset**, plus the measured
+end-to-end pipeline latency, coincides with that instant. Firing at detection
+time is only correct for events that were not predictable. The pipeline latency
+used for this must be a *measured, live* quantity, never a constant, and its
+residual variance must be reported (M8). A design that compensates a mean it
+never measured is indistinguishable from one that got lucky.
+
+**P11 — Colour is a field, not a scalar (new in r2).** Hue and saturation are
+functions of `(column, time)`, evolving on the PHRASE and SECTION timescales,
+never on the frame. Gestures deposit colour into a decaying spatial buffer, so
+that motion is visible in hue as well as in brightness. No display element may
+take its hue from a single board-wide number. Correspondingly, no gesture family
+may have a fixed origin: gesture origins are chosen from the *register that
+fired*, so that where light appears carries information.
 
 ---
 
@@ -194,9 +318,28 @@ use hop 448 (98.4 Hz). **Latency is set by the hop, not the window** — do not
 shrink the window to chase latency; it costs low-frequency resolution, which is
 where kick discrimination lives.
 
-**Mic path:** `MicrophoneCapture.bufferSize` must drop from 2048 (42.7 ms, and
-it delivers four hops in a burst) to 256 or 512. The audio callback now only
-copies into the ring, so a small buffer is cheap.
+**Capture buffers — REVISED (r2).** r1 said "drop the mic buffer from 2048 to
+256 or 512". That is **done**: `MicrophoneCapture.bufferSize = 512`, i.e.
+10.7 ms and exactly one analysis hop. The remaining questions are how much
+further to go, and what the *other* source does.
+
+* **The floor is the hop, not the buffer.** The analyser cannot run until a
+  whole hop of 512 samples exists. A capture buffer smaller than one hop adds
+  callback overhead and buys **zero** latency: the first hop still completes at
+  the same wall-clock instant. So `bufferSize = hop = 512` is the smallest
+  buffer that means anything, and r2 fixes it there rather than chasing 256.
+  Buffers *larger* than one hop are the real defect: 2048 delivered four hops in
+  a burst, which is not a slow analysis rate but a *stuttering* one, and burst
+  delivery is invisible to every metric that averages.
+* **System audio is the one still unbounded.** The process tap hands over
+  whatever CoreAudio chose. Requirement: request 512 frames via the aggregate
+  device's buffer-frame-size property where the API allows, and **count every
+  delivery larger than two hops** as a telemetry defect (`burstyDeliveries`).
+  Target: `burstyDeliveries / deliveries ≤ 0.01` over a ten-minute run. A source
+  that cannot meet it is a latency defect that no amount of scheduling fixes,
+  and it must be visible rather than averaged away.
+* **Do not shrink the FFT window.** 2048 stays. Its group delay is *compensated*
+  (§8.1-R), not paid.
 
 ### 2.1 Bands
 
@@ -271,27 +414,175 @@ Low-confidence events drive dimmer gestures rather than being discarded — the
 transition from "hit" to "no hit" must be continuous, or the board chatters at
 the detection boundary.
 
-### 2.3 Tempo and phase
+<a id="23-tempo-and-phase--revised-r2"></a>
+### 2.3 Tempo and phase — REVISED (r2)
 
 The existing autocorrelation → harmonic-sum → median-lock chain measures well
-(120.0 BPM median, 100 % of frames within 3 % on the tuning signal) and is kept.
-What changes is what is published and how it is corrected:
+(120.0 BPM median, 100 % of frames within 3 % on the tuning signal; BPM sd 0.04
+on real music) and is kept **unchanged**. What r1 got right and keeps:
 
 * Publish `(bpm, phase φ ∈ [0,1), confidence)` — a **continuously advancing
   phase**, not a stream of beat triggers. `φ` advances as `φ += dt/beatPeriod`
   every analysis hop, always, even when detection fails.
 * **Phase is corrected gradually, never snapped.** On a detected beat, `φ` moves
-  20 % of the way toward 0 (`φ ← φ · 0.8` modulo wrap, taking the shorter
-  direction). Tempo changes are rate-limited to ±2 % per beat and require three
-  consecutive agreeing estimates. This is BTrack's prior-weighted design: new
-  evidence never overrides an established hypothesis in one step.
-* **Confidence gates beat-locked behaviour.** `confidence < 0.35` (ambient,
-  rubato, spoken word) cross-fades gestures from beat-scheduled to
-  envelope-driven over 1.5 s. Never a hard switch — a visibly wrong beat grid is
-  worse than no beat grid.
-* **Predictive scheduling.** With tempo locked, beat-driven gestures are
-  scheduled at *predicted* beat times minus the measured pipeline latency
-  (§8.2), which makes their visible latency ≈ 0.
+  20 % of the way toward 0, computed at the *beat's own instant* rather than at
+  the hop that noticed it (`TempoTracker.align(toBeatAt:now:)`). Tempo changes
+  are rate-limited to ±2 % per beat and require three consecutive agreeing
+  estimates. BTrack's prior-weighted design: new evidence never overrides an
+  established hypothesis in one step.
+* **Confidence gates beat-locked behaviour**, cross-faded through `gridWeight`,
+  never switched.
+
+**What r2 adds.** r1's predictive scheduling was one line — `predictionLead =
+0.040`, a guess, applied only inside `beatIsDue`. Four things are missing and
+each of them is part of "off beat":
+
+#### 2.3.1 Publish the beat, not just the phase
+
+`AnalysisState` gains two fields:
+
+```
+nextBeatTime  = state.time + (1 − φ) · beatPeriod      // host time, absolute
+phaseSigma    = σ_φ, the phase-error spread (below)
+```
+
+The renderer must never recompute a beat time from `φ` and its own `now`: `φ` in
+an interpolated state has already been advanced by the interpolator, and doing
+the arithmetic twice is how a 10–20 ms error enters for free. One absolute
+timestamp, computed where the phase actually lives.
+
+#### 2.3.2 Phase stability is the gate, not tempo confidence
+
+The user's complaint is phase, not BPM — the tracker's BPM sd is 0.04, which is
+already an order of magnitude better than it needs to be. So measure the thing
+that is actually wrong:
+
+```
+at each accepted phase correction, record the pre-correction error
+    ε_n = wrapped phase error in beats, ∈ [−0.5, 0.5]
+σ_φ  = standard deviation of the last 8 values of ε_n            (in beats)
+```
+
+`σ_φ` is published and drives the prediction lead directly:
+
+```
+leadWeight = smoothstep(0.12, 0.06, σ_φ) · gridWeight
+```
+
+i.e. full lead when the grid holds within ±6 % of a beat (≈ 32 ms at 112 BPM),
+none when it is worse than ±12 %, continuous in between, and multiplied by the
+existing confidence ramp. **This is the term that decides whether the board is
+allowed to anticipate at all**, and it is the one number r1 never had.
+
+#### 2.3.3 Schedule to land (P10)
+
+Let `L̂` be the live measured end-to-end latency (§8.1-R). For a predicted beat
+at `T_b`, a gesture with AHR attack `τ_a`:
+
+```
+visible onset of a gesture  t_vis = startTime + τ_a · ln 2      (half-rise)
+we require                  t_vis + L̂ = T_b
+therefore                   startTime = T_b − leadWeight · (L̂ + τ_a · ln 2)
+```
+
+The half-rise point is used because that is what an eye — and M8 — calls "the
+gesture happened". `leadWeight` scales the whole lead, so a shaky grid degrades
+continuously to reactive behaviour rather than switching.
+
+Gestures are launched at the *frame whose scheduled time first reaches or passes
+`startTime`*, and evaluated as `f(t_frame − startTime)` exactly as §5 requires —
+so a gesture launched one frame late is still rendered at the right point of its
+own envelope. **`startTime` is immutable once set** (P7). If the confirming
+onset says the beat was elsewhere, that is the phase tracker's job, not the
+gesture's; moving a live gesture would be a discontinuity in `f(t)`.
+
+#### 2.3.4 Prediction credit — no phantom gestures
+
+A predicted gesture is launched before its evidence exists. Three rules bound
+what that can cost:
+
+1. **Provisional amplitude.** A predicted gesture launches at
+   `A = γ · A_exp`, `γ = 0.6`, where `A_exp` is an EWMA (τ = 4 beats) of the
+   amplitude of the last *confirmed* on-grid onsets. A phantom is therefore
+   always a modest accent, never a full flash.
+2. **Confirmation absorbs (this is P5, unchanged).** If an arbitrated onset
+   arrives with timestamp inside `[T_b − W, T_b + W]`, `W = 90 ms`, it is
+   **consumed** by the in-flight predicted gesture: `amplitude =
+   max(amplitude, A_actual)`, phase and `startTime` untouched. It does **not**
+   create a second gesture. This is exactly §5.2's absorption rule and requires
+   no new mechanism — but the consumption must be explicit, or prediction and
+   detection double-fire on every beat, which reads as a flam.
+3. **Credit.** A counter `credit ∈ [−4, +4]`, starting at 0: `+1` on
+   confirmation, `−2` on a beat that passes `T_b + W` unconfirmed. Predicted
+   launches are permitted only while `credit ≥ +1`. Two consecutive misses
+   therefore stop prediction, and two consecutive confirmations restart it. An
+   unconfirmed gesture already in flight is **not** cancelled — cancelling it
+   would be a visible pop-out, which is worse than a dim accent — it simply
+   decays on its own envelope at 0.6 amplitude.
+
+Credit is also zeroed whenever the liveliness gate closes or `grounded` falls
+(the analyser already abandons the grid 4 s after the last onset), so the board
+cannot go on beating at a tempo the music has stopped playing.
+
+#### 2.3.5 Reactive path unchanged
+
+Onsets that are *not* consumed by a predicted gesture behave exactly as in r1:
+they are timestamped back by the group delay and fire immediately. Fills,
+vocal transients and everything off the grid stay reactive by design — they were
+not predictable, so there is nothing to schedule against.
+
+---
+
+### 2.4 Decision record: aubio versus the in-house detector (new in r2)
+
+**Decision: keep the in-house detector and tempo tracker. Do not link aubio.**
+Recorded here with its reasoning and its revisit trigger, because it is the
+obvious alternative and it should not have to be re-argued.
+
+**The option.** [aubio](https://aubio.org) is a mature, streaming/causal C
+library: complex-domain and HFC onset detection, a comb-filter beat tracker in
+the Davies/Böck lineage, well-tested on MIREX-style corpora. Linking it would
+replace §2.2 and the measurement half of §2.3 with code that is better validated
+than ours.
+
+**Why not:**
+
+1. **Licence — decisive on its own.** aubio is **GPL-3** (a commercial licence
+   exists but is not free). This repository is **MIT** (`LICENSE`, "Copyright (c)
+   2026 Glorious Lights contributors"). Linking aubio into `GloriousVisualizer`
+   would relicense the shipped application under GPL-3, and — because `viz-sim`
+   links the same engine so that a measured number is a claim about the app
+   rather than about a copy of it — it would relicense the test harness too.
+   That is a project-level decision about how this software may be redistributed,
+   traded for an improvement in a component that is not the one failing.
+2. **The complaint is phase and latency, not BPM.** The in-house estimate is
+   already stable: 120.0 BPM median, 100 % of frames within 3 %, sd 0.04 on real
+   music. aubio would not measurably improve a number that is already at the
+   noise floor of the question. What is unmeasured is `σ_φ` — and §2.3.2 adds
+   it, in about twenty lines, to the tracker we already own.
+3. **aubio's beat tracker emits the wrong shape of output.** It reports *beat
+   events*, causally, after the beat. This design has deliberately moved to a
+   continuously advancing **phase** precisely because a phase can be projected
+   forward and an event stream cannot (§2.3.1, P10). Adopting aubio would mean
+   building the continuous-phase and prediction-credit layer *on top of it*
+   anyway — i.e. keeping all the new work and adding a dependency.
+4. **The onset defect aubio would have fixed is already fixed.** The 12.1
+   onsets/s on a 440 Hz sine is gone, and M5 now asserts *exactly zero* on four
+   stationary cases. Buying a better detection function to solve a solved problem
+   is not a trade.
+5. **Integration cost is real.** A C dependency in SwiftPM, an FFI bridge on the
+   analysis thread, a second build configuration for CI, and no Swift-native
+   fallback for anyone building the app from source.
+
+**What we take anyway** — ideas, not code, and the ideas are not the licensed
+thing: the adaptive-median peak-picker with a delayed decision (already in
+§2.2), and the multi-hypothesis idea behind aubio's tempo agents, which is what
+`σ_φ` and the prediction credit are a cheap scalar version of.
+
+**Revisit if, and only if, both hold:** (a) M8 mean absolute beat-alignment
+error cannot be brought under 30 ms after §2.3-R and §8-R are implemented and
+measured, **and** (b) the project accepts relicensing to GPL-3. Failing (a)
+alone is a reason to fix the scheduling, not to change the licence.
 
 ---
 
@@ -735,6 +1026,59 @@ details".
    `END`-less no-op instead of 9 packets. On typical material (pulse, VU) the
    changed-key count per frame is far below 126, so the packet count per frame
    drops several-fold — this is what makes 30 fps reachable at all.
+
+   > **REVISED (r2) — the packet builder, specified exactly.** Diffing is
+   > implemented (`VisualizerController.packets(for:lastSent:)`) but its cost
+   > model was never written down, and "1–3 packets per frame" is a *target* that
+   > nothing currently asserts. The rules below are normative.
+   >
+   > The wire constraint: a `0x11` write carries **≤ 18 keys** at
+   > `address = keyIndex · 3`, one **contiguous run** per packet. So the cost of
+   > a frame is `Σ over runs ceil(runLength / 18)`, and the builder's only
+   > freedom is where it ends a run.
+   >
+   > **Run detection.** Walk the 126 keys. Open a run at the first changed key.
+   > Continue through unchanged keys while the gap since the last changed key is
+   > `≤ G`, `G = 4`. Close the run at the last *changed* key (never at the
+   > padding). Rationale for `G = 4`: repainting `g` unchanged keys costs
+   > nothing extra until the run crosses an 18-key packet boundary, whereas
+   > splitting always costs a whole extra packet — so bridging is free up to the
+   > point where it is not, and 4 keeps the expected bridged length well inside
+   > one packet. `G` is a constant of the *wire format*, not of any song (P1).
+   >
+   > **Scattered-set fallback.** A sparse but spread-out change set is the
+   > pathological case: 20 changed keys at stride 6 produce 20 runs and 20
+   > packets — worse than the 7-packet full repaint it replaced. So, after run
+   > detection, if
+   >
+   > ```
+   > packetCount(runs) ≥ ceil(changedKeyCount / 18) + 2      // fragmentation test
+   >   OR packetCount(runs) > 5                              // absolute budget
+   > ```
+   >
+   > the builder discards the runs and emits a **single full repaint** (7 colour
+   > packets, indices 1…126). The full repaint is the ceiling, and no frame may
+   > ever cost more than it. `5` is chosen because 5 colour packets + `START` +
+   > `END` = 7 wire writes, which is under the 9 of a full frame, so the fallback
+   > can only ever reduce the worst case.
+   >
+   > **Bracketing.** `START` … `END` still brackets **every** frame, including a
+   > one-packet frame: `END` is the commit. A frame with zero changed keys sends
+   > nothing at all — not even the bracket.
+   >
+   > **Budget, asserted in telemetry, not hoped for:**
+   >
+   > | quantity | target | hard ceiling |
+   > |---|---|---|
+   > | median colour packets per delivered frame | ≤ 2 | — |
+   > | p95 colour packets per delivered frame | ≤ 4 | — |
+   > | max colour packets per delivered frame | — | 7 (the full repaint) |
+   > | frames falling back to full repaint | ≤ 5 % on musical cases | — |
+   >
+   > If the fallback rate exceeds 5 %, the *renderer* is producing scattered
+   > change sets — which is itself a defect (§6.2's σ = 1.0 blur should leave
+   > spatially coherent regions), and the fix belongs upstream, not in the packet
+   > builder.
 3. **Coalesce, don't queue.** Since the slot holds exactly one frame, a slow
    transport skips intermediate frames. Because gestures are continuous functions
    of time (§5), a skipped frame loses nothing structurally — the next delivered
@@ -761,27 +1105,90 @@ it. Targets: **≤ 60 ms indistinguishable from live; 60–120 ms tight; > 180 m
 reads as "not responding to the song"** — which the current chain, at 95–220 ms
 typical and multi-second pathological, plainly does.
 
-### 8.1 Budget, current vs designed
+<a id="81-budget--revised-r2"></a>
+### 8.1 Budget — REVISED (r2): unavoidable versus compensated
 
-| stage | today | designed | how it is trimmed |
+r1's budget added every stage into one number and then hoped a constant
+`predictionLead` would cancel it. That is the wrong shape. Latency splits into
+two kinds, and only one of them can be scheduled away:
+
+* **Unavoidable** — a delay between the sound existing and photons being
+  physically able to change. Nothing can cancel it; it can only be made smaller.
+* **Compensated** — a delay whose magnitude is *known* at the time the decision
+  is made, so the decision can simply be made earlier. Group delay is the
+  canonical case: the analyser already knows a transient happened 26.7 ms ago
+  and timestamps the event back accordingly.
+
+**The target: `T_unavoidable ≤ 40 ms`, everything else compensated.**
+
+| stage | ms @ 48 kHz / 30 fps | class | note |
 |---|---|---|---|
-| capture buffer | 10.7 ms tap / **42.7 ms mic** | 5.3–10.7 ms | mic buffer 2048 → 256/512; audio callback only copies |
-| FFT group delay | ~21 ms | ~21 ms | unchanged — window size is set by frequency resolution, latency by hop |
-| hop / peak-pick delay | +10.7 ms (reports `recent[1]`) | +10.7 ms | unchanged; the median window is causal-lagged by one hop and that is the price of the adaptive threshold |
-| envelope attack | up to 100 ms on some paths | 5–15 ms on accents | front-load the attack (§4.1). An 80 ms attack *is* 80 ms of latency |
-| analysis→render handoff | arbitrary phase, up to 66.7 ms | ≤ 5 ms | interpolate/extrapolate to `t_frame` (§6.1) instead of latching |
-| frame quantisation | 66.7 ms | 33.3 ms | fixed 30 fps clock |
-| transport | 30–55 ms, **1.5–4 s worst** | 10–25 ms, ≤ 145 ms worst | diffing, tighter timeouts, packet-scoped silence |
-| **total** | **95–220 ms, pathological seconds** | **≈ 55–90 ms, worst ≈ 210 ms** | |
+| capture buffer | 10.7 (mic, = 1 hop) | **unavoidable** | already at the hop; smaller buys nothing (§2) |
+| hop quantisation | 5.3 mean, 10.7 worst | **unavoidable** | analysis fires on whole hops |
+| FFT window group delay | 21.3 | *compensated* | `MusicAnalyzer.groupDelay` = (1024 + 256)/48000 = 26.7 ms, subtracted from every event timestamp |
+| peak-pick causal lag | 10.7 (1 hop) | *compensated* | folded into the same `groupDelay` term |
+| analysis → render handoff | ≤ 5 | *compensated* | §6.1 interpolates/extrapolates to `t_frame` |
+| envelope attack to half-rise | `τ_a · ln 2` = 10 (kick), 24 (pulse) | *compensated* | §2.3.3 subtracts it explicitly |
+| display frame quantisation | 16.7 mean, 33.3 worst | **unavoidable** | fixed 30 fps clock |
+| transport (diffed, 1–3 packets) | 6–9 median, ≤ 25 p95 | **unavoidable** (median), *compensated statistically* | §7.2-R budget |
+| transport worst case | ≤ 145 | **unavoidable, bounded** | 60 ms timeout × 2 attempts, packet-scoped |
+| **T_unavoidable** | **10.7 + 5.3 + 16.7 + 7 ≈ 39.7 ms** | | **the number that must stay ≤ 40** |
+| T_total, uncompensated | ≈ 39.7 + 21.3 + 10.7 + 5 + 10 ≈ 87 ms | | what the board would show with no scheduling |
 
-### 8.2 Negative latency for beat-locked content
+The 40 ms figure is not arbitrary: ITU-R BT.1359-1 puts the detectability
+threshold for a *lagging* visual at −125 ms and for a *leading* one at +45 ms.
+At 40 ms the board sits inside the region where the eye cannot separate light
+from sound at all — so the residual, and only the residual, is what "off beat"
+can be about. Which is why r2 measures the residual's **variance** (M8) and not
+just its mean.
 
-Once tempo confidence > 0.6, beat-driven gestures are scheduled at
-`predictedBeatTime − measuredPipelineLatency`, making their *visible* latency
-zero or slightly negative. Most of the perceived "liveness" of a music
-visualiser is beat-locked content, so this matters more than the raw number.
-Non-beat-locked detail (fills, vocal transients) still runs at the measured
-budget, which is why that budget must stay under ~90 ms.
+Two consequences r1 did not state:
+
+* **Frame quantisation is now the largest single unavoidable term.** If, after
+  §7.2-R, the transport genuinely delivers a 1–3-packet frame in under 10 ms,
+  the render rate may be raised to 40–48 fps, which takes the mean frame term
+  from 16.7 to 10–12 ms and `T_unavoidable` to ≈ 33 ms. This is the only lever
+  left, and it is gated on the M7 delivered-frame telemetry, not on a guess.
+* **`p95` matters more than the median.** A pipeline whose median is 40 ms and
+  whose p95 is 120 ms feels worse than one at a flat 70 ms, because the eye
+  tracks the *jitter* of the audio-visual offset. M7 already bounds the render
+  tick; M8 bounds what actually reaches the board.
+
+<a id="82-latency-compensation--revised-r2"></a>
+### 8.2 Latency compensation — REVISED (r2)
+
+r1: "beat-driven gestures are scheduled at `predictedBeatTime −
+measuredPipelineLatency`" — but nothing measured it, and the shipped value is a
+literal `predictionLead = 0.040`.
+
+**`L̂` is a live measurement, updated every frame:**
+
+```
+deliveryLag_n = t_END_echoed(n) − t_scheduled(n)      // per delivered frame
+D             = EWMA of deliveryLag over τ = 5 s, plus its p95
+L̂             = 0.5·dt_f            // mean display quantisation
+              + D                   // transport, measured
+              + 0.5·hopSeconds      // mean hop quantisation
+              + captureBufferSeconds
+              + userOffset           // §8.3, signed
+```
+
+Everything already compensated by timestamping (group delay, peak-pick lag,
+handoff) is **excluded** — including it would double-count and push gestures
+early by ~30 ms, which is the failure mode `TempoTracker.align` already had to
+be fixed for once ("two errors that agree numerically is not the same as either
+being right").
+
+`L̂` is clamped to `[0, 0.150]` s and rate-limited to 5 ms of change per second,
+so a single transport hiccup cannot yank the whole beat grid.
+
+**`L̂` is used only through `leadWeight` (§2.3.2/§2.3.3).** With a shaky grid the
+lead collapses to zero and the board is reactive — which is correct, because
+anticipating a beat you cannot locate is worse than being late.
+
+Non-beat-locked detail (fills, vocal transients) still runs at the full
+uncompensated ≈ 87 ms, which is why `T_unavoidable` and the transport budget
+must hold: there is nothing to schedule those against.
 
 ### 8.3 User offset
 
@@ -802,11 +1209,37 @@ schedule plus an envelope field* over the common foundation, with an explicit
 lifecycle and no re-triggering mid-gesture.
 
 Common to all five:
-* colour comes from the theme; hue variation is bounded to ±0.08 to avoid the
-  rainbow-vomit failure mode,
+* ~~colour comes from the theme; hue variation is bounded to ±0.08 to avoid the
+  rainbow-vomit failure mode~~ — **superseded by §12.** Colour comes from the
+  spatial hue field `H(x,t)`; the ±0.08 bound survives as a limit on what a
+  single *gesture* may deposit, not as a bound on the board,
 * all thresholds are in `CURRENT_RELATIVE` / `AVERAGE_RELATIVE` units,
 * all rendering is `f(t_frame)`,
 * the §6.3 per-key interlock applies unconditionally.
+
+> **REVISED (r2) — the common layer.** Two things move out of the individual
+> modes and into the shared foundation:
+>
+> **1. The bed is no longer per-mode.** Every mode in r1 invents its own resting
+> wash out of a ratio pinned at 1.0 (`pulseFloorShare · overallAverageRelative`,
+> `waveBedShare · midAverageRelative`, `rippleBedShare · …`), and spectrum and VU
+> have no bed at all. All of them are deleted and replaced by the single
+> §11.4 composition `bed(t) + swell(t)`, which is the same for every mode. What a
+> mode still owns is `shape(x,t)` — *where* the bed sits on the board — and its
+> gestures.
+>
+> **2. Gesture origins come from the register that fired (P11).** r1 puts every
+> kick ring at the exact centre column, which is the single largest contributor
+> to "the colour is concentrated in the centre". §12.4 gives the mapping. Per
+> mode:
+>
+> | mode | r1 origin | r2 origin |
+> |---|---|---|
+> | pulse | board-wide, brightest at centre | board-wide, brightest at the **centroid column** `x_c(t)` (§12.4) |
+> | wave | edge → edge | unchanged; now leaves a colour trail (§12.3) |
+> | ripple | kick = centre always | `originColumn(band)` — kick left, snare mid, hat right (§12.4) |
+> | spectrum | registers left→right | unchanged; it was already the good case |
+> | vu | symmetric from centre | **asymmetric**: left arm driven by low registers, right by high (§12.4) |
 
 ### 9.1 Pulse — "the board breathes with the beat"
 
@@ -895,6 +1328,325 @@ visible. The mouse is therefore the **slow layer**: driven by
 
 ---
 
+<a id="11-multi-timescale-energy-new-in-r2"></a>
+## 11. Multi-timescale energy (new in r2)
+
+> The user's exact words: *"it's like a cliff — the moment a certain sound plays
+> a certain colour happens, it's instantaneous triggered and then goes back to
+> zero. There's no sort of short term accumulation."*
+>
+> This section is the answer, and the first thing it has to do is undo something
+> §3 asserts.
+
+### 11.0 Why r1 cannot accumulate
+
+Everything r1 displays is built from quantities that are, by explicit design,
+memoryless beyond 4 s:
+
+* `AVERAGE_RELATIVE_b = short_b / long_b`, `long τ = 4.0 s` — §3.2 states it
+  "revolves around **1.0** for any material at any volume", which is precisely
+  the property that destroys structure.
+* `x_norm` is percentile-normalised over a 10 s window with a 0.5 s escape
+  hatch — so a build lasting 16 s is normalised *while it is happening*.
+* `master = smoothstep(0.02, 0.25, rms·gain)` saturates at 1.0 for anything
+  audible, so the one place with an absolute reference deliberately throws the
+  dynamics away.
+* Every mode's bed is one of those ratios × a share constant, so the resting
+  level of the board is pinned near a constant.
+
+Result: trigger → peak → decay to a constant. A cliff. Per **P9**, the fix is a
+second and third reference at longer windows, feeding a bed that the transients
+ride *on top of* rather than replace.
+
+### 11.1 The common source: a long-referenced energy `E(t)`
+
+All three envelopes are driven from one dimensionless scalar, computed per
+analysis hop.
+
+```
+Λ(t)  = 20·log10( max(rms(t), 1e-7) )              // log domain: music is multiplicative
+R_lo  = p05 of Λ over a 60 s decayed-histogram window
+R_hi  = p95 of Λ over the same window
+E(t)  = clamp( (Λ(t) − R_lo) / max(R_hi − R_lo, 6.0), 0, 1 )
+```
+
+* **60 s, not 10 s.** P9: to show a 20 s build you must normalise over something
+  longer than 20 s. 60 s is ~2 sections of typical popular music and comfortably
+  longer than any phrase.
+* **The 6 dB divisor floor** is the one place a decibel appears as a constant,
+  and it is a statement about *perception*, not about a track (P1(b)): a master
+  with less than 6 dB of programme dynamics genuinely has no structure to show,
+  and stretching its noise to full range would be inventing one. A heavily
+  limited EDM master reads flatter than a live recording — correct.
+* **Freeze while the master gate is closed**, exactly as §3.3 requires, so
+  silence cannot wind the reference down.
+* The same `QuantileTracker` type already in `Adaptive.swift` implements
+  `R_lo`/`R_hi`; only the window differs.
+* `E` starts undefined and is **held at 0 until the master gate has opened at
+  least once**. A session that begins in silence does not light the board.
+
+### 11.2 PHRASE — `Φ(t)`, the 0.5–2 s layer
+
+```
+Φ = AHR(attack τ = 0.35 s, hold = 0.25 s, release τ = 1.6 s).update(target: E)
+```
+
+* **The hold is the anti-cliff term at this timescale.** Side-chain ducking at
+  128 BPM has a 469 ms period; a beat gap in a ballad is ~800 ms. A 0.25 s hold
+  plus a 1.6 s release means neither of those starts a meaningful fall, while a
+  genuine 4-bar decrescendo (≈ 7.5 s at 128 BPM) is tracked almost exactly.
+* Rise is faster than fall (0.35 vs 1.6) because musical energy arrives faster
+  than it leaves, and because a build that lags its own crest reads as broken.
+
+### 11.3 SECTION — `Σ(t)`, the 10–30 s layer
+
+```
+Σ = one-pole on E with   τ_up = 8 s,   τ_down = 20 s
+```
+
+Asymmetric on purpose: a section arrives faster than it leaves, so a 2-bar
+breakdown inside a drop does not discard the drop.
+
+**Structure escape hatch.** A pure 20 s time constant makes a real section
+change take 20 s to show, which is its own failure. Reuse §3.3's dual-speed
+pattern, restated for structure:
+
+```
+D(t) = |Φ(t) − Σ(t)|                        // novelty
+if D > 0.35 sustained for > 1.5 s:
+      τ_up   ← 3 s        (accelerate upward only)
+      τ_down ← 3 s   ONLY IF  E < 0.15 sustained for ≥ 3 s
+until D < 0.15, then restore.
+```
+
+**The downward asymmetry is the anti-cliff guarantee at this timescale**, and it
+is normative: `Σ` may accelerate its *rise* on any novelty, but may accelerate
+its *fall* only on sustained genuine quiet. A filter sweep to nothing, a
+one-bar stop, a badly gain-staged verse — none of them can collapse the bed.
+Additionally `Σ` is rate-limited to a fall of **0.25 per second** at all times,
+so even the accelerated path takes ≥ 4 s from full to zero.
+
+**True silence still darkens the board.** Once the gate has opened, if
+`E < 0.05` continuously for `T_silence = 4.0 s`, a ramp-out multiplier is
+applied to the whole composition:
+
+```
+outAmount = smoothstep(4.0, 8.0, secondsSinceContinuousSilence)     // 0 → 1
+L ← L · (1 − outAmount)
+```
+
+so the board reaches black about 8 s after the music genuinely stops, and never
+sooner. Any `E ≥ 0.05` hop resets the timer instantly (rise is unrestricted).
+
+### 11.4 Composition — the exact formula
+
+Per column `x`, per frame `t`, in linear lightness before the §6.3 interlock:
+
+```
+bed(t)        = B0 + B1 · Σ(t)                        B0 = 0.09,  B1 = 0.15
+swell(t)      = S1 · max(0, Φ(t) − k · Σ(t))          S1 = 0.55,  k  = 0.85
+headroom(t)   = 1 − bed(t) − swell(t)
+accent(x,t)   = A1 · Σ_g  level_g(t) · kernel_g(x)    A1 = 0.90     (§5 gestures)
+
+L(x,t) = clamp( (bed(t) + swell(t)) · shape(x,t)
+                + accent(x,t) · headroom(t),          0, 1 ) · (1 − outAmount)
+```
+
+Ranges: `bed ∈ [0.09, 0.24]`, `swell ∈ [0, 0.55]`, and the accent scales into
+whatever is left, so a gesture always has somewhere to go — which is the
+property r1's `paintPulse` had to hand-roll (`hit · 0.85 · (1 − floor)`) and
+which is now structural.
+
+**The three properties this formula must deliver, stated so they can be
+falsified (M9):**
+
+1. **Never at zero while music plays.** `bed ≥ B0 = 0.09` whenever the gate is
+   open, so board-mean lightness `≥ 0.09 · mean_x shape(x,t)`. With every mode's
+   `shape` having a mean ≥ 0.7 this is ≥ 0.06, which is M9c's floor.
+   **This is deliberately a *board-mean* guarantee, not a per-key one.** A
+   per-key floor above the interlock's 0.14 rise threshold would make M1 and M4
+   vacuous — the exact circularity `ModeRenderer` was already corrected for once.
+   Individual keys must still be able to go dark.
+2. **Builds visibly build, drops visibly drop.** `swell = Φ − 0.85 Σ` is the
+   PHRASE energy *above* the section floor. Through a 16 s build, `Φ` tracks the
+   rise with a 1.6 s lag while `Σ` lags 8 s, so `swell` grows monotonically and
+   peaks at the drop; through a breakdown `Φ` falls in ~2 s while `Σ` holds, so
+   `swell → 0` and the board sits on the section bed. Target: `ρ_slow ≥ 0.80`
+   (M9b).
+3. **Transients punctuate without resetting the bed.** The accent term is
+   *added*, scaled by `headroom`. **Nothing in the accent path may write to `Φ`,
+   `Σ`, `E` or the trail buffers.** That one-way dependency is the whole
+   anti-cliff mechanism: a hit can only add light, never remove it, and can never
+   be followed by a return to zero because zero is not where the bed is.
+
+### 11.5 What this replaces
+
+| deleted | replaced by |
+|---|---|
+| `ModeRenderer.pulseFloorShare / waveBedShare / rippleBedShare` | `bed(t) + swell(t)` |
+| `ModeRenderer.bedEnvelope` (AHR 50/0/600 ms on a ratio) | `Φ` and `Σ` on `E` |
+| `paintPulse`'s `0.18·overallAverageRelative + 0.25·body` | ditto |
+| `master = smoothstep(0.02, 0.25, rms·gain)` as a *level* | `master` keeps its "is anything playing" role only; dynamics come from `bed + swell` |
+| spectrum's and VU's `bed = 0.0` | the common bed × their own `shape(x,t)` |
+
+`AnalysisState` gains three channels: `phrase`, `section`, `energy` (`Φ`, `Σ`,
+`E`), interpolated by the existing flat-vector interpolator for free.
+
+---
+
+<a id="12-spatial-colour-and-propagation-new-in-r2"></a>
+## 12. Spatial colour and propagation (new in r2)
+
+> *"The colour is concentrated in the centre and isn't diverse / well
+> propagated."*
+
+r1 has exactly one colour decision per frame: `state.brightness`, the
+percentile-normalised spectral centroid, mapped through a seven-stop ramp, for
+all 126 LEDs. Plus a ±0.08 per-drum offset on ripple rings. That is the entire
+colour model. Per **P11** it becomes a field.
+
+### 12.1 The hue field
+
+Hue is a function of column (rows within a column share it — the board is a
+17-wide instrument and per-row hue fights the bar metaphor; an optional ±0.02
+row tilt is permitted, no more):
+
+```
+H(x,t) = wrap01( H0(t)  +  A(t) · G(x,t)  +  C(x,t) )
+```
+
+**`H0(t)` — the drift term (SECTION timescale).** A slowly rotating base hue:
+
+```
+dH0/dt = ω0 · (0.25 + 0.75 · Σ(t))            ω0 = 1/180  turns per second
+```
+
+— a full wheel in 3 minutes at full section energy, 12 minutes at rest. Plus a
+**structure kick**: on a §11.3 novelty event (`D > 0.35` sustained 1.5 s), `H0`
+advances by `0.11` of the wheel, eased over 2 s. A new section therefore
+visibly changes the palette. **`H0` never moves per frame and never randomly** —
+the drift rate is tied to `Σ`, and the jumps to structure.
+
+**`A(t)·G(x,t)` — the register gradient, advected.** This is the key move: the
+spectral centroid stops being *the board's colour* and becomes *the position of
+the colour boundary*.
+
+```
+x_c(t) = brightness(t) · (N − 1)                  // N = 17; the centroid column
+G(x,t) = ( x − x_c(t) ) / (N − 1)      ∈ [−1, 1]  // warm below, cool above
+A(t)   = A_max · spread(t)                        A_max = 0.30 turns
+```
+
+`spread(t)` is the normalised spectral entropy over the existing per-band
+shares — how much of the spectrum is actually occupied:
+
+```
+s_b    = share(b) / Σ_b share(b)
+spread = −Σ_b s_b · ln s_b / ln 8        ∈ [0, 1]
+```
+
+So a bass-only passage (`spread` low) collapses the board toward one hue, and a
+full-band passage fans it across ±0.30 of the wheel. Bass-register columns read
+warm, treble-register columns cool, and the crossover **moves with the music**
+instead of the whole board sliding along a ramp together. `A(t)` is smoothed by
+an AHR (50 ms / 0 / 800 ms) so the fan opens and closes on the PHRASE timescale,
+not per frame.
+
+In `spectrum` mode the columns *are* registers, so `G` is literally register
+order and the mapping is exact. In the other four it reads as a warm-left,
+cool-right wash whose boundary tracks the centroid — which is what the "colour
+is not propagated" complaint is asking for.
+
+### 12.2 Saturation and value
+
+```
+sat(x,t)   = S0 + S1 · ( 0.4 · Φ(t) + 0.6 · Strail(x,t) )      S0 = 0.45, S1 = 0.55
+value(x,t) = L(x,t)                                            // §11.4, unchanged
+```
+
+Recently-struck columns are more saturated; the untouched bed is a paler tint of
+the same hue. HSV → linear RGB is done once per column per frame (17
+conversions), then §6.2's blur, interlock and single gamma encode proceed
+unchanged.
+
+### 12.3 The colour trail — motion visible in hue
+
+Two per-column decaying buffers that gestures write into. This is what makes
+motion legible as colour and not only as brightness.
+
+```
+per frame, per column x:
+    C(x,t)      ← C(x, t−dt) · exp(−dt / τ_trail)          τ_trail   = 0.90 s
+    Strail(x,t) ← Strail(x, t−dt) · exp(−dt / τ_sat)       τ_sat     = 0.60 s
+
+    for each live gesture g:
+        w = level_g(t) · kernel_g(x) · dt / τ_deposit      τ_deposit = 0.12 s
+        C(x,t)      += ν(g) · w
+        Strail(x,t) += w
+
+    C      clamped to ±0.18 turns
+    Strail clamped to  [0, 1]
+```
+
+`ν(g)` is the gesture's own hue offset — the r1 per-kind values, now *deposited
+into the board* instead of only tinting the gesture's own pixels: kick `−0.08`
+(warm), snare `0.00`, hat `+0.08` (cool), beat-driven `0.00`.
+
+A wave sweeping left to right therefore leaves a ~0.9 s hue wake behind it; a
+run of hats warms the right of the board for a second; a kick leaves a warm
+patch where its ring started. The ±0.08 deposit limit and the ±0.18 accumulation
+clamp together keep this inside "a tinted board", not "rainbow vomit" — and M10a
+puts an explicit upper bound on hue spread so the limit is enforced rather than
+asserted.
+
+### 12.4 Anti-centre-concentration
+
+**Gesture origins are chosen by the register that fired**, never fixed:
+
+```
+originColumn(band b) = round( (b + 0.5) / 8 · (N − 1) )
+                     = 1, 3, 5, 7, 9, 11, 13, 15   for b = 0…7
+```
+
+No band maps to column 8. Within an onset's kind, the band used is the one with
+the **higher flux** on that hop (kick: band 0 or 1 → column 1 or 3; snare: band
+3 or 4 → column 7 or 9; hat: band 7 → column 15), plus a deterministic ±1
+alternation so repeated hits of the same drum do not stack on one column. Kicks
+therefore live on the left, hats on the right, and *where* light appears carries
+register information instead of being a constant.
+
+**Per-mode geometry changes:**
+
+* **pulse** — `shape(x,t) = 1 − 0.25 · |x − x_c(t)| / (N − 1)`. Brightest at the
+  centroid column, which moves; r1's fixed 12 % falloff from column 8 is
+  deleted.
+* **vu** — stays a centre-out meter (that identity is deliberate) but becomes
+  **asymmetric**: `reach_left` from the low registers (bands 0–3),
+  `reach_right` from the high (bands 4–7). The meter is symmetric only when the
+  spectrum is, so its brightness centre of mass moves whenever the material is
+  tilted.
+* **ripple** — origins per the table above; the r1 "kick = centre, snare = ±4,
+  hat = ±7" scheme is deleted.
+* **wave**, **spectrum** — geometry unchanged; both gain the trail.
+
+### 12.5 The spatial-uniformity target
+
+Normative, and measured by M10:
+
+> Over any 30 s musical run, in any mode: let `V(x)` be the time-averaged mean
+> lightness of column `x`. Then **`0.5 · mean_x V(x) ≤ V(x) ≤ 1.8 · mean_x V(x)`
+> for every column** — no column starved, no column hogging.
+>
+> And, simultaneously, the per-frame brightness centre of mass `x̄(f)` must have
+> **`sd_f(x̄) ≥ 1.5` columns** and **`p95(x̄) − p05(x̄) ≥ 4.0` columns** — the
+> bright region must actually visit different parts of the board.
+
+The two clauses are deliberately in tension: a uniformly lit board satisfies the
+first trivially and fails the second, and a board that parks a bright spot in one
+place fails the first. Both must hold.
+
+---
+
 ## 10. Verification
 
 The audit's finding about the current tooling is the important one: **every
@@ -926,6 +1678,20 @@ unless stated.
 | `dnb-174` | double-time breakbeat, 174 BPM | gesture durations must stretch, not overlap |
 | `polyrhythm` | 3-against-4, ambiguous tempo | low-confidence cross-fade; must not free-run a wrong grid |
 
+**New cases (r2)** — these exist so the three new complaints become falsifiable:
+
+| id | signal | what it catches |
+|---|---|---|
+| `click-120` | bare click track: 10 ms 2 kHz sine burst, −12 dBFS, 8 ms exponential decay, exactly every 0.500 s, on digital silence. 30 s = 60 beats | **M8 ground truth.** Beat times are known exactly, so alignment error is a real number rather than an estimate |
+| `click-112` | as above at 112 BPM (0.5357 s), the tempo the user was listening to | the same, at a period that is not a round number of frames |
+| `click-90-ramp` | 90 BPM for 10 s, ramping linearly to 100 BPM over 10 s, then 100 BPM for 10 s | prediction must not overshoot on a tempo change; the ±2 %/beat rate limit is exercised here |
+| `click-120-gap` | `click-120` with beats 21–28 muted (4 s of silence mid-run) | **phantom-gesture test.** §2.3.4's credit rule must stop the board beating through the gap |
+| `build-drop` | 128 BPM: 8 s filtered intro → 16 s build (kick + rising noise sweep, RMS rising ~18 dB monotonically) → 1 s pre-drop silence → 12 s full-energy drop → 8 s breakdown. 45 s | **M9's main case.** The generator emits its own per-hop RMS as ground truth |
+
+`build-drop` is the case r1 has no answer to at all, and it is deliberately not
+a synthetic abstraction: it is the shape of the material the user was listening
+to when they used the word "cliff".
+
 Plus the **orthogonal axes** applied to every case, one battery arm each. The
 matrix was one axis at one frame rate and one sensitivity, which left three
 user-reachable settings and the headline backpressure principle gated by
@@ -938,6 +1704,7 @@ nothing:
 | `/stall` | 200 ms transport stall at 0.5 Hz | **P6**: the render clock must not move and the bounds must still hold on what the board shows. M3 is not asserted here — a 200 ms stall *is* latency |
 | `/15fps` | `dt_f = 1/15` | §1.1 claims the design is correct at 15 fps; only 30 was ever run |
 | `/quiet`, `/loud` | sensitivity 0.5 and 2.0 | the menu's own range. M2's *lower* bound is not asserted here: a monotone output gain scales the frame-to-frame difference by construction, so "is the board inert" is asked at unity gain |
+| `/latency` **(new in r2)** | `--output-latency 12` — the composed frame is recorded as *visible* 12 ms after its scheduled time | **M8 is only meaningful with this arm on.** A simulator that shows a frame the instant it is composed is measuring the model, not the pipeline, and would report a beat alignment the hardware cannot achieve. 12 ms = the §7.2-R transport median plus latch |
 
 `--jitter <ms>` on the render
 interval is driven from the distribution measured on real hardware (§7.5).
@@ -951,6 +1718,24 @@ the simulator at all**. That is why it survived. Required additions to viz-sim:
   display asynchronously) so the interpolation path in §6.1 is actually exercised,
 * per-frame CSV export of every LED level, which is what all the metrics below
   are computed from.
+
+**Further additions required by r2:**
+
+* `--output-latency <ms>` — the display-side delay described above. The frame
+  composed for `t` is recorded as visible at `t + L_out`. Without it M8 is
+  measuring a pipeline that does not exist.
+* **Per-frame colour export, not only lightness.** `SimRun.Result.colors`
+  already exists; M10 needs it exposed in the CSV as RGB triples, because hue is
+  the thing being measured and lightness discards it.
+* **Ground-truth beat and RMS tracks.** `Signal.track` must return, alongside
+  `events`, a `beats: [Double]` list (exact beat times, for M8) and an
+  `rmsEnvelope: [(time, rms)]` at the analysis rate (for M9b). Deriving either
+  from the audio inside the metric would be measuring our own analyser against
+  itself.
+* **A packet-count model.** `viz-sim` must run the real
+  `VisualizerController.packets(for:lastSent:)` over consecutive frames and
+  report the §7.2-R budget (median / p95 / max packets, fallback rate). It is
+  the only place that budget can be checked without hardware.
 
 ### 10.2 Metric definitions
 
@@ -1073,6 +1858,189 @@ metric, so the metrics are mutually consistent).
 
 ---
 
+**M8 — Beat alignment `beatError` (new in r2). The numerical statement of "the
+keyboard updates feel off beat".**
+
+Computed on the click-track cases, where the true beat times `B_i` are exact,
+**with the `/latency` arm on** so the simulated pipeline latency is included.
+Let `b(t)` be board-mean linear lightness sampled at the *displayed* frame times
+(i.e. `t_scheduled + L_out`), and `P` the true beat period.
+
+> For each beat `B_i`:
+> ```
+> f_i = min  b(t)  over t ∈ [B_i − 0.45·P, B_i]          // pre-beat trough
+> p_i = max  b(t)  over t ∈ [B_i − 0.25·P, B_i + 0.35·P] // the gesture's crest
+> h_i = f_i + 0.5·(p_i − f_i)                            // half-rise level
+> G_i = the earliest t in that window with b(t) ≥ h_i,
+>       LINEARLY INTERPOLATED between the two bracketing displayed frames
+> e_i = G_i − B_i                                        // signed, seconds
+> ```
+> Report `MAE = mean |e_i|`, `bias = mean e_i`, `sd = sd(e_i)`, all in ms.
+
+The half-rise crossing is used because it is the same instant §2.3.3 schedules
+against (`t_vis = startTime + τ_a·ln 2`), so the metric and the mechanism agree
+on what "the gesture happened" means. **Linear interpolation between frames is
+mandatory**: quantising `G_i` to `dt_f` would put a 33 ms floor under a metric
+whose threshold is 30 ms.
+
+* **Bounds** on `click-120`, `click-112`, `edm-128`, `dnb-174`, in **pulse** and
+  **wave** (the two beat-scheduled modes), at 30 fps, `/latency`:
+  * **`MAE ≤ 30 ms`** — pass. 30–45 ms warn, > 45 ms fail.
+  * **`sd(e_i) ≤ 25 ms`** — *this is the important one.* A constant offset is
+    dialled out by §8.3's user control; the spread is what an offset cannot fix
+    and what "off beat" actually feels like.
+  * **`|bias| ≤ 20 ms`** — reported separately from MAE precisely so that a
+    systematic lead/lag is not confused with a wandering one.
+  * **miss rate ≤ 5 %**, where a miss is a beat with `p_i − f_i < 0.04`.
+* On `click-90-ramp`: `MAE ≤ 45 ms` during the 10 s tempo ramp, and back under
+  30 ms within 4 s of the ramp ending.
+* **Anti-vacuity, both asserted:**
+  1. the run must produce **≥ 0.8 gestures per beat** (`p_i − f_i ≥ 0.04` on
+     ≥ 95 % of beats) — otherwise "no gesture at all" passes trivially, since a
+     flat board has no alignment error;
+  2. **`click-120-gap`: zero frames** with a rise of ≥ 0.04 above the pre-gap
+     baseline during the last 3 s of the 4 s gap. One phantom beat after the
+     music stops is allowed (the credit counter needs two misses to react); a
+     board that keeps beating is a fail. This is the direct test of §2.3.4.
+
+---
+
+**M9 — Accumulation and memory (new in r2). The numerical statement of "there's
+no short-term accumulation — it's like a cliff".**
+
+Let `b(f)` be board-mean linear lightness per displayed frame, `f = 0 … F−1`,
+sampled at `1/dt_f`.
+
+**M9a — slow-band fraction `SBF`.**
+
+> `b'(f) = b(f) − mean(b)`. Welch power spectrum: 8 s Hann segments, 50 %
+> overlap, one-sided, → `S(ν)`.
+> ```
+> SBF = Σ_{0 < ν ≤ 0.5 Hz} S(ν)  /  Σ_{0 < ν ≤ 8 Hz} S(ν)
+> ```
+> DC is excluded (that is the bed, measured by M9c). 8 Hz is the ceiling because
+> it is the display's own Nyquist at 15 fps.
+
+* **`SBF ≥ 0.35`** on `edm-128`, `ballad-72`, `dnb-174`;
+  **`SBF ≥ 0.55`** on `crescendo` and `build-drop`.
+* Defined as **0 (fail)** when total power `< 1e-8` — a frozen board must not
+  score infinity.
+* **Anti-vacuity: M9a counts as passed only if M2's *lower* bound passes on the
+  same run.** Otherwise the trivial way to win is to smooth everything into
+  mush, which is the opposite failure and is already the reason M2 is bounded on
+  both sides.
+
+**M9b — a build shows as a build.**
+
+> On `build-drop` and `crescendo`, using the generator's own ground-truth RMS:
+> `r(t)` = input RMS low-passed with a 1.0 s one-pole, resampled to the frame
+> grid. `b(t)` as above. Both z-scored over the run.
+> ```
+> ρ_build = Pearson(r, b)                                     // whole-run
+> ρ_slow  = Pearson(lowpass_0.25Hz(r), lowpass_0.25Hz(b))     // multi-second
+> dropContrast = mean(b) over the drop − mean(b) over the intro   // linear
+> ```
+
+* **`ρ_slow ≥ 0.80`**, **`ρ_build ≥ 0.60`**, **`dropContrast ≥ 0.18`**.
+* `dropContrast` is there because a correlation of 0.9 across a 3 % slice of the
+  range is invisible on hardware. Correlation says the shape is right; contrast
+  says it is big enough to see.
+
+**M9c — never dead while playing `DeadFrac`.**
+
+> Over frames whose *input* satisfies `rms(t) ≥ p20(rms)` over the run — i.e.
+> music is genuinely playing, defined from the ground-truth track and not from
+> our own analyser:
+> ```
+> DeadFrac = fraction of those frames with b(f) < 0.06
+> ```
+
+* **`DeadFrac ≤ 0.01`** on every musical case; **`≤ 0.05`** on `cut-transitions`
+  (which contains real silences by construction, and §11.3's 4 s hold + 8 s
+  ramp-out means only their tails count).
+* **The complement is asserted at the same time**, so the two cannot both be
+  satisfied by a constant glow: `near-silence` board-mean `≤ 0.03` (M6,
+  restated), and in `cut-transitions` the board-mean must be `≤ 0.03` by 10 s
+  into any silence.
+
+**M9d — memory horizon `τ_mem` (diagnostic, reported, not gated).**
+
+> Autocorrelation of `b'(f)`; report the lag at which it first falls below
+> `1/e`. Expected `≥ 1.5 s` once §11 lands.
+
+Reported rather than gated so that a change which shortens the board's memory is
+*visible* even while `SBF` still passes, which is exactly how the cliff got
+through r1's battery.
+
+---
+
+**M10 — Spatial diversity (new in r2). The numerical statement of "the colour is
+concentrated in the centre and isn't diverse".**
+
+Computed from the per-frame **RGB** export. Per LED per frame, convert to HSV:
+hue `h_k(f) ∈ [0,1)`, saturation `s_k(f)`, value `v_k(f)`.
+
+**M10a — within-frame hue spread `σ_h`.**
+
+Hue is circular, and a hue on a dark key is not visible, so: brightness-weighted
+circular standard deviation.
+
+> ```
+> w_k = v_k(f)
+> C = Σ w_k cos(2π h_k) / Σ w_k ;  S = Σ w_k sin(2π h_k) / Σ w_k
+> R = sqrt(C² + S²)
+> σ_h(f) = sqrt( −2 · ln R ) / (2π)          // in TURNS
+> ```
+> Computed only on frames where `(Σ w_k)/K ≥ 0.06` — the board is showing
+> something. Report `median_f σ_h` and `p05_f σ_h`.
+
+* **`median_f σ_h ≥ 0.035` turns (≈ 12.6°)** on all musical cases;
+  **`≥ 0.055` turns (≈ 20°)** on `edm-128` and in `spectrum` mode.
+* **Upper guard: `median_f σ_h ≤ 0.20` turns (≈ 72°)** — this is what stops the
+  fix becoming rainbow vomit, and it *replaces* r1's blanket ±0.08 rule, which
+  is now a per-gesture deposit limit (§12.3) rather than a board-wide one.
+* **`p05_f σ_h ≥ 0.015`** — no frame may be monochrome.
+* r1 scores **≈ 0** here by construction: one hue for the whole board.
+
+**M10b — hue must also move in time, but not spin.**
+
+> `sd over time of the brightness-weighted circular mean hue`, over a 30 s
+> musical run.
+
+* **`≥ 0.02` turns** (the palette follows the music, §12.1's drift and structure
+  kicks) and **`≤ 0.25` turns** (it is not a rainbow cycle).
+* Stated separately from M10a so that neither can substitute for the other: a
+  board that changes colour over time but is monochrome in every frame fails
+  M10a, and a fixed rainbow gradient fails M10b.
+
+**M10c — brightness centre of mass.**
+
+> Per frame, with `v̄(x,f)` the mean value over column `x`'s LEDs, `x ∈ 0…16`:
+> ```
+> x̄(f) = Σ_x v̄(x,f)·x / Σ_x v̄(x,f)
+> ```
+> Counted only on frames with `Σ_x v̄ ≥ 0.06 · 17`. Report `mean_f x̄`,
+> `sd_f x̄`, `p05`, `p95`.
+
+* **`|mean_f x̄ − 8.0| ≥ 0.5` columns** on `edm-128`, `dnb-174`, `ballad-72`, in
+  **pulse**, **ripple** and **spectrum**. *VU is exempt from this clause only* —
+  it is a centre-out meter by design (§9.5) — but not from the two below.
+* **`sd_f x̄ ≥ 1.5` columns** on every musical case, every mode.
+* **`p95(x̄) − p05(x̄) ≥ 4.0` columns** — the bright region must visit different
+  parts of the board, not merely wobble.
+
+**M10d — column starvation (§12.5's uniformity target).**
+
+> `V(x) = mean_f v̄(x,f)` over the run.
+
+* **`0.5 · mean_x V(x) ≤ V(x) ≤ 1.8 · mean_x V(x)`** for every column.
+* **This clause and M10c are checked together and are deliberately in tension.**
+  A uniformly lit board passes M10d trivially and fails M10c's `sd` and M10a's
+  hue spread; a board that parks a bright spot fails M10d. Neither degenerate
+  solution passes the pair, which is what makes the metric non-vacuous.
+
+---
+
 ### 10.3 Pass criteria summary
 
 | metric | bound | applies to |
@@ -1093,10 +2061,44 @@ metric, so the metrics are mutually consistent).
 | M7 tick max | ≤ 2 · dt_f | hardware + sim |
 | M7 delivered frames | ≥ 80 % of render rate | hardware + sim |
 | M7 stale frames | ≤ 1 % | hardware + sim |
+| **M8 MAE** | **≤ 30 ms** | click cases, edm-128, dnb-174 · pulse, wave · `/latency` |
+| **M8 sd(e)** | **≤ 25 ms** | as above |
+| **M8 bias** | **\|bias\| ≤ 20 ms** | as above |
+| **M8 miss rate** | **≤ 5 %** | as above |
+| **M8 gestures/beat** | **≥ 0.8** (anti-vacuity) | as above |
+| **M8 phantom beats** | **0 in the last 3 s of the gap** | `click-120-gap` |
+| **M9a SBF** | **≥ 0.35** (≥ 0.55 on crescendo, build-drop) | musical cases — *only counts if M2 lower bound passes* |
+| **M9b ρ_slow / ρ_build** | **≥ 0.80 / ≥ 0.60** | `build-drop`, `crescendo` |
+| **M9b dropContrast** | **≥ 0.18** | `build-drop` |
+| **M9c DeadFrac** | **≤ 0.01** (≤ 0.05 on cut-transitions) | musical cases |
+| **M9c silence complement** | board-mean ≤ 0.03 after 10 s of silence | `near-silence`, `cut-transitions` |
+| **M9d τ_mem** | reported, expect ≥ 1.5 s | all — diagnostic only |
+| **M10a median σ_h** | **0.035 … 0.20 turns** (≥ 0.055 on edm-128, spectrum) | musical cases |
+| **M10a p05 σ_h** | **≥ 0.015 turns** | musical cases |
+| **M10b hue drift sd** | **0.02 … 0.25 turns** | musical cases |
+| **M10c \|mean x̄ − 8\|** | **≥ 0.5 col** | pulse, ripple, spectrum (VU exempt) |
+| **M10c sd(x̄)** | **≥ 1.5 col** | all musical, all modes |
+| **M10c p95−p05(x̄)** | **≥ 4.0 col** | all musical, all modes |
+| **M10d column starvation** | **0.5× … 1.8× the column mean** | all musical, all modes |
+| **§7.2-R packets/frame** | median ≤ 2, p95 ≤ 4, max ≤ 7, fallback ≤ 5 % | sim + hardware |
 
-`viz-sim --battery` runs the full matrix (14 signals × 5 modes × 6 arms) and
-prints a pass/fail table. It is a CI gate: a change that
+`viz-sim --battery` runs the full matrix (**19** signals × 5 modes × **7** arms)
+and prints a pass/fail table. It is a CI gate: a change that
 regresses any bound is rejected regardless of how it looks on any one track.
+
+**Three anti-vacuity couplings are load-bearing and must be implemented as
+couplings, not as independent rows** — an implementer who evaluates them
+separately can satisfy every bound with a board nobody wants to look at:
+
+1. **M9a requires M2's lower bound.** Slow variance is trivially maximised by a
+   board that barely moves.
+2. **M10c and M10d are a pair.** Uniform passes one and fails the other;
+   parked-bright-spot does the reverse.
+3. **M8 requires the gestures-per-beat floor.** A flat board has perfect beat
+   alignment because it has no beats.
+
+Equally, the r1 couplings still stand: M1/M4 must keep measuring the *model*,
+which is why §11.4's bed guarantee is a board-mean and not a per-key floor.
 
 ### 10.4 What the metrics do NOT cover
 
@@ -1105,6 +2107,24 @@ whether the visualiser is *beautiful*, whether the colour choices are good, or
 whether a gesture feels musically apt. They bound jitter, deadness, latency,
 hold, false triggering and universality. Aesthetic judgement still requires
 watching `animation.mp4` and the hardware.
+
+> **Amended (r2).** M8, M9 and M10 widen the net but do not change this
+> disclaimer, and it is worth being precise about how:
+>
+> * M10 bounds *hue diversity and spatial distribution*. It says nothing about
+>   whether the palette is **attractive** — a board fanning garish magenta
+>   through lime scores identically to one fanning amber through teal. The
+>   0.20-turn upper guard is the only taste-adjacent bound in the system, and it
+>   is a bound on quantity, not on choice.
+> * M9 bounds *whether the board has memory*. It cannot say whether the memory
+>   is on the **right** timescale for a given genre; a visualiser that tracked
+>   the wrong structural layer consistently would pass.
+> * M8 bounds *alignment to a click*. Real music has swing, rubato, and
+>   producers who place the kick 8 ms early on purpose. A perfect M8 on a click
+>   track is necessary and not sufficient.
+>
+> The three complaints r2 answers are now falsifiable. Whether the answer is
+> *good* is still a question for the hardware.
 
 ### 10.5 Open measurement gaps to close first
 
@@ -1115,12 +2135,30 @@ watching `animation.mp4` and the hardware.
    menu item. The echo round trip itself is still unrecorded.
 2. **Clap-test end-to-end latency** with a 240 fps camera, to set the §8.3
    default offset.
-3. **The discriminating experiment, before any code changes**: ask whether
+3. ~~**The discriminating experiment, before any code changes**: ask whether
    `spectrum` and `vu` (the two modes that do not consume onsets) feel calmer
-   than `pulse`/`wave`/`ripple`. If yes, the onset detector is confirmed
-   dominant and §2.2 is the highest-value change. If all five feel equally
-   broken, the aliasing (§6.1), transport (§7) and output-quantisation (§6.5)
-   causes carry more weight than ranked here.
+   than `pulse`/`wave`/`ripple`.~~ **Closed by r1's ship:** all five feel calmer,
+   the detector fix landed, and the surviving complaints are the three §r2
+   answers.
+
+**Open gaps added in r2** — in the order they block the migration:
+
+4. **The echo round-trip time is still unrecorded**, and it is now load-bearing:
+   `L̂` (§8.2-R) is built from it, and the §7.2-R packet budget cannot be
+   checked without it. This is the single highest-value instrumentation left.
+5. **`σ_φ` has never been measured on real music.** BPM sd is 0.04; phase sd is
+   unknown. The entire "off beat" complaint lives in that number and §2.3.2 is
+   the first thing that will look at it. Measure it *before* implementing the
+   scheduling, so that the scheduling has something to be judged against.
+6. **The system-audio tap's delivered buffer size** — assumed, never logged.
+   §2 requires the `burstyDeliveries` counter before any claim about capture
+   latency on that path is defensible.
+7. **Which timescale the user is actually missing.** §11 asserts PHRASE
+   (0.5–2 s) and SECTION (10–30 s) as the two additions. That is a hypothesis
+   drawn from the phrase "short term accumulation" plus the structure of popular
+   music; it is not measured. Once §11 ships, the falsifiable follow-up is
+   whether varying `Φ`'s release between 0.8 s and 3 s changes the verdict, and
+   the answer belongs in this document rather than in a commit message.
 
 ---
 
@@ -1177,6 +2215,47 @@ Time constants in seconds. Nothing here was derived from a song.
 | extrapolation limit | 20 ms | 6.1 |
 | replyTimeout / attempts | 60 ms / 2 | 7 |
 
+**Added in r2.** Still nothing derived from a song: time constants, perceptual
+constants, wire-format constants, and dimensionless ratios.
+
+| symbol | value | § |
+|---|---|---|
+| capture buffer | = 1 hop (512 @ 48 kHz); larger is a defect, smaller is a no-op | 2 |
+| bursty-delivery budget | ≤ 1 % of deliveries > 2 hops | 2 |
+| phase-error window | last 8 corrections → `σ_φ` | 2.3.2 |
+| lead weight ramp | `smoothstep(0.12, 0.06, σ_φ) · gridWeight` | 2.3.2 |
+| gesture visible onset | `startTime + τ_a · ln 2` (half-rise) | 2.3.3 |
+| provisional amplitude γ | 0.6 of the 4-beat EWMA of confirmed amplitudes | 2.3.4 |
+| confirmation window W | ±90 ms | 2.3.4 |
+| prediction credit | +1 confirm / −2 miss, clamp [−4, +4], launch at ≥ +1 | 2.3.4 |
+| run-bridge gap G | 4 unchanged keys | 7.2 |
+| scattered-set fallback | `packets ≥ ceil(changed/18) + 2` or `packets > 5` → full repaint | 7.2 |
+| packet budget | median ≤ 2, p95 ≤ 4, max 7, fallback ≤ 5 % | 7.2 |
+| `T_unavoidable` target | ≤ 40 ms | 8.1 |
+| `L̂` smoothing / clamp | EWMA τ 5 s; clamp [0, 150 ms]; ≤ 5 ms change per second | 8.2 |
+| energy reference window | 60 s (p05 / p95 of `Λ`) | 11.1 |
+| energy dynamic-range floor | 6 dB | 11.1 |
+| PHRASE `Φ` AHR | 350 ms / 250 ms hold / 1600 ms | 11.2 |
+| SECTION `Σ` | τ_up 8 s, τ_down 20 s (asymmetric) | 11.3 |
+| section novelty escape | `D > 0.35` for 1.5 s → τ 3 s; **upward only** unless `E < 0.15` for 3 s | 11.3 |
+| `Σ` fall rate limit | 0.25 per second, always | 11.3 |
+| silence ramp-out | starts at 4 s of `E < 0.05`, black by 8 s | 11.3 |
+| bed `B0` / `B1` | 0.09 / 0.15 | 11.4 |
+| swell `S1` / `k` | 0.55 / 0.85 | 11.4 |
+| accent `A1` | 0.90, scaled by `headroom` | 11.4 |
+| hue drift ω0 | 1/180 turns per second, × `(0.25 + 0.75 Σ)` | 12.1 |
+| structure hue kick | 0.11 turns, eased over 2 s | 12.1 |
+| gradient amplitude `A_max` | 0.30 turns × spectral spread | 12.1 |
+| gradient AHR | 50 ms / 0 / 800 ms | 12.1 |
+| saturation `S0` / `S1` | 0.45 / 0.55 | 12.2 |
+| hue trail τ | 900 ms; deposit τ 120 ms; clamp ±0.18 turns | 12.3 |
+| saturation trail τ | 600 ms | 12.3 |
+| per-gesture hue deposit ν | kick −0.08, snare 0, hat +0.08 turns | 12.3 |
+| gesture origin map | `round((b + 0.5)/8 · 16)` → cols 1,3,5,7,9,11,13,15 | 12.4 |
+| pulse shape | `1 − 0.25 · abs(x − x_c(t)) / 16` | 12.4 |
+| column uniformity band | 0.5× … 1.8× the column mean | 12.5 |
+| simulated output latency | 12 ms (`/latency` arm) | 10.1 |
+
 ## Appendix B — migration order
 
 Highest leverage first; each step is independently shippable and independently
@@ -1196,3 +2275,34 @@ measurable against §10.
    and gamma (§6.5), delete `widenIsolatedColumns` (§6.2).
 7. **Modes re-specified as gestures** (§5, §9).
 8. **Mouse structural layer** (§9.6).
+
+## Appendix B2 — migration order for r2 (new)
+
+Steps 1–8 above are done and shipped. What follows is ordered by *how much of
+the user's three complaints each step retires per unit of risk*, and each step is
+independently shippable and independently measurable.
+
+1. **Metrics first, again** (§10.1, §10.2): the five new signals, the
+   `/latency` arm, the RGB and ground-truth exports, and M8/M9/M10. Nothing
+   below can be defended until the tool can see the three defects — and it
+   currently cannot see any of them. Expect this step to *fail loudly* on the
+   shipped build: M9a ≈ 0, M10a ≈ 0, M8 sd large. If it does not, the metric is
+   wrong, not the build.
+2. **§11 multi-timescale energy.** The largest single perceptual change, and the
+   one with no dependencies: `E`, `Φ`, `Σ`, the composition formula, and the
+   deletion of every per-mode bed. Retires complaint 2 on its own and improves
+   complaint 3 for free, because a board that is never at zero has something for
+   colour to live on.
+3. **§12 spatial colour and propagation.** Depends on §11 only for `Φ`/`Σ` in
+   the drift and saturation terms. Retires complaint 3.
+4. **§2.3-R phase publication and `σ_φ`.** Small, self-contained, and it is the
+   measurement that tells you whether step 5 is even worth doing.
+5. **§8.2-R measured `L̂` + §2.3.3 schedule-to-land + §2.3.4 credit.** Retires
+   complaint 1. Do not attempt this before step 4: scheduling against an
+   unmeasured latency is what r1 already did.
+6. **§7.2-R packet builder budget and telemetry**, then re-evaluate the render
+   rate against §8.1-R's note — 40–48 fps is the only remaining lever on
+   `T_unavoidable`, and it is gated on measured delivery, not on optimism.
+7. **§2 system-audio buffer bounding** and the `burstyDeliveries` counter.
+8. Re-run the clap test (§8.3) and set the shipped default user offset from the
+   measured `bias` in M8 rather than from the r1 default.
