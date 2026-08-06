@@ -32,10 +32,12 @@ This document specifies the replacement. It is organised as ten sections:
 9. [The five modes, re-specified](#9-the-five-modes-re-specified)
 11. [Multi-timescale energy](#11-multi-timescale-energy-new-in-r2) — *new in r2*
 12. [Spatial colour and propagation](#12-spatial-colour-and-propagation-new-in-r2) — *new in r2*
+13. [Colour as musical identity](#13-colour-as-musical-identity-new-in-r3) — *new in r3*
 10. [Verification: the universal test battery and pass metrics](#10-verification)
 
-(§11 and §12 are numbered after §10 but placed before it, so that every existing
-cross-reference stays valid while §10 remains the last normative section.)
+(§11, §12 and §13 are numbered after §10 but placed before it, so that every
+existing cross-reference stays valid while §10 remains the last normative
+section.)
 
 Appendix A restates every constant in one table. Appendix B is the migration
 order.
@@ -115,6 +117,48 @@ material — at exactly the centre column. Answered by
 §11 and §12 are numbered above §10 but placed *before* it in the document, so
 that every existing cross-reference in the codebase and in this file stays
 valid and §10 remains the last normative section.
+
+---
+
+# Revision 3 — colour should mean something (new)
+
+r2's §12 fixed *where* colour is: a field over columns rather than one
+board-wide scalar. The verdict on it is that it did not fix *what colour means*:
+
+> i want colors to represent the like specific details of a song, like i want it
+> to be consistent and like the colors are almost like a representation of the
+> music, i dont want it to just purely be a limited color space. for example if a
+> song has a repetition of a certain aspect of the song, if it happened 30
+> seconds ago and there were certain colors that represented that aspect of the
+> song, they should repeat again similarly visually the next time around — of
+> course there is gonna be some variation but u get the idea.
+
+**One root cause, and it is a design fault rather than a tuning error.** §12.1's
+base hue is `dH0/dt = ω0·(0.25 + 0.75·Σ)` — the *time integral of a rate* — plus
+a cumulative `+0.11` kick per section change. The palette at any instant is
+therefore a function of how long the visualiser has been running and of how many
+section changes have happened since launch. A repeat cannot look like a repeat,
+by construction. The two remaining terms are the spectral centroid and the
+spectral entropy: real content features, but both are level statistics that say
+*how bright and how wide* the sound is, never *what is being played*. That is the
+exact sense of "purely a limited color space" — not a narrow gamut, since the
+drift sweeps the whole wheel, but only two coordinates, neither of them musical
+identity.
+
+**What r3 changes:**
+
+| section | status in r3 |
+|---|---|
+| §0 principles | **amended** — P12 added |
+| §11 multi-timescale energy | unchanged, and now explicitly the *only* driver of lightness (§13.5) |
+| §12.1 hue field | **superseded by §13.3** — the drift term and the structure kick are deleted; the register gradient survives unchanged |
+| §12.2 saturation | **superseded by §13.3.3** — harmonic focus becomes the dominant driver |
+| §12.3 trail, §12.4 geometry, §12.5 uniformity | unchanged |
+| §13 colour as musical identity | **new** |
+| §10 verification | **extended** — M11, M12, M13; eight new battery cases |
+
+§13 is numbered above §10 and placed before it, for the same reason §11 and §12
+are.
 
 ---
 
@@ -207,6 +251,22 @@ that motion is visible in hue as well as in brightness. No display element may
 take its hue from a single board-wide number. Correspondingly, no gesture family
 may have a fixed origin: gesture origins are chosen from the *register that
 fired*, so that where light appears carries information.
+
+<a id="p12"></a>
+**P12 — Colour is a function of content, not of clock (new in r3).** No term in
+the hue expression may depend on elapsed time, frame index, wall clock, session
+start, sample position, or a random seed. Every term is a function of the current
+identity feature (§13.2) and of board geometry. A term that depends on musical
+*state* is permitted only if that state is itself re-derivable from a bounded
+window of audio and enters **non-cumulatively** — a rotation that is *set by* the
+detected key is legal; a rotation that is *advanced by* each key change is not,
+because the second makes colour path-dependent and destroys the property §13
+exists to deliver. The same audio content maps to the same colour regardless of
+when it occurs.
+
+P12 governs the **hue channel only**. §11's `Φ` and `Σ` are memories by design
+and must stay memories; the channel split is §13.5, and P12 and P9 are in tension
+only if someone lets energy into hue.
 
 ---
 
@@ -1518,6 +1578,12 @@ falsified (M9):**
 > *"The colour is concentrated in the centre and isn't diverse / well
 > propagated."*
 
+> **Partly superseded in r3.** §12.1's base hue `H0(t)` and §12.2's saturation
+> are replaced by [§13](#13-colour-as-musical-identity-new-in-r3); the register
+> gradient `A(t)·G(x,t)`, the trail (§12.3), the geometry (§12.4) and the
+> uniformity target (§12.5) survive unchanged and §13 composes with them. Read
+> §12 for the field, §13 for what sets its base.
+
 r1 has exactly one colour decision per frame: `state.brightness`, the
 percentile-normalised spectral centroid, mapped through a seven-stop ramp, for
 all 126 LEDs. Plus a ±0.08 per-drum offset on ripple rings. That is the entire
@@ -1665,6 +1731,718 @@ place fails the first. Both must hold.
 
 ---
 
+<a id="13-colour-as-musical-identity-new-in-r3"></a>
+## 13. Colour as musical identity (new in r3)
+
+> *"i want colors to represent the like specific details of a song, like i want
+> it to be consistent and like the colors are almost like a representation of the
+> music, i dont want it to just purely be a limited color space. for example if a
+> song has a repetition of a certain aspect of the song, if it happened 30
+> seconds ago and there were certain colors that represented that aspect of the
+> song, they should repeat again similarly visually the next time around — of
+> course there is gonna be some variation but u get the idea."*
+
+This section revises §12.1 and §12.2. §12.3 (the trail), §12.4 (geometry) and
+§12.5 (uniformity) survive unchanged.
+
+### 13.0 What §12 gets wrong
+
+§12 answered *"the colour is concentrated in the centre and isn't diverse"*, and
+it answered it: hue became a field over columns. But it made the field out of the
+wrong material.
+
+```
+H(x,t) = wrap01( H0(t) + A(t)·G(x,t) + C(x,t) )       // §12.1
+dH0/dt = ω0 · (0.25 + 0.75·Σ(t))                       // ω0 = 1/180 turns/s
+```
+
+Three faults, in descending order of how badly each one breaks this request:
+
+**F4 — `H0` is a clock.** The base hue is the time integral of a rate. Two
+occurrences of the same chorus, 30 s apart, are painted `∫ω0 dt` apart — at rest
+that is 1/6 of the wheel, at full section energy 1/6 to 1/2 depending on what
+happened *in between*. Nothing in §12 can make a repeat look like a repeat,
+because the one term that sets the palette is a function of how long the
+visualiser has been running. Worse, the structure kick (`H0 += 0.11` per novelty
+event) is *cumulative*, so the palette at any instant depends on the number of
+section changes since launch: the colour of the second chorus depends on the
+path taken to reach it, not on the chorus.
+
+**F5 — the remaining terms describe level, not content.** `A(t)·G(x,t)` is
+driven by the spectral centroid (where the energy is) and the spectral entropy
+(how spread it is). Both are real content features and both are *reproducible* —
+they survive into r3 unchanged — but neither says anything about *what is being
+played*. A C major chord and an E♭ minor chord with the same registration and the
+same brightness are, to §12, the same colour. That is the precise sense in which
+r2's colour is "a limited color space": not that the gamut is narrow (the drift
+sweeps the whole wheel), but that the *coordinates the music controls* are only
+two, and both of them are timbral level statistics.
+
+**F6 — the only thing that spans the wheel is the thing that ignores the
+music.** M10b asks hue to move over time and M10a asks it to vary over the board.
+Both are satisfied by `H0`'s clock and `A·G`'s static gradient — which is exactly
+what `μ_h` (§10.2, r2.1) was added to catch. r2 caught the vacuity and patched
+the metric. r3 removes the cause.
+
+The replacement principle: **hue is a function of what is playing.** Same
+harmony, same colour; different harmony, different colour; and the colour of a
+moment is derivable from that moment's audio alone.
+
+### 13.1 The invariant
+
+**[P12](#p12) is the whole of this section's contract**: hue is a function of
+content, not of clock, and the same audio content maps to the same colour
+regardless of when it occurs.
+
+Two consequences, both normative:
+
+* **Delete `dH0/dt`.** There is no drift term in r3. Appendix A's `ω0` is
+  removed, not retuned.
+* **Delete the structure kick.** A section change is already visible: sections
+  change harmony (§13.3 moves the hue) and change energy (§11 moves the
+  brightness). A section change that alters neither is not a section change the
+  board should invent a colour for.
+
+Legal residue: `Θ_user`, the user's theme hue, is a **constant** rotation of the
+whole field. It is a preference, not a clock; every invariant and every metric
+below is stated on hue *differences*, so all of them are invariant under `Θ_user`.
+
+**P12 does not apply to lightness.** §11's `Φ` and `Σ` are memories by design and
+must stay memories. P12 governs the hue channel only; the split is §13.5.
+
+### 13.2 The identity feature
+
+A vector that answers "what is playing", computed causally, once per analysis hop
+(93.75 Hz), from arrays the pipeline already builds.
+
+#### 13.2.1 Chroma — the primary identity carrier
+
+Harmony is what repeats when a song repeats. A chorus returns with a different
+mix, a different vocal take and a different drum fill, but with the same chords;
+so the pitch-class profile is the feature with the highest ratio of
+"stable across repetitions" to "distinguishes one part of the song from another".
+
+**Source: the raw magnitude spectrum, not the whitened one.** `MusicAnalyzer`
+already keeps both (`magnitudes` and `whitened`). Whitening divides every bin by
+its own recent peak, which is exactly right for flux and exactly wrong here: it
+flattens a sustained chord toward 1.0 in every occupied bin, discarding the
+relative weights that *are* the chord, and it amplifies the leakage of empty
+bins. Chroma reads `magnitudes`, the same array the band sums read (§2.1). This
+is the same argument §3's own comment already makes for the level path.
+
+**Band.** Bins with centre frequency in `[f_lo, f_hi] = [130.81 Hz (C3),
+2093.0 Hz (C7)]`. At 48 kHz with `Δf = sr/2048 = 23.4375 Hz` that is bins 6…89 —
+**84 bins**.
+
+**The low-frequency resolution limit, stated rather than ignored.** A semitone at
+`f` is `f·(2^(1/12) − 1) = 0.05946·f` Hz wide. One FFT bin covers one semitone
+only above `Δf / 0.05946 = 394 Hz`. Below that a bin straddles several semitones
+and its pitch-class assignment is progressively meaningless. This is a
+time-frequency identity, not a tuning choice: resolving a semitone at 65 Hz needs
+a 256 ms window, which would cost six times the group delay §8.1 is trying to
+minimise. So the design does not pretend, and does not add a second FFT. It
+weights:
+
+```
+r_k = clamp( f_k · (2^(1/12) − 1) / Δf , 0, 1 )        // resolution weight
+```
+
+`r_k` is 1.00 above 394 Hz, 0.665 at C4 (262 Hz), 0.332 at C3 (131 Hz), and the
+band edge cuts it off below. **The bass fundamental is deliberately not the
+source of the bass note's identity**; a 65 Hz root contributes through its 4th
+through 8th partials (262–523 Hz), which land in the fully-resolved region and
+which restate the root and its fifth. The mapping in §13.3 is built so that this
+leakage lands *near* the root rather than anywhere on the wheel.
+
+**Tuning reference.** A440 equal temperament:
+
+```
+π_k = 69 + 12·log2(f_k / 440)                          // fractional MIDI pitch
+```
+
+Material that is not at A440 (a 432 Hz recording, a tape transfer, a live band a
+quarter-tone flat) would smear across two pitch classes and, because §13.3 maps a
+semitone to 7/12 of the wheel, that smear is not a small hue error — it is a
+large one. So the detune is estimated, over a window long enough that it is a
+property of the material rather than of the moment:
+
+```
+per hop, over bins with r_k = 1 only:
+    φ_k  = 2π · frac(π_k)                              // residual, period 1 semitone
+    X   ← X·exp(−dt/τ_tune) + Σ_k m_k² · cos φ_k       τ_tune = 20 s
+    Y   ← Y·exp(−dt/τ_tune) + Σ_k m_k² · sin φ_k
+    W   ← W·exp(−dt/τ_tune) + Σ_k m_k²
+    δ_raw = atan2(Y, X) / 2π                           ∈ [−0.5, 0.5) semitones
+    conf  = sqrt(X² + Y²) / max(W, ε)
+    δ     = δ_raw · smoothstep(0.10, 0.20, conf)
+```
+
+`m_k²` weights peaks over noise, which is where tuning information lives. `conf`
+is a ratio of two observed quantities, so P1 holds. On equal-tempered material
+`δ → 0`; on nothing in particular, `conf` stays low and `δ` stays 0. Because
+`τ_tune = 20 s` and a song's tuning is constant, `δ` is the same on the first and
+the second chorus, which is what reproducibility needs.
+
+**Accumulation.** Per hop, for each in-band bin:
+
+```
+p_k = (π_k − δ) mod 12                                 // fractional pitch class
+a   = floor(p_k),  u = p_k − a,  b = (a + 1) mod 12
+w_k = r_k · m_k
+c_a += (1 − u) · w_k ;   c_b += u · w_k                // triangular, 1-semitone half-width
+```
+
+The linear split is a 1-semitone-wide interpolation kernel: a partial sitting
+exactly on a semitone contributes entirely to it, one between two contributes to
+both. It is what keeps a slightly detuned or vibratoed note from stepping
+discontinuously between pitch classes.
+
+**Normalisation** — two steps, in this order:
+
+```
+c_p ← ( c_p / max_q c_q )^γ_c                          γ_c = 1.5
+C_p =   c_p / Σ_q c_q                                  // L1, so Σ C_p = 1
+```
+
+The exponent suppresses reverb tails, harmonic leakage and the shoulders of the
+interpolation kernel relative to the notes actually being played; it does nothing
+to a flat profile, so it cannot manufacture structure. The L1 normalisation is
+what makes chroma **level-independent**: the same chord soft and loud gives the
+same vector, which is §13.5's orthogonality requirement expressed at the source
+rather than patched downstream.
+
+**Undefined-chroma gate.** If the master gate is closed (`frozen`, §3.3) or the
+in-band weighted magnitude `Σ_k w_k` is below `overallFollower.long ·
+emptyBandFraction` — the same empty-band test §3.2 already applies per band —
+chroma is undefined for that hop and the smoothed value below is held, not
+updated toward zero. Silence must not have a colour opinion.
+
+#### 13.2.2 Timbre — what distinguishes a stab from a pad
+
+Four scalars, all from arrays that already exist. They exist to separate two
+performances of the same harmony; they are deliberately weak compared to chroma.
+
+| symbol | what | computed from |
+|---|---|---|
+| `ζ` | brightness | spectral centroid, log-frequency mapped |
+| `𝒩` | noisiness | spectral flatness |
+| `ψ₁` | spectral tilt | DCT-II coefficient 1 of the log band shares |
+| `ψ₂` | spectral peakedness | DCT-II coefficient 2 of the same |
+
+```
+ζ  = clamp( log2( max(f_c, 55) / 110 ) / 6 , 0, 1 )       // 110 Hz … 7040 Hz, 6 octaves
+𝒩  = clamp( (log10 F + 2.5) / 2.5 , 0, 1 )
+     F = exp( mean_k ln m_k ) / mean_k m_k                // geometric ÷ arithmetic mean
+     over every 4th bin in [80 Hz, 8 kHz] (~85 bins)
+ℓ_b = ln( max( band_b / Σ band , 1e-4 ) )                 b = 0…7, §2.1's bands
+ψ_j = clamp( (2/8) · Σ_b ℓ_b · cos( π·j·(b + 0.5)/8 ) / 2.5 , −1, 1 )      j = 1, 2
+```
+
+Three notes on why these and not others:
+
+* **`f_c` is the centroid of the raw spectrum, and it is *not* the percentile-
+  normalised `state.brightness`.** `brightness` is normalised against a 10 s
+  window of its own history, so the same sound maps to a different number
+  depending on what preceded it — acceptable for positioning a gradient
+  (§12.1 keeps using it for exactly that), unacceptable for an identity. The
+  fixed 110 Hz–7 kHz log mapping is a *frequency* constant, and P1 governs
+  magnitudes: pitch and brightness are the one axis on which absolute references
+  are musically meaningful, and a mapping that renormalised them away would
+  destroy the property being built.
+* **Flatness over decimated bins.** Flatness is a distributional statistic;
+  every 4th bin estimates it to well within the precision anything downstream
+  uses, at a quarter of the logarithms.
+* **`ψ₁`, `ψ₂` are the cheapest honest shape descriptor available** — two
+  cepstral coefficients over the existing 8-band filterbank. `ψ₁` is tilt (dark
+  versus bright, but level-normalised and robust in a way the centroid is not);
+  `ψ₂` separates a mid-peaked voice or nasal synth from a spectrally hollow pad.
+  Higher orders would need a finer filterbank, which would need its own
+  justification.
+
+#### 13.2.3 Smoothing, and the identity vector
+
+Identity must be **stable inside a chord and prompt at a chord change**. One time
+constant cannot do both, so this reuses §3.3's and §11.3's dual-speed pattern
+rather than inventing a third idiom.
+
+```
+n      = 1 − cos( C_inst , C̄ )                        // chroma novelty ∈ [0,1]
+τ_id   = 0.80 s                                        // normal
+if n > 0.22 for ≥ 2 consecutive hops:  τ_id ← 0.10 s   // until n < 0.08
+C̄ ← C̄ + (C_inst − C̄)·(1 − exp(−dt/τ_id)) , then L1-renormalised
+
+T̄ = one-pole on (ζ, 𝒩, ψ₁, ψ₂), τ_T = 0.50 s, symmetric
+```
+
+The targets this is set to hit, both of which §10's M13 measures:
+
+* **Same chord → same hue.** Inside a sustained chord the identity hue's standard
+  deviation is `≤ 0.008` turns (2.9°) after a 2 s settle.
+* **Chord change → colour change.** At a chord change the hue completes **≥ 50 %
+  of the step within 0.25 s and ≥ 80 % within 0.40 s**, with overshoot
+  `≤ 0.05` turns. At `τ_id = 0.10 s` a step is 92 % complete in 0.25 s; the
+  budget above the raw filter is the two-hop novelty confirmation (21 ms) and the
+  render interpolation.
+
+The two-hop confirmation is what stops a single noisy hop — a cymbal crash, a
+gated reverb tail — from switching the fast path on. It costs 21 ms of
+responsiveness against a chord change, which is a fifth of one display frame.
+
+**The identity vector**, used only by the recurrence diagnostic (§13.4):
+
+```
+I(t) = [ Ĉ(t) (12 dims, L2-normalised) ;  0.5 · T̄(t) (4 dims) ]     // 16 dims
+```
+
+#### 13.2.4 What is published
+
+`AnalysisState` gains four channels. Hue is published **as a vector, never as an
+angle**, because §6.1's interpolator is a flat linear lerp over the channel array
+and linearly interpolating an angle across the wrap point sweeps the long way
+round the wheel:
+
+```
+identityX = F_h · cos(2π·H_id)
+identityY = F_h · sin(2π·H_id)
+timbreTint = δ_T                                       // §13.3.3, already bounded
+noisiness  = 𝒩
+```
+
+Interpolating `(identityX, identityY)` as a pair moves through the disc, which
+takes the short way round and passes through lower saturation while doing it —
+the correct behaviour for a hue crossing, and free.
+
+### 13.3 Identity → colour
+
+#### 13.3.1 The circle of fifths
+
+Pitch class `p` (0 = C) is placed on the hue wheel at
+
+```
+θ_p = ( (7·p) mod 12 ) / 12        turns
+```
+
+| pitch class | `p` | fifths index `7p mod 12` | hue (turns) | hue (deg) | ≈ colour |
+|---|---|---|---|---|---|
+| C  | 0  | 0  | 0.000 | 0   | red |
+| G  | 7  | 1  | 0.083 | 30  | orange |
+| D  | 2  | 2  | 0.167 | 60  | yellow |
+| A  | 9  | 3  | 0.250 | 90  | chartreuse |
+| E  | 4  | 4  | 0.333 | 120 | green |
+| B  | 11 | 5  | 0.417 | 150 | spring green |
+| F♯ | 6  | 6  | 0.500 | 180 | cyan |
+| C♯ | 1  | 7  | 0.583 | 210 | azure |
+| G♯ | 8  | 8  | 0.667 | 240 | blue |
+| D♯ | 3  | 9  | 0.750 | 270 | violet |
+| A♯ | 10 | 10 | 0.833 | 300 | magenta |
+| F  | 5  | 11 | 0.917 | 330 | rose |
+
+**Why fifths and not chromatic order.** Three reasons, in order of weight:
+
+1. **Harmonic distance becomes perceptual distance.** Chords that share notes are
+   adjacent on the circle of fifths. Under this mapping a I–V move is one step
+   (0.083 turns, red → orange) and a chord progression inside a key is a small
+   walk in one colour family, while a modulation to a distant key is a large
+   jump. Under chromatic order, C major and G major — the two most closely
+   related chords in music — would be 7/12 of the wheel apart, and every
+   progression would read as an unmotivated colour scramble.
+2. **It matches how the harmonic series leaks.** The strongest non-octave
+   partials of any pitched sound are the 3rd (a fifth) and the 5th (a major
+   third): ±1 and +4 steps on this circle. Leakage that the FFT cannot separate
+   therefore lands *near* the fundamental's own hue instead of across the wheel,
+   so imperfect chroma degrades into a slightly blurred colour rather than a
+   wrong one. Chromatic order gives the fifth's leakage a 7-step error.
+3. **It spans the wheel exactly.** 7 and 12 are coprime, which is what §13.3.6
+   turns into the gamut guarantee.
+
+The assignment is also, by construction, close to Scriabin's *clavier à
+lumières* scale — C red, G orange, D yellow, A green — which is fifths-ordered
+for the same first reason. That is a pleasing corroboration, not a justification.
+
+**Perceptual spacing.** Equal steps in HSV hue are not equal perceptual steps
+(the green sector is wide, the blue sector narrow). A fixed, monotone
+reparametrisation of the wheel is permitted and does not affect any invariant
+here, because every statement in §13 is about hue *differences* being nonzero,
+ordered, or bounded — never about a specific hue. It is not specified now
+because it should be chosen against hardware, and it must be a constant table if
+it is chosen at all.
+
+#### 13.3.2 Polyphony: the vector sum, focus, and the root vote
+
+A chord is a distribution, not a pitch class. Combine on the circle:
+
+```
+u(θ) = ( cos 2πθ , sin 2πθ )
+
+root salience:   r_p = C̄_p + 0.4·C̄_{(p+7) mod 12} + 0.25·C̄_{(p+4) mod 12}
+                 B_p = r_p^γ_r / Σ_q r_q^γ_r                        γ_r = 3
+
+V   = Σ_p [ (1 − β)·C̄_p + β·B_p ] · u(θ_p)                          β = 0.30
+
+H_id = arg(V) / 2π          (turns)         // the hue
+F_h  = |V|                  ∈ [0, 1]        // the harmonic focus
+```
+
+**The magnitude is the point.** `F_h` falls out of the same sum and carries
+exactly the information saturation should:
+
+| content | `H_id` (turns) | `F_h` |
+|---|---|---|
+| single note C | 0.998 | 0.99 |
+| C + G (open fifth) | 0.035 | 0.96 |
+| C major triad | 0.098 | 0.66 |
+| C minor triad | 0.949 | 0.64 |
+| C7 | 0.029 | 0.54 |
+| C major 7 | 0.181 | 0.48 |
+| C + F♯ (tritone) | undefined | **0.00** |
+| chromatic 12-note cluster | undefined | **0.00** |
+
+A pure tone is focused and vivid; a triad is focused enough to be a definite
+colour; an extended chord is less so; a tritone and a chromatic cluster cancel
+exactly and read as an achromatic wash. That last row is not a special case in
+the code — it is the vector sum being honest about a distribution with no centre.
+
+**Chord quality shows as hue, and it shows for a reason.** C major reads 0.098
+and C minor 0.949 — 0.148 turns apart, a clearly different colour on the same
+root. That is not a coincidence to be tuned: the major third is four fifths
+*sharp* of the root and the minor third is three fifths *flat*, so major chords
+pull sharpward and minor chords flatward. The mapping renders the major/minor
+distinction without anyone having written a rule for it.
+
+**The root vote (`β`).** Chroma alone is ambiguous between chords that share
+notes. The worst case is the relative pair: with a perfectly flat triad, G major
+`{G,B,D}` and A minor `{A,C,E}` produce *identical* vector sums (75.0° both) —
+the two hues collide exactly. `B_p` breaks it by asking which pitch class is best
+*supported* by the others: a root is reinforced by its own fifth (+7) and major
+third (+4), so `r_p` peaks at the root, and `γ_r = 3` sharpens that peak into a
+vote. With `β = 0.30` the pair separates to 0.181 versus 0.199. On the
+equal-weight idealisation that is only 0.018 turns; **on real audio, where the
+root and fifth dominate the chroma, the same pair separates to 0.143 versus
+0.225 — a full 0.082-turn lattice step.** The equal-weight case is the worst
+case, and it is the one quoted below.
+
+`β` trades root identity against chord-quality contrast, measured:
+
+| `β` | C major ↔ C minor | G major ↔ A minor |
+|---|---|---|
+| 0.00 | 0.167 | **0.000** (exact collision) |
+| 0.15 | 0.157 | 0.009 |
+| **0.30** | **0.148** | **0.018** |
+| 0.45 | 0.140 | 0.027 |
+| 0.60 | 0.133 | 0.034 |
+
+0.30 keeps chord quality at 89 % of its maximum contrast while removing the
+degeneracy. Higher values buy root separation the timbre term (±0.030) would
+swamp anyway.
+
+**The resolution hierarchy, stated so nobody expects more than is delivered.**
+The mapping is a 2-D projection of a 12-D space; collisions exist and cannot be
+argued away. Where they are:
+
+| distinction | hue separation |
+|---|---|
+| transposition by a semitone | 0.583 turns |
+| same root, major ↔ minor | 0.148 turns |
+| adjacent roots on the fifths circle (C ↔ G) | 0.083 turns |
+| major triad ↔ its nearest minor triad (C minor ↔ B♭ major) | 0.018 turns |
+| timbre offset, bound (§13.3.3) | ±0.030 turns |
+
+The minor-triad lattice sits a constant 0.018 turns from the major lattice, so
+every minor triad has a *harmonically adjacent* major triad at that distance —
+C minor and B♭ major, which share two notes and one key signature. The mapping
+resolves nothing finer than that, and timbre may swamp it. What timbre may never
+do is move a chord onto a neighbouring root's hue: 0.030 < 0.083/2.
+
+**Focus gate.** When `F_h < 0.10` the angle of `V` is numerical noise. `H_id`
+**holds its last value** and does not update until focus recovers; saturation
+falls on its own, so the held hue is barely visible while it is held. The hold is
+non-cumulative — it freezes, it never rotates — so P12 is intact.
+
+#### 13.3.3 Timbre's bounded role
+
+```
+δ_T = κ_T · ( 0.6·(2ζ̄ − 1) + 0.3·ψ̄₁ + 0.1·ψ̄₂ )         κ_T = 0.030 turns
+```
+
+`|δ_T| ≤ κ_T = 0.030 turns` **by construction**, since the bracket is a convex
+combination of terms in `[−1, 1]`. A synth stab and a pad on the same chord
+therefore differ by at most 0.060 turns — visible — while never reaching the
+0.083 turns that separate adjacent roots. Timbre tints an identity; it cannot
+relabel one. Being a bounded, deterministic function of the current spectrum, it
+costs nothing in reproducibility: the same sound gives the same offset whenever
+it occurs.
+
+Noisiness goes to saturation instead of hue, because "how pitched is this" is
+what saturation already means here:
+
+```
+F̂        = smoothstep(0.12, 0.80, F_h)
+sat(x,t) = clamp( S0 + S1·( 0.55·F̂ + 0.30·Strail(x,t) + 0.15·Φ(t) ), 0, 1 )
+           · ( 1 − S_noise · 𝒩̄ )
+                     S0 = 0.35,  S1 = 0.65,  S_noise = 0.30
+```
+
+This replaces §12.2's `S0 + S1·(0.4·Φ + 0.6·Strail)`. Harmonic focus becomes the
+dominant driver of vividness, the §12.3 trail keeps its local sparkle, and `Φ`
+keeps a minority share (0.15) so that a build still gains a little intensity.
+`S0` drops from 0.45 to 0.35 so that genuinely diffuse harmony can actually read
+as washed out — with the old floor it could not. Ranges: a clean triad with no
+recent gesture reads 0.71; the same chord under a run of hits reaches 1.00; an
+atonal noise cluster bottoms out at 0.245, pale but not grey.
+
+**Timbre does not touch lightness.** That is §13.5.
+
+#### 13.3.4 The composed field
+
+```
+H(x,t) = wrap01( Θ_user + H_id(t) + δ_T(t) + A(t)·G(x,t) + C(x,t) )
+```
+
+| term | source | status |
+|---|---|---|
+| `Θ_user` | user theme hue, constant | unchanged |
+| `H_id` | §13.3.2, chroma + root vote | **replaces `H0(t)`** |
+| `δ_T` | §13.3.3, bounded ±0.030 | new |
+| `A(t)·G(x,t)` | §12.1, centroid position × spectral spread | unchanged |
+| `C(x,t)` | §12.3, the gesture trail | unchanged |
+| ~~`ω0` drift~~ | wall clock | **deleted** |
+| ~~structure kick~~ | cumulative on novelty | **deleted** |
+
+**Both properties hold at once, and this is the whole point.** The user's earlier
+complaint (colour not diverse, centre-concentrated) and this one (colour not
+reproducible) pull in opposite directions only if diversity is bought with a
+clock. Here every surviving term is a function of content:
+
+* `H_id` sets the base hue from the harmony — reproducible because the harmony is.
+* `A·G` fans the board about the centroid column by up to ±0.30 turns — spatially
+  varied, and reproducible because the centroid and the spectral spread are
+  functions of the current spectrum.
+* `C` lays a ±0.18-turn wake behind gestures with a 0.9 s decay — reproducible up
+  to onset-detection agreement, and short-lived enough that disagreement cannot
+  accumulate.
+
+So the board still spans a wide arc at every instant (M10a, unchanged) while the
+*base* of that arc is pinned to the music (M11, new). The register gradient
+modulates *around* the identity hue within a bounded arc; it never replaces it.
+
+**Residual non-determinism, bounded and named.** Three terms are not pure
+functions of the current window, and honesty about their size is what makes the
+reproducibility bound settable:
+
+1. `x_c` uses `state.brightness`, percentile-normalised over 10 s. Within one
+   song the percentiles converge to that song's own distribution, so the two
+   occurrences of a section see the same mapping; the residual is the tracker's
+   own ripple, well under 0.02 in normalised centroid, i.e. under 0.01 turns
+   through `A·G`.
+2. `δ` (tuning) converges in ~20 s and is constant thereafter for one recording.
+3. The identity smoother carries ~2 s of the preceding material into a segment.
+   M11 excludes the first 2 s of a segment for exactly this reason, and states
+   that it does.
+
+#### 13.3.5 Voicing sensitivity, and what "similar" means
+
+The same chord voiced differently is not exactly the same chroma. Measured on the
+mapping: a C major triad with equal pitch-class weights reads 0.098; the same
+triad with a realistic weighting (root 1.0, fifth 0.6, third 0.45, plus 0.15 of
+the fifth-of-the-fifth from partial leakage) reads 0.059. So **voicing and
+registration move the hue by up to ≈ 0.04 turns**, and timbre by up to 0.030.
+
+That is the arithmetic behind the tolerance in the user's own framing — *"of
+course there is gonna be some variation"*. Two occurrences of a section:
+
+* **identical audio** (a loop, a copy-pasted chorus): hue difference ≈ 0, bounded
+  by the smoother's 2 s memory. M11a: **≤ 0.02 turns**.
+* **same harmony, re-arranged** (added vocal, extra percussion, different lead
+  patch, +3 dB): bounded by 0.04 (voicing) + 0.030 (timbre) ≈ **0.07 turns**.
+  M11c: **≤ 0.08 turns** — a visibly related colour, not an identical one.
+* **different harmony**: at least 0.083 turns for the most closely related chord
+  and up to 0.5 for a distant one. M11b: **≥ 0.15 turns** on the battery case.
+
+The gap between the second and third rows is what makes the property real rather
+than asserted, and it is why M11 pairs a reproducibility bound with a
+discrimination bound.
+
+#### 13.3.6 Gamut: the transposition-equivariance theorem
+
+> *"i dont want it to just purely be a limited color space"*
+
+**Claim.** Transposing any material up `s` semitones rotates its identity hue by
+exactly `(7s/12) mod 1` turns, and by nothing else.
+
+**Proof sketch.** Transposition by `s` is the cyclic shift `C_p → C_{(p−s) mod
+12}`. Every operation between chroma and `H_id` — the power `γ_c`, the L1
+normalisation, the root-salience kernel (defined purely by the intervals +7 and
++4), the sharpening `γ_r`, and the vector sum — commutes with a cyclic shift.
+And `θ_{(p+s) mod 12} = θ_p + 7s/12 (mod 1)`. Therefore `H_id` rotates rigidly and
+`F_h` is unchanged. ∎
+
+**Consequence.** Because 7 and 12 are coprime, the 12 transpositions of *any*
+chord type land on 12 hues spaced **exactly 1/12 of a turn apart, tiling the
+whole wheel**. Verified numerically: the 12 major triads sit at 0.014, 0.098,
+0.181, 0.264, 0.348, 0.431, 0.514, 0.598, 0.681, 0.764, 0.848, 0.931, with all
+twelve gaps equal to 0.0833 to within floating-point error; the 12 minor triads
+tile the same lattice offset by 0.018.
+
+This is a *guarantee*, not a hope: the model cannot collapse into one region of
+the wheel unless the music collapses into one pitch class. Within a single key a
+diatonic loop stays inside a family — I–V–vi–IV in C spans 0.014 → 0.199, an arc
+of 0.185 turns — and that is correct, because the music stayed in one key; the
+family moves bodily when the music modulates. Across a song with sections in
+different keys, coverage is wide by construction. M12 measures it; the unit test
+in M12b proves the lattice directly, with no audio involved.
+
+### 13.4 Recurrence
+
+#### 13.4.1 Determinism already delivers it
+
+The user's example — *"if it happened 30 seconds ago … they should repeat again
+similarly"* — is a consequence of §13.1 plus §13.3, not a feature to be added on
+top. `H(x,t)` is a function of the audio in the last few seconds and of nothing
+else. If the same passage plays again, the same function is evaluated on the same
+input and returns the same colour, whether the gap is 30 seconds, 3 minutes or
+three days. Under re-arrangement the difference is bounded at ≈ 0.07 turns by
+§13.3.5's arithmetic.
+
+A guarantee with a bound is a stronger answer than a heuristic that usually
+works, so the design's primary answer to the recurrence request is the deletion
+of the clock, not the addition of a memory.
+
+#### 13.4.2 The self-similarity layer, specified in full
+
+Specified so that the decision below is a decision and not an omission.
+
+```
+buffer:      I(t) sampled at 5 Hz (every 19th hop), horizon 120 s
+             → 600 entries × 16 Float32 = 38.4 KB
+alongside:   H_raw(t) — the §13.3 mapping's own output, for each entry
+exclusion:   candidates within 5 s of now are ignored (adjacency is not recurrence)
+match:       s_max = max over candidates of cosine( I(t), I(t−k) )
+weight:      w = w_max · smoothstep(0.90, 0.97, s_max)              w_max = 0.35
+bias:        H_out = wrap01( H_id + w · wrap±(H_raw[argmax] − H_id) )
+```
+
+* **It cannot drift or feed back.** The buffer stores `H_raw` — the unbiased
+  mapping — and `I`, both computed before the bias is applied, and no entry is
+  ever rewritten. So the bias is applied at most once, to a value that never
+  becomes an input. Maximum displacement from the raw mapping is
+  `w_max · 0.5 = 0.175` turns, in one step, ever.
+* **Degradation is continuous.** Nothing above 0.90 similarity ⇒ `w = 0` ⇒
+  exactly the §13.3 mapping. The `smoothstep` means the layer can never switch
+  on or off between frames.
+* **Cost is not the objection**: 38 KB and 600 × 16 = 9 600 multiply-adds per
+  frame, ~0.14 MFLOP/s at 15 fps.
+
+#### 13.4.3 Decision: specified, measured, **not enabled**
+
+The cost is negligible, so the verdict turns entirely on whether it does anything
+good. Three reasons it does not:
+
+1. **It can only close a gap smaller than the tolerance already granted.** Where
+   the audio repeats, §13.3 gives ≈ 0 hue difference and there is nothing to fix.
+   Where the arrangement changed, the difference is bounded at ≈ 0.07 turns —
+   which is the "some variation" the user explicitly allowed, and arguably the
+   *information* that the second chorus is not the first.
+2. **It reintroduces exactly what §13.1 deletes.** The colour of a moment would
+   depend on what had been played earlier in the session: starting the same song
+   from the second verse would render it differently, and P12 would become
+   unenforceable. The invariant is worth more than the marginal effect, because
+   the invariant is what makes every metric below meaningful.
+3. **Its failure mode attacks the thing that makes the requirement
+   falsifiable.** A false match at `s ≈ 0.92` between two harmonically different
+   sections pulls them *together* — it can only improve reproducibility by
+   spending discrimination, and M11's pair is precisely a reproducibility bound
+   held against a discrimination bound. A mechanism whose errors move the system
+   toward passing one metric by failing its couple is a bad mechanism, however
+   cheap.
+
+**But the property is made explicit and measurable**, which is the part the
+request demands and which determinism alone does not supply: the same ring buffer
+and cosine matching are implemented **in `viz-sim`, offline, over the exported
+per-frame identity track**, and reported as M11d. That measures the recurrence
+claim on any material — including the user's own music through
+`Signal.file(URL)` — instead of asserting it.
+
+**Revisit condition, stated so the decision is falsifiable.** Enable at
+`w_max = 0.35` if either: M11c's measured reproducibility-under-variation exceeds
+0.08 turns on real music, or M11d's recurrence hue error exceeds 0.05 turns on a
+track the user identifies as having an obvious repeat. On enabling, M11b must be
+re-run and must not regress below 0.15 turns; if it does, the layer loses on its
+own terms.
+
+### 13.5 Orthogonality with §11
+
+**Normative split:**
+
+| channel | driven by | section |
+|---|---|---|
+| **hue** | identity only — chroma, root vote, timbre offset, register gradient, trail | §13.3 |
+| **value / lightness** | energy only — `bed + swell + accent`, `outAmount` | §11.4 |
+| **saturation** | shared, deliberately: `0.55·F̂ + 0.30·Strail + 0.15·Φ`, × noisiness | §13.3.3 |
+
+**The invariant:** no term in `H(x,t)` may read `E`, `Φ`, `Σ`, `master`, the
+output gain or any gesture *level*; no term in `L(x,t)` may read chroma, `F_h`,
+`ζ`, `𝒩` or `ψ`. Saturation is the single deliberate crossing, and `Φ`'s share of
+it is capped at 0.15 so that a quiet passage desaturates a little and never
+changes colour.
+
+This is what makes the user's requirement survive a quiet passage: chroma is
+L1-normalised (§13.2.1), so a chord played *pp* and the same chord played *ff*
+produce the same `C̄`, the same `H_id`, and the same hue. The board goes dimmer —
+§11 does that, correctly — and keeps its harmonic colour instead of washing out.
+M13e measures exactly this and would fail any implementation that let level leak
+into hue.
+
+Two directions the coupling could sneak back in, both closed:
+
+* **`A(t)` uses spectral spread, not energy.** Spread is a shape statistic of the
+  normalised band shares, so a crescendo with constant instrumentation does not
+  open the fan.
+* **The trail `C(x,t)` is deposited with weight `level_g · kernel_g(x)`**, which
+  *is* an energy term — but it deposits a per-kind *hue offset* bounded at ±0.08
+  and clamped at ±0.18, and it decays in 0.9 s. It modulates hue locally on the
+  TRANSIENT timescale; it cannot move the base. This is a deliberate exception,
+  and M13e's bound is set above it (the case has no onsets, so it is not
+  exercised there; M11a is, and it passes with the trail live).
+
+### 13.6 Cost
+
+Per analysis hop (93.75 Hz), all of it on the analysis thread:
+
+| step | work |
+|---|---|
+| chroma accumulation | 84 bins × ~4 flops = ~340 flops |
+| tuning estimator | 60 bins × 2 transcendental (precomputed `cos φ_k`, `sin φ_k` — `π_k` is fixed per bin) → ~240 flops |
+| sharpen + normalise | 12 × (1 sqrt-based pow) |
+| root salience + vote | 36 + 12 pow + 12 MAC |
+| vector sum | 24 MAC on a precomputed `u(θ_p)` table |
+| flatness | ~85 logs |
+| DCT ψ₁, ψ₂ | 8 logs + 16 MAC on a precomputed cosine table |
+| smoothing | 16 one-poles |
+
+≈ 900 flops and ≈ 100 transcendentals per hop → under 0.1 MFLOP/s, below 0.5 % of
+one core, and **zero** additional FFTs. Every per-bin quantity that depends only
+on the bin index (`f_k`, `π_k`, `r_k`, `cos φ_k`, `sin φ_k`) is precomputed once
+at construction, as `bandBins` already is.
+
+Render-side cost is unchanged: `H_id` and `δ_T` arrive as interpolated channels,
+and §12.2's 17 HSV conversions per frame are untouched.
+
+### 13.7 What this replaces
+
+| deleted | replaced by |
+|---|---|
+| `ColourField.driftRate` (`ω0 = 1/180`) and the `baseHue += …` integration | `H_id` from chroma (§13.3.2) |
+| `ColourField.structureKick` / `structureKickSeconds` / `kickRemaining` | nothing — a section change shows through its harmony and its energy |
+| `advance(…, section:, structureChanged:)` parameters | `advance(…, identityX:, identityY:, timbreTint:, noisiness:)` |
+| §12.2's `sat = S0 + S1·(0.4Φ + 0.6·Strail)`, `S0 = 0.45` | §13.3.3's focus-driven saturation, `S0 = 0.35` |
+| `state.brightness` as *the* colour decision (already demoted in r2) | remains the *position* of the gradient only |
+
+`AnalysisState` gains `identityX`, `identityY`, `timbreTint`, `noisiness`.
+`MusicAnalyzer` gains a `ChromaAnalyzer` fed from `magnitudes`, alongside the
+existing whitening path.
+
+---
+
 ## 10. Verification
 
 The audit's finding about the current tooling is the important one: **every
@@ -1712,9 +2490,44 @@ unless stated.
 |---|---|---|
 | `music-then-room` | 20 s of 128 BPM four-on-the-floor, then 55 s of −45 dBFS room tone. 75 s | **M9c's silence complement.** The clause "board-mean ≤ 0.03 after 10 s of silence" was emitted **zero** times in 13 138 checks: `cut-transitions`' silences are 0.5 s and the clause needs ten seconds, so `DeadFrac` ran entirely uncoupled and a board glowing on room noise passed the whole table. −45 dBFS, not `near-silence`'s −60: the AGC's own gain clamp already decides −60 dBFS, and the question is what happens in the 15 dB above it |
 
+**New cases (r3)** — eight harmonic cases, so that "colour represents the music"
+becomes falsifiable. Common generation rules, so an implementer has no free
+parameters:
+
+* **Voice.** A pitch is rendered as a harmonic stack, partials `n = 1…10` at
+  amplitude `1/n`, zero phase, unless the case names another timbre.
+* **Voicing.** Root in octave 3 (C3 = 130.81 Hz), third and fifth in octave 4.
+  A440 equal temperament exactly, so the §13.2.1 tuning estimator settles at
+  `δ = 0` and cannot be the thing under test.
+* **Chord envelope.** 20 ms linear attack, decay to 0.75 over 250 ms, sustain,
+  60 ms release before the next chord. No crossfade: chord changes are hard, so
+  M13b measures the model's own responsiveness and not a generator ramp.
+* **Percussion bed** (where present): 120 BPM, kick = 60 Hz sine burst (12 ms
+  attack, 180 ms decay) on every beat, hat = 8 kHz noise burst (20 ms) on the
+  offbeats. **Identical in every segment of a case**, so that only harmony
+  differs between segments.
+* **Mix.** Chords at −14 dBFS RMS, percussion at −18 dBFS RMS, sum normalised to
+  −12 dBFS peak, unless the case names a level.
+* **Determinism.** Any noise component uses a stated xorshift seed (12345); the
+  battery must be bit-reproducible in CI.
+
+| id | signal | what it catches |
+|---|---|---|
+| `aba-progression` | 60 s, three 20 s segments. **A** = C–G–Am–F, 2.5 s per chord, ×2. **B** = the same progression transposed **+3 semitones** (E♭–B♭–Cm–A♭). The third segment is the *same rendered samples* as the first, written twice. Percussion bed throughout | **M11a/M11b.** Reproducibility with an exactly repeated segment, held against discrimination on a segment 0.25 turns away by the §13.3.6 theorem |
+| `loop-recur` | 36 s, three 12 s segments at 100 BPM. **X** = Dm–B♭–F–C, 3 s each, saw stack (partials 1…12, `1/n`). **Y** = X transposed **+6 semitones**. **X′** = X's harmony and rhythm re-arranged: 25 %-duty pulse instead of saw, a square-wave lead (partials 1,3,5,7 at `1/n`, one chord tone per bar), an added 16th-note shaker (12 kHz noise, 10 ms), and +3 dB overall | **M11c.** The user's actual case — "the same part, arranged differently". Reproducibility must survive it; discrimination against Y must not |
+| `key-tour` | 48 s, 12 major triads × 4 s, roots stepping **+5 semitones** each: C F A♯ D♯ G♯ C♯ F♯ B E A D G. By §13.3.6 each step rotates the hue by exactly −1/12 turn, so the case walks the whole wheel in 12 equal steps | **M12.** Gamut coverage, against a known-exact expectation |
+| `chord-hold` | 20 s sustained C major triad, constant level, no percussion | **M13a.** Identity stability — a stationary harmony must give a stationary hue |
+| `chord-dynamics` | 24 s sustained C major triad, level ramping −34 → −8 dBFS over 12 s and back over 12 s (linear in dB), no percussion | **M13e.** The orthogonality case: lightness must move, hue must not |
+| `chord-change` | 32 s, alternating C major and E major every 4 s (8 segments), no percussion. E is +4 semitones from C, so the expected hue step is exactly 1/3 turn | **M13b.** Responsiveness: the promptness half of the stability/promptness pair |
+| `timbre-triad` | 30 s, C major triad throughout at −14 dBFS RMS, three 10 s timbres: (1) saw stack, partials 1…12 at `1/n`; (2) pad, partials 1,2,3 at 1.0/0.30/0.10, 400 ms attack, 5-cent 6 Hz vibrato; (3) pluck, partials 1…16 at `1/n^0.7`, exponential decay τ 250 ms retriggered every 500 ms, each retrigger with a 15 % broadband noise transient | **M13c.** Same harmony, three timbres: hue must stay inside the §13.3.3 bound while saturation must separate the tonal from the noisy |
+| `atonal-cluster` | 20 s, all 12 pitch classes sounding together (C4…B4, saw stacks partials 1…6, equal amplitude), plus seeded noise bursts at 8 Hz | **M13d.** Harmonic focus must collapse and the board must desaturate rather than pick a hue out of noise |
+
 `build-drop` is the case r1 has no answer to at all, and it is deliberately not
 a synthetic abstraction: it is the shape of the material the user was listening
-to when they used the word "cliff".
+to when they used the word "cliff". `aba-progression` and `loop-recur` are the
+r3 equivalents: not abstractions of "harmony", but the two literal shapes the
+request names — a part that comes back identical, and a part that comes back
+changed.
 
 Plus the **orthogonal axes** applied to every case, one battery arm each. The
 matrix was one axis at one frame rate and one sensitivity, which left three
@@ -1760,6 +2573,21 @@ the simulator at all**. That is why it survived. Required additions to viz-sim:
   `VisualizerController.packets(for:lastSent:)` over consecutive frames and
   report the §7.2-R budget (median / p95 / max packets, fallback rate). It is
   the only place that budget can be checked without hardware.
+
+**Further additions required by r3:**
+
+* **Per-frame identity export.** `H_id`, `F_h`, `δ_T`, `𝒩` and the 12-bin
+  smoothed chroma `C̄`, alongside the existing RGB. M11's tight bound is stated
+  on `H_id` and its loose bound on the composed board hue, so that a failure
+  says *which* of the two moved; M11d needs `C̄` to compute similarity offline.
+* **Segment ground truth.** `Signal.track` must return
+  `segments: [(label: String, start: Double, end: Double)]`. Every r3 case
+  above emits its segments, and the metrics align occurrences by label. Deriving
+  segment boundaries from the audio would be measuring our own analyser against
+  itself, which is the same mistake §10.1 already refuses for beats and RMS.
+* **A pure-function harness for the mapping.** M12b and the equivariance test run
+  `chromaToHue(_:)` on constructed 12-vectors with no audio and no renderer.
+  A property that is provable should be proved, not sampled.
 
 ### 10.2 Metric definitions
 
@@ -2087,6 +2915,209 @@ that is a fixed function of column, however fast the palette rotates.
 
 ---
 
+**M11, M12, M13 — colour as musical identity (new in r3).**
+
+Shared definitions, used by all three:
+
+> **Circular hue distance**, in turns, always in `[0, 0.5]`:
+> ```
+> d(h₁, h₂) = | wrap±( h₁ − h₂ ) | ,   wrap±(x) = x − round(x)
+> ```
+> **Board hue** `h̄(f)`: the brightness-weighted circular mean hue over all LEDs
+> in frame `f` — the same estimator M10b uses, so the two agree on what "the
+> board's colour" means. Counted only on frames with `(Σ_k v_k)/K ≥ 0.06`.
+>
+> **Identity hue** `h_id(f)`: the exported §13.3.2 hue, before the register
+> gradient, the trail and `Θ_user`. Every bound below is stated on **both**, with
+> the tight bound on `h_id` and the loose bound on `h̄`, so that a failure
+> localises to either the mapping or the composition.
+
+**Scope.** M11–M13 are asserted in **`pulse` and `spectrum`** only, on the
+reference, `/15fps` and `/jitter` arms. Identity is computed once per frame,
+board-wide, and is mode-independent by construction — the mode affects only the
+spatial gradient and the trail, which M10 already bounds. The gain arms
+(`/quiet`, `/loud`) apply a monotone curve to lightness and cannot move hue;
+asserting there would add 96 runs and no information. This scoping is a claim,
+and it is testable: if a hue metric ever differs between `pulse` and `spectrum`
+by more than its own bound, the scoping is wrong and the matrix must widen.
+
+---
+
+**M11 — reproducibility and discrimination. The numerical statement of "if it
+happened 30 seconds ago … they should repeat again similarly".**
+
+**M11a — reproducibility, identical repeat.** On `aba-progression`, whose
+segments A₁ (0–20 s) and A₂ (40–60 s) are the same rendered samples.
+
+> Align A₁ and A₂ by segment-relative time. **Excluding the first 2.0 s of each
+> segment** — §13.2.3's identity smoother carries ~2 s of the preceding material,
+> and the exclusion is stated rather than hidden — compare corresponding frames:
+> ```
+> D_rep      = mean_f d( h_id(f + t_A₁), h_id(f + t_A₂) )
+> D_rep(brd) = mean_f d( h̄(f + t_A₁),   h̄(f + t_A₂)   )
+> ```
+
+* **`D_rep ≤ 0.010` turns**, `p95 ≤ 0.020`.
+* **`D_rep(brd) ≤ 0.020` turns**, `p95 ≤ 0.040`. The looser board bound absorbs
+  the two named residuals of §13.3.4: the centroid percentile tracker's ripple
+  through `A·G` (< 0.01 turns) and onset-detection disagreement through the
+  0.9 s trail.
+* r2 scores **≈ 0.11 turns** here by construction — `ω0 · 40 s` at rest — so this
+  bound fails loudly on the shipped build, which is how it should land.
+
+**M11b — discrimination (the anti-vacuity couple, and it is mandatory).**
+
+> On the same run, comparing A₁ against B frame-by-frame over the same aligned
+> window:
+> ```
+> D_disc = mean_f d( h_id(f + t_A₁), h_id(f + t_B) )
+> ```
+
+* **`D_disc ≥ 0.15` turns** — expectation is 0.25 turns exactly, since B is A
+  transposed +3 semitones and §13.3.6 makes that a rigid 0.25-turn rotation.
+* **`D_disc / max(D_rep, 0.005) ≥ 5`.**
+* **Without this clause a constant-colour visualiser passes M11a perfectly.**
+  M11a and M11b are a single check with two outputs and must be implemented as
+  one: reporting them as independent rows is the failure mode this document has
+  already had to correct four times (§10.3).
+
+**M11c — reproducibility under variation.** On `loop-recur`, comparing X
+(0–12 s) against X′ (24–36 s), same 2 s exclusion:
+
+* **`d(X, X′) ≤ 0.080` turns** on `h_id`. The budget is §13.3.5's arithmetic:
+  ≤ 0.04 turns from re-voicing plus ≤ 0.030 turns from the timbre term. This is
+  the metric that encodes *"of course there is gonna be some variation"* — it is
+  deliberately not 0.01, because an implementation that made a re-arranged
+  chorus **identical** would have thrown away the timbre channel.
+* **`d(X, Y) ≥ 0.15` turns** — the discrimination couple again, with an
+  expectation of 0.5 turns.
+* **Both clauses on one run**, or the case proves nothing.
+
+**M11d — recurrence index (diagnostic, reported, not gated).**
+
+> Offline in `viz-sim`, over the exported per-frame identity track: for every
+> pair of frames `(i, j)` with `|t_i − t_j| > 5 s` and
+> `cosine( I_i, I_j ) ≥ 0.95`, accumulate `d(h_id(i), h_id(j))`.
+> Report the mean, the p95 and the pair count.
+
+* Expected mean `≤ 0.03` turns. Reported rather than gated because the pair count
+  depends entirely on the material: a case with no repeats produces no pairs, and
+  a bound that no case can reach is a comment, not a gate (§10.3, coupling 5).
+* This is the measurement that makes §13.4's decision falsifiable, and it is the
+  only metric here that runs on **arbitrary audio** — including the user's own
+  music through `Signal.file(URL)`, which is where the request came from.
+
+---
+
+**M12 — gamut coverage. The numerical statement of "i dont want it to just
+purely be a limited color space".**
+
+**M12a — measured coverage.** On `key-tour`:
+
+> Bin the hue circle into 24 bins of 1/24 turn. A bin is **visited** if at least
+> 0.25 s of frames have `h_id(f)` inside it, counted only on frames where the
+> board is showing something (`(Σ_k v_k)/K ≥ 0.06`).
+> ```
+> Gamut = visited bins / 24
+> ```
+
+* **`Gamut ≥ 0.45`.** The case places 12 chords at exactly 1/12-turn spacing, so
+  12 distinct bins are reachable by the sustained chords alone (0.50) and the
+  transitions sweep between them; 0.45 leaves margin for the settle at each
+  change without accepting a model that collapses.
+* **Upper guard `Gamut ≤ 0.95`.** Visiting essentially every bin on a 12-chord
+  case would mean something is still rotating that should not be — the guard is
+  a residual-drift detector, not a taste bound.
+* **Not asserted on fixed-harmony cases.** `edm-128` loops one harmony; a low
+  gamut there is *correct*, and demanding coverage would be demanding the board
+  invent harmony the material does not have. This is the same error §10.5 gap 9
+  records for M9a on the steady loops, and it is not repeated here.
+
+**M12b — the lattice, proved rather than sampled (unit test, no audio).**
+
+> Over the pure mapping `chromaToHue(_:)`:
+> 1. For each of the 24 triads (12 major, 12 minor), compute the hue. The 12
+>    transpositions of each type must be spaced `1/12 ± 0.002` turns apart, and
+>    must therefore tile the wheel.
+> 2. For each chord type and each `s ∈ 1…11`, transposing the chroma vector by
+>    `s` must rotate the hue by `(7s/12) mod 1 ± 0.002` turns and leave `F_h`
+>    unchanged to `±0.002`.
+> 3. `F_h(C+F♯) ≤ 0.01` and `F_h(chromatic cluster) ≤ 0.01`.
+
+This is §13.3.6's theorem as an assertion. It is what actually guarantees the
+gamut — M12a can only sample it — and it costs microseconds.
+
+---
+
+**M13 — identity stability, responsiveness and orthogonality.**
+
+**M13a — stability inside a chord.** On `chord-hold`, after a 2.0 s settle:
+
+* **`sd_f( h_id ) ≤ 0.008` turns** and `p95 − p05 ≤ 0.020` turns.
+* **`sd_f( h̄ ) ≤ 0.020` turns.**
+* A stationary harmony must give a stationary hue. This is the hue analogue of
+  M1's `p95 ≤ 0.1` on `sustained-tone`: colour flicker is flicker.
+
+**M13b — promptness at a chord change.** On `chord-change`, at each of the 7
+boundaries, with the expected step `Δ = 1/3` turn known exactly:
+
+> ```
+> step(t) = d( h_id(t_boundary − 0.05) , h_id(t) )     // distance travelled
+> t₅₀ = first t with step(t) ≥ 0.50·Δ
+> t₈₀ = first t with step(t) ≥ 0.80·Δ
+> overshoot = max_t  d( h_id(t) , h_target ) over [t₈₀, t_boundary + 2 s]
+> ```
+
+* **`median(t₅₀ − t_boundary) ≤ 0.25 s`**, **`p90(t₈₀ − t_boundary) ≤ 0.40 s`**.
+* **`overshoot ≤ 0.05` turns.**
+* **Miss rate ≤ 5 %**, where a miss is a boundary at which `step` never reaches
+  `0.80·Δ` within 1.0 s.
+* **M13a and M13b are a couple and must be evaluated together.** Raising `τ_id`
+  passes M13a and fails M13b; removing the smoother does the reverse. Neither
+  degenerate answer passes both, which is the entire reason §13.2.3 is
+  dual-speed rather than a single time constant.
+
+**M13c — same chord, different timbre.** On `timbre-triad`, over the three 10 s
+segments (2 s settle each), using each segment's mean identity hue and mean board
+saturation:
+
+* **`max pairwise d(h_id) ≤ 0.075` turns** — timbre may tint (§13.3.3 bounds one
+  offset at 0.030, so a pair is bounded at 0.060, plus settle) and may **not**
+  relabel the harmony. The bound is below the 0.083 turns that separate adjacent
+  roots, so passing it *proves* the guarantee rather than restating it.
+* **`max pairwise d(h_id) ≥ 0.010` turns** — timbre must be visible at all.
+  Without this, dropping `δ_T` entirely would pass.
+* **`sat(pluck) ≤ sat(saw) − 0.10`** — the noisy voice must read paler. Expected
+  separation is ≈ 0.25 from `S_noise` and the focus term together.
+
+**M13d — focus collapse.** On `atonal-cluster`, after a 2 s settle:
+
+* **`mean F_h ≤ 0.25`** and **mean board saturation `≤ 0.55`.**
+* **`sd_f(h_id) ≤ 0.030` turns** — the §13.3.2 focus gate must hold the hue, not
+  let it spin on the angle of a near-zero vector. A model that let hue chase
+  noise here would show as a colour scramble on every drum solo.
+
+**M13e — orthogonality (the §11 / §13 interface).** On `chord-dynamics`, whose
+harmony is constant and whose level ramps 26 dB:
+
+> Split the run into its loud half (input RMS above the run median) and its quiet
+> half. Then:
+> ```
+> hueShift  = d( circular mean h_id over loud , circular mean h_id over quiet )
+> lightSwing = mean board lightness over loud − mean over quiet
+> ```
+
+* **`hueShift ≤ 0.020` turns** — energy may not move hue.
+* **`lightSwing ≥ 0.18`** — and it must be asserted, because `hueShift ≤ 0.02` is
+  passed trivially by a visualiser that does nothing at all. This pairing is the
+  same shape as M9b's `dropContrast` and exists for the same reason.
+* This is the metric behind "a quiet passage keeps its harmonic colour rather
+  than washing out". It is the one metric that would fail if anybody let `Φ`,
+  `Σ`, `E` or the output gain into the hue expression, which is why it is stated
+  as a metric and not only as an invariant.
+
+---
+
 ### 10.3 Pass criteria summary
 
 | metric | bound | applies to |
@@ -2130,12 +3161,24 @@ that is a fixed function of column, however fast the palette rotates.
 | **§7.2-R packets/frame** | median ≤ 2, p95 ≤ 4, **max ≤ 7 (invariant, unit-tested)**, fallback ≤ 5 % | sim + hardware |
 | **M8 credit misses** | **≥ 2** — §2.3.4's counter must be what stopped the board | `click-120-gap` |
 | **M9c silence complement** | board-mean ≤ 0.03, 10 s into a ground-truth silence | `music-then-room` |
+| **M11a `D_rep`** | **≤ 0.010 turns** on `h_id`, ≤ 0.020 on the board | `aba-progression` · pulse, spectrum |
+| **M11b `D_disc`** | **≥ 0.15 turns**, and `D_disc/D_rep ≥ 5` | as above — *the couple, one check* |
+| **M11c variation** | **`d(X,X′) ≤ 0.080`** and **`d(X,Y) ≥ 0.15` turns** | `loop-recur` |
+| **M11d recurrence index** | reported, expect ≤ 0.03 turns | any case with repeats — diagnostic only |
+| **M12a gamut** | **0.45 … 0.95** of 24 hue bins | `key-tour` only |
+| **M12b lattice** | **1/12 ± 0.002 turn spacing over 24 triads; `F_h ≤ 0.01` on the tritone** | pure-function unit test |
+| **M13a hue stability** | **`sd ≤ 0.008` turns** (`h_id`), ≤ 0.020 (board) | `chord-hold` |
+| **M13b promptness** | **`t₅₀ ≤ 0.25 s`, `t₈₀ p90 ≤ 0.40 s`, overshoot ≤ 0.05 turns** | `chord-change` — *coupled to M13a* |
+| **M13c timbre** | **0.010 ≤ max pairwise `d(h_id)` ≤ 0.075 turns**; `Δsat ≥ 0.10` | `timbre-triad` |
+| **M13d focus collapse** | **`F_h ≤ 0.25`, sat ≤ 0.55, `sd(h_id) ≤ 0.030` turns** | `atonal-cluster` |
+| **M13e orthogonality** | **`hueShift ≤ 0.020` turns** *and* **`lightSwing ≥ 0.18`** | `chord-dynamics` |
 
-`viz-sim --battery` runs the full matrix (**20** signals × 5 modes × **7** arms)
-and prints a pass/fail table. It is a CI gate: a change that
+`viz-sim --battery` runs the full matrix (**20** signals × 5 modes × **7** arms),
+plus the **8** r3 identity signals × 2 modes × 3 arms (§10.2's scoping note), and
+prints a pass/fail table. It is a CI gate: a change that
 regresses any bound is rejected regardless of how it looks on any one track.
 
-**Five anti-vacuity couplings are load-bearing and must be implemented as
+**Eight anti-vacuity couplings are load-bearing and must be implemented as
 couplings, not as independent rows** — an implementer who evaluates them
 separately can satisfy every bound with a board nobody wants to look at:
 
@@ -2150,6 +3193,16 @@ separately can satisfy every bound with a board nobody wants to look at:
 5. **M9c's `DeadFrac` requires its silence complement**, and the complement must
    be *emitted*: a bound that no case in the battery can reach is not a coupling,
    it is a comment. `music-then-room` exists for this and for nothing else.
+6. **M11a requires M11b** (added in r3). A visualiser that paints the board one
+   fixed colour scores a perfect 0.000 on reproducibility. Discrimination is what
+   makes the repeat mean anything, and the two must be computed from one run and
+   reported as one verdict.
+7. **M13a requires M13b** (added in r3). Stability inside a chord and promptness
+   at a chord change are the two halves of one requirement, and each is trivially
+   won by giving up the other — a long time constant passes stability, no time
+   constant passes promptness.
+8. **M13e's `hueShift` requires its `lightSwing`** (added in r3). "Energy does
+   not move hue" is satisfied perfectly by a board that does not move at all.
 
 **And the couplings must be asserted on every arm.** M9a's coupling to M2 was
 switched off wherever M2's lower bound was, which was the `/quiet` and `/loud`
@@ -2202,6 +3255,25 @@ watching `animation.mp4` and the hardware.
 >
 > The three complaints r2 answers are now falsifiable. Whether the answer is
 > *good* is still a question for the hardware.
+
+> **Amended (r3).** M11, M12 and M13 make "colour represents the music"
+> falsifiable, and it is worth being exact about how little that settles:
+>
+> * M11 bounds *whether the same music gets the same colour*. It says nothing
+>   about whether the colour is the **right** one for that music. C major is red
+>   here because C is anchored at 0.000 turns; anchoring it anywhere else would
+>   score identically on every metric in this document, because every bound is
+>   stated on hue differences.
+> * M12 bounds *how much of the wheel a song reaches*. It cannot say whether the
+>   parts of the wheel it reaches are the parts a listener would have chosen, and
+>   §10.5 gap 14 records that turns are not perceptual units.
+> * M13 bounds *stability and promptness of the hue*. Whether 0.25 s is the right
+>   promptness for a chord change — as against a deliberately slower colour that
+>   reads as a wash — is a taste question no bound in this table asks.
+>
+> And the request's own escape clause is now a number rather than a shrug:
+> "of course there is gonna be some variation" is M11c's 0.080-turn budget,
+> chosen from §13.3.5's arithmetic rather than from listening.
 
 ### 10.5 Open measurement gaps to close first
 
@@ -2274,6 +3346,34 @@ is a tuning error and none should be swept for again without reading this first.
     does. Closing the gap means moving one of the three numbers, and which one is
     a design question: 0.10 in linear lightness is PWM code 2 of 255, i.e. all
     three thresholds describe a nearly-black key.
+
+**Open gaps added in r3** — the places where §13 is a design claim that no
+measurement has yet touched.
+
+12. **Chroma has never been run on real polyphonic music with drums on top.**
+    Every number in §13.3 is computed on ideal 12-vectors, and the whole battery
+    is synthetic by policy. The failure mode to look for is percussion energy
+    leaking into the chroma band and flattening the profile — a snare covers
+    200 Hz–8 kHz — which would drag `F_h` down and desaturate the board on
+    exactly the material people play. If it happens, the fix is a percussive/
+    harmonic split before the chroma accumulation, not a constant. Measure
+    `F_h`'s distribution on `edm-128` and on real music before touching anything.
+13. **The 130.81 Hz low edge is a resolution argument, not a measurement.** It
+    follows from `Δf` and the semitone width, and the claim that a bass root
+    arrives adequately through its 4th–8th partials is untested. The falsifiable
+    version: synthesise the same progression with and without a bass part and
+    measure `d(h_id)`; if it exceeds M11c's 0.08 turns, the bass is carrying
+    identity the chroma band cannot see.
+14. **HSV hue is not perceptually uniform, and every bound in M11–M13 is stated
+    in turns.** A 0.02-turn bound is a much tighter perceptual claim in the blue
+    sector than in the green. This does not invalidate any bound — they are all
+    conservative in the wide sectors — but the perceptual reparametrisation
+    §13.3.1 permits should be chosen against hardware and, if adopted, every
+    turn-valued bound must be re-derived rather than carried over.
+15. **`β = 0.30` was chosen on a table of idealised chords** (§13.3.2), where the
+    G-major/A-minor separation is 0.018 turns. On realistic weights the same pair
+    separates by 0.082. Which of those two regimes real music sits in is unknown,
+    and it is the one constant in §13 whose value would change if measured.
 
 ---
 
@@ -2358,11 +3458,11 @@ constants, wire-format constants, and dimensionless ratios.
 | bed `B0` / `B1` | 0.09 / 0.15 | 11.4 |
 | swell `S1` / `k` | 0.55 / 0.85 | 11.4 |
 | accent `A1` | 0.90, scaled by `headroom` | 11.4 |
-| hue drift ω0 | 1/180 turns per second, × `(0.25 + 0.75 Σ)` | 12.1 |
-| structure hue kick | 0.11 turns, eased over 2 s | 12.1 |
+| ~~hue drift ω0~~ | ~~1/180 turns per second~~ — **deleted in r3, P12** | 12.1 |
+| ~~structure hue kick~~ | ~~0.11 turns, eased over 2 s~~ — **deleted in r3, P12** | 12.1 |
 | gradient amplitude `A_max` | 0.30 turns × spectral spread | 12.1 |
 | gradient AHR | 50 ms / 0 / 800 ms | 12.1 |
-| saturation `S0` / `S1` | 0.45 / 0.55 | 12.2 |
+| ~~saturation `S0` / `S1`~~ | ~~0.45 / 0.55~~ — **superseded by §13.3.3** | 12.2 |
 | hue trail τ | 900 ms; deposit τ 120 ms; clamp ±0.18 turns | 12.3 |
 | saturation trail τ | 600 ms | 12.3 |
 | per-gesture hue deposit ν | kick −0.08, snare 0, hat +0.08 turns | 12.3 |
@@ -2385,6 +3485,34 @@ tables; a constant that is not in Appendix A is a constant nobody can audit.
 | VU arm bed floor | 0.62 (not 0.45) | 12.4 | a meter that only occasionally reaches its outermost columns starves them, and M10d bounds every column to 0.5…1.8× the board's own column mean |
 | M8 warm-up | 8 s | 10.2 | §2.3's tracker autocorrelates over 8 s and requires three agreeing estimates; alignment measured before any of that is the lock-in transient |
 | M10a hue motion floor | 0.010 turns | 10.2 | new in r2.1 — the anti-vacuity companion to M10a and M10b, below |
+
+**Added in r3 — the identity model.** Frequencies and pitch references are
+absolute *by necessity*: P1 governs magnitudes, and a normalisation that made
+pitch relative would delete the property §13 exists to build.
+
+| symbol | value | § |
+|---|---|---|
+| chroma band | 130.81 Hz (C3) … 2093.0 Hz (C7) — 84 bins at 48 kHz | 13.2.1 |
+| chroma source | raw `magnitudes`, **never** the whitened spectrum | 13.2.1 |
+| resolution weight `r_k` | `clamp( f_k·(2^(1/12) − 1) / Δf, 0, 1 )` — 1.0 above 394 Hz | 13.2.1 |
+| tuning reference | A440 equal temperament, `π = 69 + 12·log2(f/440)` | 13.2.1 |
+| tuning estimator τ | 20 s; applied via `smoothstep(0.10, 0.20, conf)` | 13.2.1 |
+| chroma sharpening `γ_c` | 1.5, then L1 normalisation | 13.2.1 |
+| timbre brightness `ζ` | `log2(f_c/110)/6`, clamped — 110 Hz … 7040 Hz | 13.2.2 |
+| flatness band / decimation | 80 Hz … 8 kHz, every 4th bin | 13.2.2 |
+| noisiness map | `(log10 F + 2.5)/2.5`, clamped | 13.2.2 |
+| shape descriptors `ψ₁`, `ψ₂` | DCT-II coefficients 1 and 2 of the log band shares ÷ 2.5 | 13.2.2 |
+| identity smoothing `τ_id` | 0.80 s; 0.10 s while novelty `n > 0.22` for ≥ 2 hops, until `n < 0.08` | 13.2.3 |
+| timbre smoothing `τ_T` | 0.50 s, symmetric | 13.2.3 |
+| pitch class → hue | `θ_p = ((7p) mod 12)/12` turns — the circle of fifths | 13.3.1 |
+| root-salience kernel | `r_p = C̄_p + 0.4·C̄_{p+7} + 0.25·C̄_{p+4}` | 13.3.2 |
+| root-vote sharpening `γ_r` | 3 | 13.3.2 |
+| root-vote weight `β` | 0.30 | 13.3.2 |
+| focus gate | hold `H_id` while `F_h < 0.10` | 13.3.2 |
+| timbre hue bound `κ_T` | **0.030 turns**, hard by construction (< half a fifths step) | 13.3.3 |
+| saturation `S0` / `S1` / `S_noise` | 0.35 / 0.65 / 0.30 | 13.3.3 |
+| focus shaping | `smoothstep(0.12, 0.80, F_h)` | 13.3.3 |
+| recurrence layer | horizon 120 s @ 5 Hz, cosine ≥ 0.90…0.97, `w_max = 0.35` — **specified, not enabled** | 13.4 |
 
 ## Appendix B — migration order
 
@@ -2436,3 +3564,35 @@ independently shippable and independently measurable.
 7. **§2 system-audio buffer bounding** and the `burstyDeliveries` counter.
 8. Re-run the clap test (§8.3) and set the shipped default user offset from the
    measured `bias` in M8 rather than from the r1 default.
+
+## Appendix B3 — migration order for r3 (new)
+
+§13 depends on §11 for nothing and on §12 only for the two terms it keeps, so it
+can land independently of wherever r2's steps 4–8 have reached.
+
+1. **M12b first, and it is a unit test, not a run.** The mapping is a pure
+   function of a 12-vector; the equivariance and lattice properties are provable
+   in milliseconds and are what everything else rests on. If the lattice is not
+   exactly 1/12, nothing downstream is worth measuring.
+2. **The r3 battery cases, the identity export and M11/M13** (§10.1, §10.2).
+   Expect this step to **fail loudly on the shipped build**: M11a should measure
+   ≈ 0.11 turns (the drift integrated over the 40 s between the two A segments),
+   M13e should show hue moving with level through the `Σ`-scaled drift rate, and
+   M12a should *pass* — because the clock sweeps the wheel whether or not the
+   music does, which is the whole indictment. A run where M12a fails and M11a
+   passes means the export is wrong, not the build.
+3. **`ChromaAnalyzer`** (§13.2.1–13.2.2) fed from `magnitudes`, publishing the
+   four new channels. Measurable on its own against M12b's mapping test and
+   M13a/M13b before any renderer change.
+4. **Delete the drift and the structure kick; seat `H_id` as the base hue**
+   (§13.3.4). One deletion and one substitution in `ColourField`; retires the
+   request. M11 flips here, and M10a/M10b/`μ_h` must be re-run in the same step —
+   they were passing partly *because* of the clock, and §13.3.4's argument that
+   the surviving content terms carry them is a claim this step tests.
+5. **The focus-driven saturation** (§13.3.3). Independent of step 4 and lower
+   risk; do it after, so that a hue regression and a saturation regression cannot
+   arrive in the same commit.
+6. **M11d as an offline diagnostic**, then run it on the user's own music. This
+   is the only step that can revisit §13.4's decision, and it is deliberately
+   last: the decision was made on the design's guarantees, and only measurement
+   on real material can overturn it.
