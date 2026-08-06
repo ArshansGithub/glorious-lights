@@ -39,13 +39,22 @@ swift build -c release
 
 - **Menu-bar app:** `swift run -c release GMMKLightsApp` — effect picker,
   brightness/speed sliders, color picker, hot-plug aware.
+- **Switch-friendly colors:** the easiest fix for a board that mixes clear and
+  tinted (cyan Lynx) switch housings is to pick a color the tint barely touches.
+  The *Switch-Friendly Colors* submenu has eight green/blue-dominant swatches
+  that both housings render about the same, applied as ordinary solid colors.
+  Pick a red-heavy color instead and the menu says so, without stopping you.
 - **Switch compensation:** if the board mixes clear and tinted switch housings
   (Glorious Lynx housings are cyan, so they eat red and tint everything green),
   *Tune Switch Compensation…* has you press whichever kind you have fewer of —
   each lights white as you go — say which kind that was, then drag one slider
   until the board reads as the colour you actually picked. The tinted keys are
   the ones corrected, whether they're the set you marked or the rest.
-  *Uniform Color (Compensated)* then paints per-key with that correction.
+  *Uniform Color (Compensated)* then paints per-key with that correction. It
+  can only do so much — a cyan housing filters red out subtractively, and on a
+  warm color red is already maxed — so the palette above is the better answer
+  for most colors. Fn is marked with a button, since the keyboard handles that
+  key itself and the Mac never sees it.
 - **CLI:** `swift run -c release gmmk-cli help`
 
 ```sh

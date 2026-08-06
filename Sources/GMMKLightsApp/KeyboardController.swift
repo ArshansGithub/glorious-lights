@@ -91,6 +91,17 @@ final class KeyboardController {
         send(GMMKTransaction.setRainbow(on))
     }
 
+    /// Sets a solid colour in mode `fixed` in one transaction — mode,
+    /// brightness, rainbow off and the colour together.
+    ///
+    /// Brightness rides along because ``GMMKTransaction/solidColor(_:brightness:)``
+    /// writes it; passing the current UI value keeps it where the user left it
+    /// instead of jumping to full.
+    func setSolidColor(_ color: RGB, brightnessPercent: Int) {
+        send(GMMKTransaction.solidColor(color,
+                                        brightness: Brightness.level(fromPercent: brightnessPercent)))
+    }
+
     /// Switches to mode `custom` and paints every LED the target colour, with
     /// the tinted keys corrected back towards it — see ``SwitchCompensation``,
     /// including how `markedSwitches` decides which keys those are.

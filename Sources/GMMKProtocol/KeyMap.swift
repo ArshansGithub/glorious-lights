@@ -70,6 +70,20 @@ public enum GMMKKeyMap {
     /// Number of keys on a US-ANSI TKL board.
     public static let ansiTKLKeyCount = 87
 
+    /// LED index of the **Fn** key.
+    ///
+    /// Fn is handled entirely inside the keyboard's firmware: it never produces
+    /// a USB event, so macOS cannot see it and no event monitor can detect it.
+    /// Anything that wants to address it has to name this index directly.
+    ///
+    /// > Unverified, and the most likely thing in this file to be wrong. A GMMK
+    /// > TKL's bottom row is Ctrl / Win / Alt / Space / Alt / Fn / Menu / Ctrl,
+    /// > which puts Fn in the slot the full-size map calls the right Windows key
+    /// > — index 91. The tuner's "Toggle Fn Key" button flashes this LED white,
+    /// > so one press says whether the guess is right; if it lights a different
+    /// > key, change this constant to that key's index.
+    public static let fnLEDIndex: UInt16 = 91
+
     // MARK: - The table
 
     /// Every key of a US-ANSI TKL board, in reading order.
@@ -166,7 +180,10 @@ public enum GMMKKeyMap {
         Key("Left Opt",    keyCode: 0x3A, ledIndex: 88),
         Key("Space",       keyCode: 0x31, ledIndex: 89),
         Key("Right Opt",   keyCode: 0x3D, ledIndex: 90),
-        Key("Right Cmd",   keyCode: 0x36, ledIndex: 91),
+        // Index 91 is the full-size right Windows key; on a TKL the same slot
+        // carries Fn — see ``fnLEDIndex``. The key code is kept so an external
+        // full-size keyboard can still mark it.
+        Key("Right Cmd / Fn", keyCode: 0x36, ledIndex: 91),
         Key("Menu",        keyCode: 0x6E, ledIndex: 92),
         Key("Right Ctrl",  keyCode: 0x3E, ledIndex: 93),
         Key("Left",        keyCode: 0x7B, ledIndex: 94),

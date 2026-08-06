@@ -198,6 +198,82 @@ final class SwitchCompensationTests: XCTestCase {
         XCTAssertEqual(colors.filter { $0 == orange }.count, 1)
     }
 
+    // MARK: - Red-heaviness score
+
+    /// redFraction = r / (r + g + b).
+    func testRedFraction() {
+        XCTAssertEqual(SwitchCompensation.redFraction(RGB(red: 255, green: 0, blue: 0)), 1.0)
+        XCTAssertEqual(SwitchCompensation.redFraction(RGB(red: 0, green: 255, blue: 0)), 0.0)
+        XCTAssertEqual(SwitchCompensation.redFraction(RGB(red: 100, green: 100, blue: 100)),
+                       1.0 / 3.0, accuracy: 1e-12)
+        // ff8800: 255 / (255 + 136) = 0.652…
+        XCTAssertEqual(SwitchCompensation.redFraction(orange), 255.0 / 391.0, accuracy: 1e-12)
+    }
+
+    /// Black has no drive at all; the score must not divide by zero.
+    func testRedFractionOfBlackIsZero() {
+        XCTAssertEqual(SwitchCompensation.redFraction(.black), 0)
+        XCTAssertFalse(SwitchCompensation.isRedHeavy(.black))
+    }
+
+    func testRedHeavyThreshold() {
+        XCTAssertEqual(SwitchCompensation.redHeavyThreshold, 0.45)
+        // Warm colours trip it.
+        XCTAssertTrue(SwitchCompensation.isRedHeavy(orange))
+        XCTAssertTrue(SwitchCompensation.isRedHeavy(RGB(red: 255, green: 0, blue: 0)))
+        XCTAssertTrue(SwitchCompensation.isRedHeavy(RGB(red: 200, green: 100, blue: 100)))
+        // Neutral and cool ones do not.
+        XCTAssertFalse(SwitchCompensation.isRedHeavy(RGB(red: 255, green: 255, blue: 255)))
+        XCTAssertFalse(SwitchCompensation.isRedHeavy(RGB(red: 0, green: 200, blue: 255)))
+    }
+
+    /// The comparison is strictly greater-than, so a colour sitting exactly on
+    /// the threshold is not flagged.
+    func testExactlyAtTheThresholdIsNotRedHeavy() {
+        // 45 / (45 + 30 + 25) = 0.45 exactly.
+        let onTheLine = RGB(red: 45, green: 30, blue: 25)
+        XCTAssertEqual(SwitchCompensation.redFraction(onTheLine), 0.45, accuracy: 1e-12)
+        XCTAssertFalse(SwitchCompensation.isRedHeavy(onTheLine))
+    }
+
+    // MARK: - Switch-friendly palette
+
+    /// The point of the palette: every swatch is green/blue-dominant enough
+    /// that both housings render it about the same.
+    func testEverySwatchIsSwitchFriendly() {
+        XCTAssertFalse(SwitchFriendlyPalette.swatches.isEmpty)
+        for swatch in SwitchFriendlyPalette.swatches {
+            let fraction = SwitchCompensation.redFraction(swatch.color)
+            XCTAssertLessThanOrEqual(fraction, SwitchFriendlyPalette.maxRedFraction,
+                                     "\(swatch.name) (#\(swatch.color.hexString)) is too red")
+            XCTAssertFalse(SwitchCompensation.isRedHeavy(swatch.color), swatch.name)
+        }
+    }
+
+    /// The ceiling has to sit below the point where a colour is called out as
+    /// red-heavy, or the palette could recommend a colour the UI warns about.
+    func testPaletteCeilingIsBelowTheRedHeavyThreshold() {
+        XCTAssertLessThan(SwitchFriendlyPalette.maxRedFraction,
+                          SwitchCompensation.redHeavyThreshold)
+    }
+
+    func testSwatchesAreDistinctAndNamed() {
+        let names = SwitchFriendlyPalette.swatches.map(\.name)
+        let colors = SwitchFriendlyPalette.swatches.map(\.color)
+        XCTAssertEqual(Set(names).count, names.count)
+        XCTAssertEqual(Set(colors).count, colors.count)
+        XCTAssertFalse(names.contains(""))
+        XCTAssertEqual(SwitchFriendlyPalette.swatches.count, 8)
+    }
+
+    /// Spot-check that the hex literals parsed into the bytes they name.
+    func testSwatchHexParsing() {
+        let mint = SwitchFriendlyPalette.swatches.first { $0.name == "Mint" }
+        XCTAssertEqual(mint?.color, RGB(red: 0x66, green: 0xFF, blue: 0xAA))
+        let indigo = SwitchFriendlyPalette.swatches.first { $0.name == "Indigo" }
+        XCTAssertEqual(indigo?.color, RGB(red: 0x55, green: 0x33, blue: 0xFF))
+    }
+
     // MARK: - Transactions
 
     /// 126 LEDs → 7 full packets of 18, plus mode-custom at three profiles,

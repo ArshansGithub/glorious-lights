@@ -34,7 +34,28 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
     static let markedColor = RGB(red: 0xFF, green: 0xFF, blue: 0xFF)
 
     /// Fixed window width; the height follows from how the instructions wrap.
-    private static let contentWidth: CGFloat = 400
+    private static let contentWidth: CGFloat = 420
+
+    /// Virtual key code → the **device-dependent** bit that key sets in
+    /// `NSEvent.modifierFlags.rawValue`.
+    ///
+    /// `NSEvent.ModifierFlags`' public constants are per *kind* of modifier:
+    /// both Shift keys set `.shift`, so they cannot be told apart that way. The
+    /// device-dependent bits below (`NX_DEVICE…KEYMASK`) are per physical key,
+    /// which is what marking a left and a right modifier separately needs.
+    private static let deviceModifierMasks: [UInt16: UInt] = [
+        0x37: 0x000008,     // Left Command
+        0x36: 0x000010,     // Right Command
+        0x38: 0x000002,     // Left Shift
+        0x3C: 0x000004,     // Right Shift
+        0x3A: 0x000020,     // Left Option
+        0x3D: 0x000040,     // Right Option
+        0x3B: 0x000001,     // Left Control
+        0x3E: 0x002000,     // Right Control
+    ]
+
+    /// Caps Lock, which has no device-dependent bit of its own.
+    private static let capsLockKeyCode: UInt16 = 0x39
 
     /// Everything the tuner owns, reported back in one piece for persistence.
     struct Tuning {
@@ -61,6 +82,9 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
         Say which kind you marked, then drag the slider until the whole board \
         matches the colour you picked. The keys that tint the light are the ones \
         corrected; the rest are left alone.
+
+        Fn is handled inside the keyboard and never reaches the Mac, so use the \
+        button for it.
         """)
     private let statusLabel = NSTextField(labelWithString: "")
     private let switchKindControl = NSSegmentedControl(
@@ -72,10 +96,11 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
                                                  range: 0...100) { "\($0)%" }
 
     private var keyMonitor: Any?
-    /// Modifier key codes currently held down. `flagsChanged` fires on both
-    /// press and release with no flag saying which, so the transitions are
-    /// tracked here and only the press edge toggles.
+    /// Modifier key codes currently held down, derived from each event's flags
+    /// rather than counted, so only the press edge toggles.
     private var heldModifierKeyCodes: Set<UInt16> = []
+    /// Last known Caps Lock state, seeded when the monitor is installed.
+    private var capsLockWasOn = false
     private var pendingRepaint: DispatchWorkItem?
 
     // MARK: - Lifecycle
@@ -121,6 +146,9 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
         switchKindRow.orientation = .horizontal
         switchKindRow.spacing = 8
 
+        let fnButton = NSButton(title: "Toggle Fn Key",
+                                target: self,
+                                action: #selector(toggleFnKey))
         let clearButton = NSButton(title: "Clear Marks",
                                    target: self,
                                    action: #selector(clearMarks))
@@ -131,7 +159,7 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let buttons = NSStackView(views: [clearButton, spacer, doneButton])
+        let buttons = NSStackView(views: [fnButton, clearButton, spacer, doneButton])
         buttons.orientation = .horizontal
         buttons.distribution = .fill
 
@@ -216,6 +244,10 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
 
     private func installKeyMonitor() {
         guard keyMonitor == nil else { return }
+        // Seed from the world as it is, so the first Caps Lock press reads as a
+        // change and the first modifier press is not mistaken for a release.
+        capsLockWasOn = NSEvent.modifierFlags.contains(.capsLock)
+        heldModifierKeyCodes.removeAll()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) {
             [weak self] event in
             guard let self else { return event }
@@ -235,13 +267,7 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
         guard window?.isKeyWindow == true else { return event }
 
         if event.type == .flagsChanged {
-            // Press and release look identical here, so only the press edge —
-            // the transition into the held set — counts as a mark.
-            if heldModifierKeyCodes.contains(event.keyCode) {
-                heldModifierKeyCodes.remove(event.keyCode)
-                return nil
-            }
-            heldModifierKeyCodes.insert(event.keyCode)
+            guard isPressEdge(of: event) else { return nil }
         } else if event.isARepeat {
             return nil
         }
@@ -250,36 +276,80 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
         return nil
     }
 
+    /// Whether a `flagsChanged` event is the key going **down**.
+    ///
+    /// Modifiers never produce `keyDown`; they arrive here, and press and
+    /// release look identical apart from the flags they carry. The reliable
+    /// signal is the flag state itself rather than counting events, which
+    /// desynchronises the moment one is missed — releasing Shift while another
+    /// app is focused, say.
+    ///
+    /// Caps Lock is the exception twice over: it has no device-dependent bit,
+    /// and `.capsLock` reports the *lock*, not the key. Each physical press
+    /// flips the lock exactly once, so a change in either direction is one
+    /// press — which also means Caps can be marked and unmarked normally.
+    private func isPressEdge(of event: NSEvent) -> Bool {
+        let flags = event.modifierFlags
+
+        if let mask = Self.deviceModifierMasks[event.keyCode] {
+            guard flags.rawValue & mask != 0 else {
+                heldModifierKeyCodes.remove(event.keyCode)
+                return false
+            }
+            return heldModifierKeyCodes.insert(event.keyCode).inserted
+        }
+
+        if event.keyCode == Self.capsLockKeyCode {
+            let locked = flags.contains(.capsLock)
+            defer { capsLockWasOn = locked }
+            return locked != capsLockWasOn
+        }
+
+        // Anything else with no press edge we can name — the keyboard's own Fn
+        // among them, which never reaches macOS at all.
+        return false
+    }
+
+    /// Toggles the key that reports `keyCode`.
     private func toggle(keyCode: UInt16) {
         guard let key = GMMKKeyMap.key(forKeyCode: keyCode) else {
             statusLabel.stringValue = markedSummary
                 + " — key code \(keyCode) is not on the ANSI TKL map"
             return
         }
+        toggle(ledIndex: key.ledIndex, label: key.label)
+    }
 
+    /// The keyboard's Fn key is handled inside the firmware and never produces
+    /// an event, so it can only be marked by naming its LED index.
+    @objc private func toggleFnKey() {
+        toggle(ledIndex: GMMKKeyMap.fnLEDIndex, label: "Fn")
+    }
+
+    private func toggle(ledIndex: UInt16, label: String) {
         let isMarked: Bool
-        if markedLEDIndices.contains(key.ledIndex) {
-            markedLEDIndices.remove(key.ledIndex)
+        if markedLEDIndices.contains(ledIndex) {
+            markedLEDIndices.remove(ledIndex)
             isMarked = false
         } else {
-            markedLEDIndices.insert(key.ledIndex)
+            markedLEDIndices.insert(ledIndex)
             isMarked = true
         }
 
         statusLabel.stringValue = markedSummary
-            + " — \(key.label) \(isMarked ? "marked" : "unmarked") (LED \(key.ledIndex))"
+            + " — \(label) \(isMarked ? "marked" : "unmarked") (LED \(ledIndex))"
         notifyChange()
 
         // One packet, straight away: white while marked, back to whatever that
         // key should show while not. A marked key stays white until the next
         // whole-board repaint, which is what makes the set visible on the
         // hardware.
-        let restored = SwitchCompensation.color(forLEDIndex: key.ledIndex,
+        let restored = SwitchCompensation.color(forLEDIndex: ledIndex,
                                                 target: target,
                                                 markedLEDIndices: markedLEDIndices,
                                                 markedSwitches: markedSwitches,
                                                 strength: strength)
-        controller.paintKey(ledIndex: key.ledIndex,
+        controller.paintKey(ledIndex: ledIndex,
                             color: isMarked ? Self.markedColor : restored)
     }
 

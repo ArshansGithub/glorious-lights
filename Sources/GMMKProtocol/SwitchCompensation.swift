@@ -81,6 +81,28 @@ public enum SwitchCompensation {
         UInt8(Swift.max(0, Swift.min(255, value.rounded())))
     }
 
+    // MARK: - How badly a colour will show the switch mix
+
+    /// How much of a colour's total drive is red, `0`…`1`.
+    ///
+    /// Red is the channel a cyan housing absorbs, so it is the one that makes a
+    /// mixed-switch board look like two boards. Black has no drive at all and
+    /// scores 0.
+    public static func redFraction(_ color: RGB) -> Double {
+        let total = Double(Int(color.red) + Int(color.green) + Int(color.blue))
+        return Double(color.red) / Swift.max(1, total)
+    }
+
+    /// Above this share of red, the difference between housings is obvious
+    /// enough to be worth warning about.
+    public static let redHeavyThreshold: Double = 0.45
+
+    /// Whether a colour is red-dominant enough that a mixed-switch board will
+    /// visibly show the mix. Advisory only — nothing refuses to send it.
+    public static func isRedHeavy(_ color: RGB) -> Bool {
+        redFraction(color) > redHeavyThreshold
+    }
+
     /// Whether the LED at `ledIndex` is one of the tinted ones, i.e. the ones
     /// that need correcting.
     public static func needsCorrection(ledIndex: UInt16,

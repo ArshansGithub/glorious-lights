@@ -16,6 +16,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let rainbowItem = NSMenuItem(title: "Rainbow", action: nil, keyEquivalent: "")
     private let compensatedItem = NSMenuItem(title: "Uniform Color (Compensated)",
                                              action: nil, keyEquivalent: "")
+    /// Advisory note under the colour row, shown only for red-heavy colours.
+    private let redHintItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     /// True while the shared `NSColorPanel` is targeted at this delegate.
     private var ownsColorPanel = false
     /// Kept across openings so the tuner reopens with its state intact.
@@ -109,6 +111,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         colorRow.onClick = { [weak self] in self?.presentColorPanel() }
         menu.addItem(row(colorRow))
+
+        // Advisory, never blocking: a red-heavy colour is the one case where a
+        // mixed-switch board looks obviously mismatched, and the fix is to pick
+        // a different colour rather than to correct harder.
+        redHintItem.isEnabled = false
+        redHintItem.attributedTitle = NSAttributedString(
+            string: "Red-heavy — will show your switch mix",
+            attributes: [
+                .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ])
+        redHintItem.indentationLevel = 1
+        menu.addItem(redHintItem)
+
+        menu.addItem(switchFriendlyItem())
         menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "Quit GMMK Lights",
@@ -122,6 +139,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let item = NSMenuItem()
         item.view = view
         return item
+    }
+
+    /// Submenu of colours both switch housings render about the same, so the
+    /// board looks uniform with no per-key correction at all — see
+    /// ``SwitchFriendlyPalette``. These are ordinary solid colours.
+    private func switchFriendlyItem() -> NSMenuItem {
+        let submenu = NSMenu()
+        for swatch in SwitchFriendlyPalette.swatches {
+            let item = NSMenuItem(title: swatch.name,
+                                  action: #selector(selectSwitchFriendlyColor(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = swatch.color
+            item.image = swatchImage(nsColor(swatch.color))
+            submenu.addItem(item)
+        }
+        let item = NSMenuItem(title: "Switch-Friendly Colors", action: nil, keyEquivalent: "")
+        item.submenu = submenu
+        return item
+    }
+
+    private func swatchImage(_ color: NSColor) -> NSImage {
+        let size = NSSize(width: 16, height: 12)
+        return NSImage(size: size, flipped: false) { rect in
+            let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5),
+                                    xRadius: 2, yRadius: 2)
+            color.setFill()
+            path.fill()
+            NSColor.separatorColor.setStroke()
+            path.stroke()
+            return true
+        }
     }
 
     // MARK: - State → UI
@@ -154,6 +203,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let colorEnabled = settings.compensated
             || (settings.mode.usesSolidColor && !settings.rainbow)
         colorRow.setEnabled(colorEnabled)
+        // The hint is about the colour the board is actually showing, so it is
+        // pointless when the colour is not in play at all.
+        redHintItem.isHidden = !colorEnabled || !SwitchCompensation.isRedHeavy(settings.color)
         // An already-open panel outlives the row that spawned it, so detach it
         // too; otherwise dragging in it keeps writing colour while the menu
         // says the control is unavailable.
@@ -201,6 +253,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.save()
         refreshEnablement()
         paintCompensated()
+    }
+
+    /// Applies a ``SwitchFriendlyPalette`` swatch as a plain solid colour.
+    ///
+    /// No per-key writes: the whole point of these colours is that both housings
+    /// render them about the same, so there is nothing to correct.
+    @objc private func selectSwitchFriendlyColor(_ sender: NSMenuItem) {
+        guard let color = sender.representedObject as? RGB else { return }
+        settings.color = color
+        settings.mode = .fixed
+        settings.rainbow = false
+        settings.compensated = false
+        settings.save()
+        colorRow.setColor(nsColor(color), hexText: "#" + color.hexString)
+        refreshEnablement()
+        controller.setSolidColor(color, brightnessPercent: settings.brightnessPercent)
     }
 
     @objc private func openTuner(_ sender: NSMenuItem) {

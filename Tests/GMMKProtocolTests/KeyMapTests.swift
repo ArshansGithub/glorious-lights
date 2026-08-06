@@ -95,6 +95,16 @@ final class KeyMapTests: XCTestCase {
         }
     }
 
+    /// Fn never reaches macOS, so its index is named rather than looked up by
+    /// key code — but it still has to be a real, in-range index that belongs to
+    /// a key in the table.
+    func testFnIndexIsInTheTable() {
+        XCTAssertTrue(GMMKKeyMap.paintableLEDIndices.contains(GMMKKeyMap.fnLEDIndex))
+        XCTAssertNotNil(GMMKKeyMap.key(forLEDIndex: GMMKKeyMap.fnLEDIndex))
+        XCTAssertEqual(GMMKKeyMap.key(forLEDIndex: GMMKKeyMap.fnLEDIndex)?.label,
+                       "Right Cmd / Fn")
+    }
+
     /// Modifiers are the keys most likely to be mis-transcribed, and macOS
     /// delivers them as `flagsChanged` rather than `keyDown`, so pin the codes.
     func testModifierKeyCodes() {
@@ -102,7 +112,7 @@ final class KeyMapTests: XCTestCase {
             ("Left Shift", 0x38), ("Right Shift", 0x3C),
             ("Left Ctrl", 0x3B), ("Right Ctrl", 0x3E),
             ("Left Opt", 0x3A), ("Right Opt", 0x3D),
-            ("Left Cmd", 0x37), ("Right Cmd", 0x36),
+            ("Left Cmd", 0x37), ("Right Cmd / Fn", 0x36),
             ("Caps Lock", 0x39),
         ]
         for (label, keyCode) in expected {
