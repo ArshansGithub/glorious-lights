@@ -132,6 +132,15 @@ public enum MouseSensor: UInt8, CaseIterable, Sendable {
     /// DPI is always a multiple of this.
     public var dpiStep: Int { 100 }
 
+    /// The values ``raw(dpi:)`` can represent exactly: multiples of
+    /// ``dpiStep`` from one step up to ``maximumDPI``.
+    ///
+    /// libratbag's floor is 100 even though Glorious's own software stops at 400
+    /// (doc §6), so 100 is what this allows.
+    public func isValidDPI(_ dpi: Int) -> Bool {
+        dpi >= dpiStep && dpi <= maximumDPI && dpi % dpiStep == 0
+    }
+
     /// `raw` → DPI. PMW3360/3327 store `DPI/100 − 1`; the PMW3389 stores
     /// `DPI/100` (doc §6 — the easiest thing here to get wrong by 100 DPI).
     public func dpi(raw: UInt8) -> Int {

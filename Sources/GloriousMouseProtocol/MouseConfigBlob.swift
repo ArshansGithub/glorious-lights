@@ -228,6 +228,60 @@ public struct MouseConfigBlob: Equatable, Sendable {
     /// (doc §6): disable slot 2 of 6 and the fifth enabled slot is 5, not 6.
     public var activeDPIOrdinal: Int { Int((bytes[Offset.dpiCountAndActive] >> 4) & 0x0F) }
 
+    /// How many of the ``dpiSlotCount`` presented slots are enabled — the
+    /// population ``activeDPIOrdinal`` counts within.
+    public var enabledDPISlotCount: Int {
+        (0..<dpiSlotCount).count { isDPISlotEnabled($0) }
+    }
+
+    /// The 0-based slot the active ordinal currently points at, or `nil` if the
+    /// ordinal is out of step with the enabled set — which a device can be in
+    /// after something else wrote the blob.
+    public var activeDPISlot: Int? {
+        guard activeDPIOrdinal >= 1 else { return nil }
+        var seen = 0
+        for slot in 0..<dpiSlotCount where isDPISlotEnabled(slot) {
+            seen += 1
+            if seen == activeDPIOrdinal { return slot }
+        }
+        return nil
+    }
+
+    /// Sets the active DPI ordinal, **1-based over the enabled slots only**.
+    ///
+    /// Bounds are the enabled count rather than the slot count: pointing the
+    /// ordinal past the last enabled slot leaves the mouse selecting a stage
+    /// that is switched off, which the firmware has no defined behaviour for.
+    public mutating func setActiveDPIOrdinal(_ ordinal: Int) throws {
+        let enabled = enabledDPISlotCount
+        guard (1...max(enabled, 1)).contains(ordinal), enabled > 0 else {
+            throw MouseFieldError.activeDPIOrdinalOutOfRange(ordinal: ordinal, enabled: enabled)
+        }
+        let low = bytes[Offset.dpiCountAndActive] & 0x0F
+        bytes[Offset.dpiCountAndActive] = (UInt8(ordinal) << 4) | low
+    }
+
+    /// Enables or disables one slot without touching its DPI value.
+    ///
+    /// The active ordinal counts enabled slots, so changing membership can leave
+    /// it dangling; this clamps it back into range rather than leaving the mouse
+    /// pointing past the end of its own list.
+    public mutating func setDPISlotEnabled(_ enabled: Bool, at slot: Int) throws {
+        guard (0..<GloriousMouseDevice.dpiSlotCount).contains(slot) else {
+            throw MouseFieldError.dpiSlotOutOfRange(slot)
+        }
+        let bit: UInt8 = 1 << UInt8(slot)
+        if enabled {
+            bytes[Offset.disabledDPIMask] &= ~bit
+        } else {
+            bytes[Offset.disabledDPIMask] |= bit
+        }
+        let count = enabledDPISlotCount
+        if count > 0, activeDPIOrdinal > count {
+            try setActiveDPIOrdinal(count)
+        }
+    }
+
     /// Byte `0x0C`, **bit set = slot disabled**.
     public var disabledDPIMask: UInt8 {
         get { bytes[Offset.disabledDPIMask] }
@@ -274,6 +328,14 @@ public struct MouseConfigBlob: Equatable, Sendable {
         let independent = hasIndependentXYDPI
         if !independent && !stage.isSymmetric {
             throw MouseFieldError.asymmetricDPIWithoutFlag
+        }
+        // `sensor.raw(dpi:)` clamps and snaps, which is right for a decode but
+        // wrong for a command: silently storing 12000 when the user asked for
+        // 20000 is a setting they did not choose. Refuse instead.
+        for value in [stage.x, stage.y] {
+            guard sensor.isValidDPI(value) else {
+                throw MouseFieldError.dpiOutOfSensorRange(dpi: value, sensor: sensor)
+            }
         }
         let base = Offset.dpiStages + (independent ? slot * 2 : slot)
         bytes[base] = sensor.raw(dpi: stage.x)
@@ -467,6 +529,8 @@ public struct MouseConfigBlob: Equatable, Sendable {
 /// Refusals from ``MouseConfigBlob``'s typed setters.
 public enum MouseFieldError: Error, CustomStringConvertible {
     case dpiSlotOutOfRange(Int)
+    case dpiOutOfSensorRange(dpi: Int, sensor: MouseSensor)
+    case activeDPIOrdinalOutOfRange(ordinal: Int, enabled: Int)
     case asymmetricDPIWithoutFlag
     case unknownSensor(UInt8)
     case effectHasNoParameters(MouseRGBEffect)
@@ -479,6 +543,15 @@ public enum MouseFieldError: Error, CustomStringConvertible {
         switch self {
         case .dpiSlotOutOfRange(let slot):
             return "DPI slot \(slot) is out of range 0…\(GloriousMouseDevice.dpiSlotCount - 1)."
+        case .dpiOutOfSensorRange(let dpi, let sensor):
+            return "\(dpi) dpi is outside the \(sensor.displayName)'s range: "
+                 + "\(sensor.dpiStep)…\(sensor.maximumDPI) in steps of \(sensor.dpiStep)."
+        case .activeDPIOrdinalOutOfRange(let ordinal, let enabled):
+            return enabled == 0
+                ? "No DPI slot is enabled, so there is no active stage to select."
+                : "The active DPI stage is 1-based over the enabled slots only "
+                  + "(docs/mouse-protocol.md §6), so it must be 1…\(enabled) with "
+                  + "\(enabled) slot\(enabled == 1 ? "" : "s") enabled; got \(ordinal)."
         case .asymmetricDPIWithoutFlag:
             return """
                 Separate X and Y DPI needs the XY-independent flag (bit 3 of the high nibble \

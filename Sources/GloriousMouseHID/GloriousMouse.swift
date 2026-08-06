@@ -152,6 +152,20 @@ public final class GloriousMouse {
         MouseCommandReport.activeProfile(fromReply: try query(.activeProfile))
     }
 
+    /// Sets the debounce time through command `0x1a` (doc §7).
+    ///
+    /// **Not a blob field.** This is the one setting that lives on the command
+    /// channel rather than in the configuration blob, so it needs no
+    /// read-modify-write and no write marker — but it also means it is not
+    /// covered by a `mouse dump`, and libratbag warns the command may not work
+    /// on short-config devices at all (doc §11 item 4). Read it back to find out.
+    ///
+    /// - Throws: ``MouseCommandError/invalidDebounceTime(_:)`` outside the
+    ///   documented even 4…16 ms.
+    public func setDebounce(milliseconds: Int) throws {
+        try send(commandReport: MouseCommandReport.setDebounce(milliseconds: milliseconds))
+    }
+
     /// Debounce time in milliseconds, or `nil` if command `0x1a` is not
     /// supported here — which doc §11 item 4 flags as genuinely open, and which
     /// this read settles non-destructively.
