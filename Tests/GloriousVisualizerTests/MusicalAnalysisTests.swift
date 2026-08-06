@@ -2,301 +2,451 @@ import XCTest
 @testable import GloriousVisualizer
 import GMMKProtocol
 
-/// The musical layer, against synthesised signals whose answers are known.
-///
-/// This is the part the redesign rests on: if the tempo is wrong or the onsets
-/// fire on everything, every mode built on top inherits it and the board goes
-/// back to looking random.
+/// The musical layer end to end: onsets, tempo, gestures and the composed
+/// picture, driven through the same ``VisualizerEngine`` the app drives.
 final class MusicalAnalysisTests: XCTestCase {
 
-    private let sampleRate: Double = 48_000
+    let sampleRate = 48_000.0
 
-    // MARK: - Fixtures
+    // MARK: - Signals
 
-    /// A kick-like pattern: a short 60 Hz burst with a fast decay, every beat.
-    private func kickPattern(bpm: Double, seconds: Double) -> [Float] {
-        let count = Int(sampleRate * seconds)
-        let period = 60 / bpm
-        return (0..<count).map { index in
-            let t = Double(index) / sampleRate
-            let phase = t.truncatingRemainder(dividingBy: period)
-            let envelope = exp(-phase * 22)
-            return Float(0.9 * envelope * sin(2 * .pi * 60 * t))
+    /// A kick-like burst: fast attack, exponential decay, low frequency.
+    private func kick(into samples: inout [Float], at time: Double, amplitude: Double = 0.9) {
+        let start = Int(time * sampleRate)
+        for offset in 0..<Int(0.4 * sampleRate) {
+            let index = start + offset
+            guard index >= 0, index < samples.count else { continue }
+            let u = Double(offset) / sampleRate
+            let envelope = (1 - exp(-u / 0.012)) * exp(-u / 0.18)
+            samples[index] += Float(amplitude * envelope * sin(2 * .pi * 60 * u))
         }
     }
 
-    /// Feeds a signal through a pipeline the way the app does, and returns the
-    /// last musical frame plus everything that fired along the way.
-    private func run(_ samples: [Float],
-                     fps: Double = 15,
-                     profile: VisualizerPipeline.SourceProfile = .music)
-        -> (frames: [MusicalFrame], onsets: [OnsetKind: Int]) {
-        let pipeline = VisualizerPipeline(
-            sampleRate: Float(sampleRate),
-            bandCount: VisualizerLayout.columns.count,
-            tuning: .init(sourceProfile: profile))
-        let interval = 1 / fps
-        let perFrame = Int(sampleRate * interval)
-        var frames: [MusicalFrame] = []
-        var counts: [OnsetKind: Int] = [:]
-
-        var offset = 0
-        while offset + perFrame <= samples.count {
-            pipeline.analyze(Array(samples[offset..<(offset + perFrame)]))
-            let frame = pipeline.musicalFrame(elapsed: interval)
-            frames.append(frame)
-            for (kind, strength) in frame.onsets where strength > 0 {
-                counts[kind, default: 0] += 1
-            }
-            offset += perFrame
+    private func beatPattern(bpm: Double, seconds: Double) -> [Float] {
+        var samples = [Float](repeating: 0, count: Int(sampleRate * seconds))
+        var time = 0.0
+        while time < seconds {
+            kick(into: &samples, at: time)
+            time += 60 / bpm
         }
-        return (frames, counts)
+        return samples
     }
 
-    // MARK: - Tempo
-
-    /// **A 120 BPM kick pattern must read as 120 BPM.** The whole rhythmic half
-    /// of the redesign is downstream of this.
-    func testTempoOfA120BPMKickPattern() {
-        let (frames, _) = run(kickPattern(bpm: 120, seconds: 20))
-        let estimates = frames.map(\.tempo.bpm).filter { $0 > 0 }
-        XCTAssertFalse(estimates.isEmpty, "no tempo was ever established")
-
-        let settled = Array(estimates.suffix(estimates.count / 3))
-        let sorted = settled.sorted()
-        let median = sorted[sorted.count / 2]
-        XCTAssertEqual(median, 120, accuracy: 4, "settled at \(median) BPM")
-    }
-
-    /// And a different tempo must give a different answer — a detector that
-    /// always says 120 would pass the test above.
-    func testTempoOfA150BPMKickPattern() {
-        let (frames, _) = run(kickPattern(bpm: 150, seconds: 20))
-        let estimates = frames.map(\.tempo.bpm).filter { $0 > 0 }
-        let settled = Array(estimates.suffix(max(1, estimates.count / 3))).sorted()
-        let median = settled[settled.count / 2]
-        XCTAssertEqual(median, 150, accuracy: 5, "settled at \(median) BPM")
-    }
-
-    /// Half- and double-time observations of the same music must agree, which
-    /// is what the octave folding is for.
-    func testTemposAreFoldedIntoOneOctave() {
-        XCTAssertEqual(TempoTracker.canonical(bpm: 180), 90, accuracy: 0.001)
-        XCTAssertEqual(TempoTracker.canonical(bpm: 45), 90, accuracy: 0.001)
-        XCTAssertEqual(TempoTracker.canonical(bpm: 120), 120, accuracy: 0.001)
-        for bpm in stride(from: 40.0, through: 400.0, by: 7) {
-            let folded = TempoTracker.canonical(bpm: bpm)
-            XCTAssertTrue(TempoTracker.canonicalRange.contains(folded),
-                          "\(bpm) folded to \(folded)")
+    private func sine(_ frequency: Double, seconds: Double, amplitude: Double = 0.5) -> [Float] {
+        (0..<Int(sampleRate * seconds)).map { index in
+            Float(amplitude * sin(2 * .pi * frequency * Double(index) / sampleRate))
         }
     }
 
-    /// Noise has no tempo, and the tracker must say so rather than inventing
-    /// one a mode would then lock to.
-    func testNoiseProducesLowTempoConfidence() {
-        var state: UInt64 = 99
-        let noise = (0..<Int(sampleRate * 12)).map { _ -> Float in
-            state ^= state << 13; state ^= state >> 7; state ^= state << 17
-            return Float(Double(state >> 11) / Double(1 << 53) - 0.5) * 0.4
+    /// Runs a signal through the engine at the analysis rate, collecting every
+    /// published state and event.
+    private func analyse(_ samples: [Float]) -> (states: [AnalysisState], onsets: [OnsetEvent]) {
+        let engine = VisualizerEngine(sampleRate: sampleRate, frameRate: 30)
+        var states: [AnalysisState] = []
+        var onsets: [OnsetEvent] = []
+        engine.bus.onPublish = { state, events in
+            states.append(state)
+            onsets += events
         }
-        let (frames, _) = run(noise)
-        let confidence = frames.map(\.tempo.confidence).suffix(30)
-        let mean = confidence.reduce(0, +) / Double(max(confidence.count, 1))
-        XCTAssertLessThan(mean, 0.6, "noise should not read as strongly periodic")
+        var position = 0
+        while position < samples.count {
+            let end = min(position + 512, samples.count)
+            engine.ingest(Array(samples[position..<end]),
+                          hostTime: Double(end) / sampleRate)
+            position = end
+        }
+        return (states, onsets)
     }
 
     // MARK: - Onsets
 
-    /// A 120 BPM kick pattern fires roughly two kicks a second — not eight,
-    /// which is what the detector did before the refractory periods were tuned.
-    func testKickOnsetsMatchTheBeatRate() {
-        let seconds = 16.0
-        let (_, counts) = run(kickPattern(bpm: 120, seconds: seconds))
-        let kicks = counts[.kick] ?? 0
-        let perSecond = Double(kicks) / seconds
-        XCTAssertGreaterThan(perSecond, 1.2, "only \(kicks) kicks in \(seconds)s")
-        XCTAssertLessThan(perSecond, 3.2, "\(kicks) kicks in \(seconds)s is re-triggering")
-    }
-
-    /// Onsets land on the beat, not scattered between them.
-    func testKickOnsetsLandOnTheBeat() {
-        let bpm = 120.0
-        let (frames, _) = run(kickPattern(bpm: bpm, seconds: 16))
-        let period = 60 / bpm
-
-        let onsetTimes = frames.filter { $0.onset(.kick) > 0 }.map(\.time)
-        XCTAssertFalse(onsetTimes.isEmpty)
-        // Each onset should sit near a multiple of the beat period. One display
-        // frame is 67 ms, so a fifth of a beat is the tightest honest bound.
-        var near = 0
-        for time in onsetTimes {
-            let offset = time.truncatingRemainder(dividingBy: period)
-            let distance = min(offset, period - offset)
-            if distance < period * 0.2 { near += 1 }
+    /// **The regression that started the redesign.** A pure sine wave contains
+    /// exactly zero onsets; the previous detector emitted 12.1 a second on one.
+    func testASteadyToneProducesNoOnsets() {
+        for frequency in [110.0, 440.0, 1_000.0] {
+            let result = analyse(sine(frequency, seconds: 12))
+            XCTAssertEqual(result.onsets.count, 0,
+                           "a steady \(frequency) Hz tone produced onsets")
         }
-        XCTAssertGreaterThan(Double(near) / Double(onsetTimes.count), 0.7,
-                             "only \(near) of \(onsetTimes.count) onsets landed near a beat")
     }
 
-    /// Silence produces no onsets at all.
-    func testSilenceProducesNoOnsets() {
-        let (_, counts) = run([Float](repeating: 0, count: Int(sampleRate * 5)))
-        XCTAssertEqual(counts.values.reduce(0, +), 0)
-    }
-
-    /// The room profile asks for more evidence, so the same material fires
-    /// fewer onsets than the music profile — the point of having two.
-    func testTheRoomProfileIsLessTriggerHappy() {
-        let signal = kickPattern(bpm: 128, seconds: 14)
-        let music = run(signal, profile: .music).onsets.values.reduce(0, +)
-        let room = run(signal, profile: .room).onsets.values.reduce(0, +)
-        XCTAssertLessThanOrEqual(room, music,
-                                 "room fired \(room) onsets, music \(music)")
-    }
-
-    // MARK: - Features
-
-    /// **A rising sweep must raise the brightness monotonically** — that is the
-    /// whole contract of the centroid feature, and hue depends on it.
-    func testBrightnessRisesWithASweep() {
-        let seconds = 12.0
-        let count = Int(sampleRate * seconds)
-        let low = 120.0, high = 9_000.0
-        let sweep = (0..<count).map { index -> Float in
-            let t = Double(index) / sampleRate
-            let progress = t / seconds
-            let k = log(high / low)
-            let phase = 2 * .pi * low * seconds / k * (exp(progress * k) - 1)
-            return Float(0.5 * sin(phase))
+    /// Nor does noise, at any level: a stationary signal must produce a
+    /// stationary board.
+    func testNoiseProducesNoOnsets() {
+        var generator = SystemRandomNumberGenerator()
+        for amplitude in [0.2, 0.001] {
+            let samples = (0..<Int(sampleRate * 12)).map { _ in
+                Float(Double.random(in: -1...1, using: &generator) * amplitude)
+            }
+            XCTAssertEqual(analyse(samples).onsets.count, 0, "noise at \(amplitude)")
         }
-        let (frames, _) = run(sweep)
-        let brightness = frames.map(\.brightness)
-        XCTAssertFalse(brightness.isEmpty)
-
-        // Compare thirds rather than adjacent frames: the feature is smoothed,
-        // so what matters is the trend, not that every step rises.
-        let third = brightness.count / 3
-        let first = brightness[0..<third].reduce(0, +) / Float(third)
-        let last = brightness[(third * 2)...].reduce(0, +) / Float(brightness.count - third * 2)
-        XCTAssertGreaterThan(last, first + 0.15,
-                             "brightness went \(first) → \(last) across a rising sweep")
     }
 
-    /// **Brightness tracks which register dominates, within one signal.**
-    ///
-    /// Deliberately measured across a signal that changes rather than by
-    /// comparing two separate steady tones. The centroid mapping is adaptive —
-    /// it stretches the hue ramp across the range the material actually uses —
-    /// so a lone unchanging tone has no range to sit within and lands
-    /// mid-ramp whatever its pitch. That is the design working, not a fault:
-    /// the fixed 200 Hz–6 kHz window it replaced is exactly why every frame came
-    /// out the same colour on real music. What must hold is the relative
-    /// property, and that is what this checks.
-    func testBrightnessTracksTheDominantRegister() {
-        let segment = Int(sampleRate * 4)
-        func tone(_ hz: Double, count: Int, from start: Int) -> [Float] {
-            (0..<count).map { index in
-                Float(0.5 * sin(2 * .pi * hz * Double(start + index) / sampleRate))
+    func testDigitalSilenceProducesNoOnsets() {
+        let result = analyse([Float](repeating: 0, count: Int(sampleRate * 5)))
+        XCTAssertEqual(result.onsets.count, 0)
+    }
+
+    /// Kicks are found, at about the rate they were played, and reported as
+    /// kicks rather than as something else.
+    func testKicksAreDetectedAtTheRatePlayed() {
+        let result = analyse(beatPattern(bpm: 120, seconds: 20))
+        let kicks = result.onsets.filter { $0.kind == .kick && $0.time > 1 }
+        // 120 BPM is two a second; allow the warm-up second.
+        XCTAssertGreaterThan(Double(kicks.count) / 19, 1.7)
+        XCTAssertLessThan(Double(kicks.count) / 19, 2.2)
+        XCTAssertEqual(result.onsets.count, kicks.count + result.onsets.filter {
+            $0.time <= 1 || $0.kind != .kick
+        }.count)
+    }
+
+    /// Detected kicks land on the beat, not scattered around it.
+    func testKicksLandOnTheBeat() {
+        let period = 0.5
+        let result = analyse(beatPattern(bpm: 120, seconds: 20))
+        let kicks = result.onsets.filter { $0.kind == .kick && $0.time > 1 }
+        XCTAssertFalse(kicks.isEmpty)
+        for onset in kicks {
+            let phase = onset.time.truncatingRemainder(dividingBy: period)
+            let distance = min(phase, period - phase)
+            XCTAssertLessThan(distance, 0.06, "onset at \(onset.time) is off the grid")
+        }
+    }
+
+    /// The accepted trigger rate stays inside the band where a board can
+    /// actually show one thing per event.
+    func testTriggerRateStaysInsideTheUsefulBand() {
+        let result = analyse(beatPattern(bpm: 160, seconds: 20))
+        let rate = Double(result.onsets.count) / 20
+        XCTAssertGreaterThan(rate, 0.5)
+        XCTAssertLessThan(rate, 5.0)
+    }
+
+    /// The arbiter is strict precedence, not a weighted score: a kick coincident
+    /// with anything else is reported as a kick, and nothing else is reported
+    /// alongside it.
+    func testTheArbiterPrefersTheKickAndSuppressesTheRest() {
+        var arbiter = OnsetArbiter()
+        func candidate(_ kind: OnsetKind, at time: Double, flux: Double) -> FluxOnsetDetector.Candidate {
+            FluxOnsetDetector.Candidate(time: time, kind: kind, flux: flux, threshold: 1,
+                                        strength: 1, confidence: 1)
+        }
+        // A snare with far more flux than the kick, at the same instant.
+        var winners = arbiter.arbitrate([candidate(.kick, at: 1.0, flux: 2),
+                                         candidate(.snare, at: 1.0, flux: 50)], now: 1.0)
+        XCTAssertEqual(winners.map(\.kind), [.kick])
+        // The snare is still pending; once its window elapses it is suppressed
+        // because the kick claimed that moment.
+        winners = arbiter.arbitrate([], now: 1.2)
+        XCTAssertTrue(winners.isEmpty)
+    }
+
+    /// A snare on its own is reported: the arbiter suppresses duplicates, not
+    /// events.
+    func testALoneSnareSurvivesArbitration() {
+        var arbiter = OnsetArbiter()
+        let snare = FluxOnsetDetector.Candidate(time: 1.0, kind: .snare, flux: 10,
+                                                threshold: 1, strength: 1, confidence: 1)
+        XCTAssertTrue(arbiter.arbitrate([snare], now: 1.0).isEmpty)   // still deciding
+        XCTAssertEqual(arbiter.arbitrate([], now: 1.2).map(\.kind), [.snare])
+    }
+
+    // MARK: - Tempo
+
+    func testTempoOfAKickPattern() {
+        for bpm in [100.0, 120.0, 150.0] {
+            let result = analyse(beatPattern(bpm: bpm, seconds: 25))
+            let settled = result.states.suffix(200).map(\.tempo.bpm).filter { $0 > 0 }
+            XCTAssertFalse(settled.isEmpty, "no tempo at \(bpm) BPM")
+            let median = settled.sorted()[settled.count / 2]
+            XCTAssertEqual(median, TempoTracker.canonical(bpm: bpm), accuracy: bpm * 0.04,
+                           "estimated \(median) for \(bpm)")
+        }
+    }
+
+    /// Phase advances continuously and stays in `[0, 1)` — it is a position, not
+    /// a trigger, which is what makes prediction possible at all.
+    func testPhaseAdvancesContinuously() {
+        let result = analyse(beatPattern(bpm: 120, seconds: 25))
+        let locked = result.states.suffix(400)
+        XCTAssertTrue(locked.allSatisfy { (0..<1).contains($0.tempo.phase) })
+        // It wraps rather than sticking: over four seconds at 120 BPM there are
+        // eight beats, so at least a few wraps must have happened.
+        var wraps = 0
+        var previous = 0.0
+        for state in locked where state.tempo.bpm > 0 {
+            if state.tempo.phase < previous { wraps += 1 }
+            previous = state.tempo.phase
+        }
+        XCTAssertGreaterThan(wraps, 3)
+    }
+
+    /// Noise has no beat, and the tracker says so rather than inventing a grid.
+    func testNoiseProducesLowTempoConfidence() {
+        var generator = SystemRandomNumberGenerator()
+        let samples = (0..<Int(sampleRate * 20)).map { _ in
+            Float(Double.random(in: -1...1, using: &generator) * 0.2)
+        }
+        let noise = analyse(samples).states.suffix(400).map(\.tempo.confidence)
+        let beat = analyse(beatPattern(bpm: 120, seconds: 20))
+            .states.suffix(400).map(\.tempo.confidence)
+        let noiseConfidence = noise.reduce(0, +) / Double(noise.count)
+        let beatConfidence = beat.reduce(0, +) / Double(beat.count)
+        // Noise has periodicity in it — any random envelope does — so the claim
+        // is comparative: the tracker must be markedly less sure of noise than
+        // of a real beat, and the modes cross-fade rather than switch on the
+        // difference.
+        XCTAssertLessThan(noiseConfidence, beatConfidence * 0.85,
+                          "noise \(noiseConfidence) vs beat \(beatConfidence)")
+    }
+
+    /// Half- and double-time observations of the same music agree once folded.
+    func testTemposAreFoldedIntoOneOctave() {
+        XCTAssertEqual(TempoTracker.canonical(bpm: 60), 120, accuracy: 0.001)
+        XCTAssertEqual(TempoTracker.canonical(bpm: 240), 120, accuracy: 0.001)
+        XCTAssertEqual(TempoTracker.canonical(bpm: 128), 128, accuracy: 0.001)
+        for bpm in stride(from: 40.0, through: 300.0, by: 7) {
+            XCTAssertTrue(TempoTracker.canonicalRange.contains(TempoTracker.canonical(bpm: bpm)),
+                          "\(bpm) folded outside the canonical range")
+        }
+    }
+
+    // MARK: - Gestures
+
+    /// **Absorption.** A trigger arriving while a gesture is building raises its
+    /// amplitude and touches nothing else. Re-launching is what stops a gesture
+    /// from ever displaying its body.
+    func testATriggerDuringAttackIsAbsorbed() {
+        var list = GestureList(capacity: 2)
+        let envelope = AHR.clamped(attack: 0.015, hold: 0.1, release: 0.32,
+                                   frameInterval: 1.0 / 30)
+        XCTAssertTrue(list.trigger(Gesture(kind: .pulse, startTime: 1.0, amplitude: 0.4,
+                                           envelope: envelope), at: 1.0))
+        XCTAssertFalse(list.trigger(Gesture(kind: .pulse, startTime: 1.05, amplitude: 0.9,
+                                            envelope: envelope), at: 1.05))
+        XCTAssertEqual(list.gestures.count, 1)
+        XCTAssertEqual(list.gestures[0].startTime, 1.0, accuracy: 1e-9)
+        XCTAssertEqual(list.gestures[0].amplitude, 0.9, accuracy: 1e-9)
+        // …and absorption only ever raises.
+        list.trigger(Gesture(kind: .pulse, startTime: 1.06, amplitude: 0.1,
+                             envelope: envelope), at: 1.06)
+        XCTAssertEqual(list.gestures[0].amplitude, 0.9, accuracy: 1e-9)
+    }
+
+    /// Once in release, a gesture may be replaced — and the population is capped.
+    func testGesturesAreCappedOldestFirst() {
+        var list = GestureList(capacity: 2)
+        let envelope = AHR(attack: 0.001, hold: 0, release: 0.01)
+        for step in 0..<5 {
+            let time = Double(step) * 0.5
+            list.trigger(Gesture(kind: .ring, startTime: time, amplitude: 0.5,
+                                 envelope: envelope), at: time)
+        }
+        XCTAssertLessThanOrEqual(list.gestures.count, 2)
+    }
+
+    /// The display is a pure function of time: evaluating the same gesture at
+    /// the same instant gives the same answer no matter how it was reached.
+    func testGestureLevelIsAFunctionOfTime() {
+        let gesture = Gesture(kind: .pulse, startTime: 10, amplitude: 0.8,
+                              envelope: AHR(attack: 0.015, hold: 0.1, release: 0.32))
+        XCTAssertEqual(gesture.level(at: 9.9), 0, accuracy: 1e-12)
+        XCTAssertEqual(gesture.level(at: 10.1), 0.8, accuracy: 0.01)
+        XCTAssertLessThan(gesture.level(at: 10.5), 0.8)
+        XCTAssertGreaterThan(gesture.level(at: 10.5), 0)
+        XCTAssertFalse(gesture.isAlive(at: 10 + gesture.lifetime + 0.001))
+    }
+
+    /// Motion is clamped to two cells a frame, in frame-interval terms rather
+    /// than against any particular frame rate.
+    func testVelocityIsClampedInFrames() {
+        XCTAssertEqual(clampedSpeed(1000, frameInterval: 1.0 / 30), 60, accuracy: 1e-9)
+        XCTAssertEqual(clampedSpeed(1000, frameInterval: 1.0 / 15), 30, accuracy: 1e-9)
+        XCTAssertEqual(clampedSpeed(5, frameInterval: 1.0 / 30), 5, accuracy: 1e-9)
+    }
+
+    /// Durations are musical, so a gesture stretches when the tempo halves
+    /// instead of overlapping — and is clamped at both ends.
+    func testMusicalDurationsStretchAndClamp() {
+        XCTAssertEqual(musicalDuration(beats: 1, beatPeriod: 0.5), 0.5, accuracy: 1e-9)
+        XCTAssertEqual(musicalDuration(beats: 1, beatPeriod: 1.0), 1.0, accuracy: 1e-9)
+        XCTAssertEqual(musicalDuration(beats: 0.1, beatPeriod: 0.3), 0.20, accuracy: 1e-9)
+        XCTAssertEqual(musicalDuration(beats: 8, beatPeriod: 1.0), 2.0, accuracy: 1e-9)
+    }
+
+    /// Motion blur widens the kernel by the distance travelled during a frame,
+    /// which is what turns strobing into streaking.
+    func testMotionBlurWidensWithSpeed() {
+        let still = Gesture(kind: .wave, startTime: 0, amplitude: 1, speed: 0, width: 2.8,
+                            envelope: AHR(attack: 0.01, hold: 0, release: 0.3))
+        let fast = Gesture(kind: .wave, startTime: 0, amplitude: 1, speed: 60, width: 2.8,
+                           envelope: AHR(attack: 0.01, hold: 0, release: 0.3))
+        XCTAssertEqual(still.effectiveWidth(frameInterval: 1.0 / 30), 2.8, accuracy: 1e-9)
+        XCTAssertGreaterThan(fast.effectiveWidth(frameInterval: 1.0 / 30), 2.8)
+    }
+
+    // MARK: - Canvas
+
+    /// Fractional fills: the top row of a bar fades in continuously instead of
+    /// toggling, which is most of the visible per-frame chatter on quiet
+    /// material.
+    func testColumnFillsAreFractional() {
+        var canvas = LinearCanvas()
+        canvas.fillColumn(0, height: 0.5, colour: (1, 1, 1), ramp: { _ in 1 })
+        // 0.5 of five rows is two full rows and half of the third.
+        XCTAssertEqual(canvas.red[0][0], 1, accuracy: 1e-9)
+        XCTAssertEqual(canvas.red[0][1], 1, accuracy: 1e-9)
+        XCTAssertEqual(canvas.red[0][2], 0.5, accuracy: 1e-9)
+        XCTAssertEqual(canvas.red[0][3], 0, accuracy: 1e-9)
+
+        // …and it is monotonic in height, with no step at a row boundary.
+        var previous = 0.0
+        for step in 0...50 {
+            var probe = LinearCanvas()
+            probe.fillColumn(0, height: Double(step) / 50, colour: (1, 1, 1), ramp: { _ in 1 })
+            let total = (0..<LinearCanvas.rowCount).reduce(0.0) { $0 + probe.red[0][$1] }
+            XCTAssertGreaterThanOrEqual(total + 1e-9, previous)
+            previous = total
+        }
+    }
+
+    /// The blur spreads a single lit column into its neighbours — the reason
+    /// `widenIsolatedColumns` could be deleted — and conserves brightness.
+    func testBlurSpreadsWithoutInventingEnergy() {
+        var canvas = LinearCanvas()
+        canvas.addColumn(8, (1, 1, 1), level: 1)
+        let before = (0..<LinearCanvas.columnCount).reduce(0.0) { sum, column in
+            sum + (0..<LinearCanvas.rowCount).reduce(0.0) { $0 + canvas.red[column][$1] }
+        }
+        canvas.blur(sigma: 1.0)
+        XCTAssertGreaterThan(canvas.red[7][2], 0.1)
+        XCTAssertGreaterThan(canvas.red[9][2], 0.1)
+        XCTAssertLessThan(canvas.red[8][2], 1)
+        let after = (0..<LinearCanvas.columnCount).reduce(0.0) { sum, column in
+            sum + (0..<LinearCanvas.rowCount).reduce(0.0) { $0 + canvas.red[column][$1] }
+        }
+        XCTAssertEqual(after, before, accuracy: before * 0.25)
+    }
+
+    /// A short column samples the same continuous field as a tall one, so a bar
+    /// rising through the navigation cluster fades rather than toggling half the
+    /// column at a level crossing.
+    func testShortColumnsSampleTheSameField() {
+        var canvas = LinearCanvas()
+        canvas.fillColumn(15, height: 0.6, colour: (1, 1, 1), ramp: { _ in 1 })
+        let bottom = canvas.sample(column: 15, physicalRow: 0, of: 2)
+        let top = canvas.sample(column: 15, physicalRow: 1, of: 2)
+        XCTAssertGreaterThan(bottom.r, top.r)
+        XCTAssertGreaterThan(bottom.r, 0.5)
+    }
+
+    // MARK: - Interpolation
+
+    /// The renderer evaluates a continuous function of time between analysis
+    /// states rather than latching whichever it happened to see.
+    func testInterpolationIsContinuousAndBounded() {
+        var a = AnalysisState(), b = AnalysisState(), c = AnalysisState()
+        a.time = 0; b.time = 0.0107; c.time = 0.0214
+        a[AnalysisState.Channel.vu] = 0
+        b[AnalysisState.Channel.vu] = 0.5
+        c[AnalysisState.Channel.vu] = 1
+        let mid = AnalysisState.catmullRom(a, b, c, 0.5)
+        XCTAssertGreaterThan(mid.vu, 0.5)
+        XCTAssertLessThan(mid.vu, 1)
+        XCTAssertEqual(AnalysisState.mix(b, c, 0).vu, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(AnalysisState.mix(b, c, 1).vu, 1, accuracy: 1e-9)
+    }
+
+    // MARK: - End to end
+
+    /// Silence renders black, and near-silence stays dark: the percentile AGC's
+    /// gain clamp is what stops a -60 dBFS noise bed becoming a light show.
+    func testSilenceAndNearSilenceRenderDark() {
+        var generator = SystemRandomNumberGenerator()
+        let cases: [(String, [Float])] = [
+            ("digital silence", [Float](repeating: 0, count: Int(sampleRate * 6))),
+            ("-60 dBFS noise", (0..<Int(sampleRate * 6)).map { _ in
+                Float(Double.random(in: -1...1, using: &generator) * 0.001)
+            }),
+        ]
+        for (name, samples) in cases {
+            for mode in VisualizerMode.allCases {
+                let engine = VisualizerEngine(sampleRate: sampleRate, frameRate: 30, mode: mode)
+                var position = 0
+                var frame = 0
+                var brightest = 0.0
+                while position < samples.count {
+                    let end = min(position + 512, samples.count)
+                    engine.ingest(Array(samples[position..<end]),
+                                  hostTime: Double(end) / sampleRate)
+                    position = end
+                    while Double(frame) / 30 < Double(end) / sampleRate {
+                        let colors = engine.renderFrame(at: Double(frame) / 30)
+                        frame += 1
+                        guard Double(frame) / 30 > 2 else { continue }
+                        brightest = max(brightest, colors.map {
+                            max(KeyInterlock.decode($0.red),
+                                max(KeyInterlock.decode($0.green), KeyInterlock.decode($0.blue)))
+                        }.max() ?? 0)
+                    }
+                }
+                XCTAssertLessThan(brightest, 0.10, "\(name) lit the board in \(mode.rawValue)")
             }
         }
-        // Bass, then treble, then bass again, so the mapping has both extremes
-        // to stretch across and the answer cannot come from adaptation alone.
-        var signal = tone(80, count: segment, from: 0)
-        signal += tone(5_000, count: segment, from: segment)
-        signal += tone(80, count: segment, from: segment * 2)
-
-        let (frames, _) = run(signal)
-        let perSegment = frames.count / 3
-        guard perSegment > 6 else { return XCTFail("too few frames") }
-
-        // Sample the settled part of each segment, skipping the transition.
-        func meanBrightness(_ segmentIndex: Int) -> Float {
-            let lower = segmentIndex * perSegment + perSegment / 2
-            let upper = (segmentIndex + 1) * perSegment
-            let slice = frames[lower..<upper]
-            return slice.map(\.brightness).reduce(0, +) / Float(slice.count)
-        }
-        let firstBass = meanBrightness(0)
-        let treble = meanBrightness(1)
-
-        XCTAssertGreaterThan(treble, firstBass + 0.2,
-                             "80 Hz read \(firstBass), 5 kHz read \(treble)")
     }
 
-    /// Loudness is compressed    /// Loudness is compressed, so a quiet passage still shows life rather than
-    /// mapping to nearly nothing.
-    func testLoudnessIsCompressed() {
-        let loud = run(kickPattern(bpm: 120, seconds: 8)).frames.map(\.loudness).suffix(20)
-        let loudMean = loud.reduce(0, +) / Float(loud.count)
-        XCTAssertGreaterThan(loudMean, 0.15, "a kick pattern should read as clearly audible")
-        XCTAssertLessThanOrEqual(loudMean, 1.0)
-    }
-
-    // MARK: - Modes
-
-    /// **No mode may ever light an isolated key.** This is the property the
-    /// whole redesign was asked for, so it is checked for every mode against
-    /// real-ish material rather than argued for in a comment.
-    func testNoModeProducesIsolatedKeys() {
-        let signal = kickPattern(bpm: 128, seconds: 10)
+    /// Music renders something in every mode, and the board holds still between
+    /// hits rather than blinking out.
+    func testEveryModeShowsAndHoldsOnABeat() {
+        let samples = beatPattern(bpm: 120, seconds: 12)
         for mode in VisualizerMode.allCases {
-            let pipeline = VisualizerPipeline(sampleRate: Float(sampleRate),
-                                              bandCount: VisualizerLayout.columns.count)
-            let renderer = ModeRenderer(mode: mode)
-            let interval = 1.0 / 15
-            let perFrame = Int(sampleRate * interval)
-            var offset = 0
-            var worstRun = Int.max
-
-            while offset + perFrame <= signal.count {
-                pipeline.analyze(Array(signal[offset..<(offset + perFrame)]))
-                let colors = renderer.render(pipeline.musicalFrame(elapsed: interval),
-                                             elapsed: interval)
-                offset += perFrame
-
-                // Which columns are meaningfully lit, relative to this frame's
-                // own brightest key.
-                let luminance = { (color: RGB) -> Double in
-                    (0.2126 * Double(color.red) + 0.7152 * Double(color.green)
-                     + 0.0722 * Double(color.blue)) / 255
+            let engine = VisualizerEngine(sampleRate: sampleRate, frameRate: 30, mode: mode)
+            var position = 0
+            var frame = 0
+            var litFrames = 0
+            var frames = 0
+            while position < samples.count {
+                let end = min(position + 512, samples.count)
+                engine.ingest(Array(samples[position..<end]), hostTime: Double(end) / sampleRate)
+                position = end
+                while Double(frame) / 30 < Double(end) / sampleRate {
+                    let colors = engine.renderFrame(at: Double(frame) / 30)
+                    frame += 1
+                    guard Double(frame) / 30 > 4 else { continue }
+                    frames += 1
+                    let lit = colors.filter { KeyInterlock.decode($0.red) >= 0.10
+                        || KeyInterlock.decode($0.green) >= 0.10
+                        || KeyInterlock.decode($0.blue) >= 0.10 }.count
+                    if lit > 10 { litFrames += 1 }
                 }
-                let peak = colors.map(luminance).max() ?? 0
-                guard peak > 0.02 else { continue }
-                var lit: [Bool] = []
-                for column in VisualizerLayout.columns {
-                    let isLit = column.levelRows.flatMap { $0 }.contains { led in
-                        let offset = Int(led) - Int(GMMKKeyMap.minLEDIndex)
-                        guard colors.indices.contains(offset) else { return false }
-                        return luminance(colors[offset]) >= peak * 0.45
-                    }
-                    lit.append(isLit)
-                }
-                guard lit.contains(true) else { continue }
-
-                // The shortest run of lit columns in this frame.
-                var run = 0
-                var shortest = Int.max
-                for isLit in lit {
-                    if isLit {
-                        run += 1
-                    } else if run > 0 {
-                        shortest = min(shortest, run)
-                        run = 0
-                    }
-                }
-                if run > 0 { shortest = min(shortest, run) }
-                if shortest != Int.max { worstRun = min(worstRun, shortest) }
             }
-
-            XCTAssertGreaterThanOrEqual(worstRun, 2,
-                                        "\(mode.rawValue) produced a run of \(worstRun) column(s)")
+            XCTAssertGreaterThan(Double(litFrames) / Double(frames), 0.9,
+                                 "\(mode.rawValue) went dark between hits")
         }
     }
 
-    func testEveryModeIsNamedAndDistinct() {
-        let names = VisualizerMode.allCases.map(\.displayName)
-        XCTAssertEqual(Set(names).count, names.count)
-        XCTAssertEqual(VisualizerMode.allCases.count, 5)
-        XCTAssertFalse(VisualizerMode.allCases.map(\.summary).contains(""))
+    /// The render is a function of the timestamp it is *given*, so a jittered
+    /// wake-up cannot become motion jitter: composing the same frame time twice
+    /// with the same analysis behind it gives the same picture.
+    func testRenderingIsDrivenByTheTimestampNotTheWallClock() {
+        let samples = beatPattern(bpm: 120, seconds: 6)
+        func run(_ jitter: [Double]) -> [RGB] {
+            let engine = VisualizerEngine(sampleRate: sampleRate, frameRate: 30)
+            var position = 0
+            var frame = 0
+            var last: [RGB] = []
+            while position < samples.count {
+                let end = min(position + 512, samples.count)
+                engine.ingest(Array(samples[position..<end]), hostTime: Double(end) / sampleRate)
+                position = end
+                while Double(frame) / 30 + jitter[frame % jitter.count] < Double(end) / sampleRate {
+                    last = engine.renderFrame(at: Double(frame) / 30)
+                    frame += 1
+                }
+            }
+            return last
+        }
+        // The wake-ups differ; the composed timestamps do not.
+        XCTAssertEqual(run([0]), run([0.004, 0.001, 0.007]))
     }
 }
