@@ -526,6 +526,40 @@ final class PacketGoldenTests: XCTestCase {
         }
     }
 
+    /// A whole look is five fields at three bases inside one transaction,
+    /// field-major: mode, brightness, delay, rainbow, colour.
+    func testApplyLookWritesEveryFieldAtEveryProfile() {
+        let t = GMMKTransaction.applyLook(mode: .horizontalWave,
+                                          rainbow: true,
+                                          brightness: 3,
+                                          delay: 1,
+                                          color: RGB(red: 0xFF, green: 0x88, blue: 0x00))
+        XCTAssertEqual(t.count, 2 + 5 * 3)
+        XCTAssertEqual(t.first, GMMKPacket.start())
+        XCTAssertEqual(t.last, GMMKPacket.end())
+        // Field-major: each field's three packets sit together, at 0x00/0x2A/0x54
+        // plus the field's own offset.
+        XCTAssertEqual(t[1...3].map { $0[4] }, [0x00, 0x2A, 0x54])   // mode
+        XCTAssertEqual(t[4...6].map { $0[4] }, [0x01, 0x2B, 0x55])   // brightness
+        XCTAssertEqual(t[7...9].map { $0[4] }, [0x02, 0x2C, 0x56])   // delay
+        XCTAssertEqual(t[10...12].map { $0[4] }, [0x04, 0x2E, 0x58]) // rainbow
+        XCTAssertEqual(t[13...15].map { $0[4] }, [0x05, 0x2F, 0x59]) // colour
+        XCTAssertEqual(t[1][7], LightingMode.horizontalWave.rawValue)
+        XCTAssertEqual(t[4][7], 3)
+        XCTAssertEqual(t[7][7], 1)
+        XCTAssertEqual(t[10][7], 0x01)                                // rainbow on
+        XCTAssertEqual(Array(t[13][7..<10]), [0xFF, 0x88, 0x00])
+    }
+
+    /// The rainbow flag is written either way, so a look that turns it off
+    /// clears one left on by a previous look.
+    func testApplyLookAlwaysWritesTheRainbowFlag() {
+        let t = GMMKTransaction.applyLook(mode: .fixed, rainbow: false, brightness: 4,
+                                          delay: 0, color: .black)
+        XCTAssertEqual(t[10][7], 0x00)
+        XCTAssertEqual(t[10][4], UInt8(GMMKPacket.ConfigOffset.rainbow))
+    }
+
     func testCustomColorTransactionSetsModeAtEveryProfileFirst() {
         let t = GMMKTransaction.customColors(startKeyIndex: 1, colors: [RGB.black])
         XCTAssertEqual(t.count, 3 + 3)

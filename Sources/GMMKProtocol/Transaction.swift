@@ -103,6 +103,31 @@ public enum GMMKTransaction {
         ])
     }
 
+    /// Every field of a whole look in one transaction: mode, brightness, delay,
+    /// rainbow flag and colour, each at all three profile bases.
+    ///
+    /// One transaction rather than five, because a look is one user action —
+    /// splitting it would let the board display a half-applied state, and each
+    /// transaction pays for its own `START`/`END` and hello read.
+    ///
+    /// The rainbow flag rides along explicitly instead of being implied by the
+    /// mode: on this firmware it is an independent field, so the same mode with
+    /// the flag off shows the colour and with it on cycles hues.
+    public static func applyLook(mode: LightingMode,
+                                 rainbow: Bool,
+                                 brightness: UInt8,
+                                 delay: UInt8,
+                                 color: RGB) -> [[UInt8]] {
+        writingEveryProfile([
+            { GMMKPacket.setMode(mode, profileBase: $0) },
+            { GMMKPacket.setBrightness(level: brightness, profileBase: $0) },
+            { GMMKPacket.setDelay(delay, profileBase: $0) },
+            { GMMKPacket.setRainbow(rainbow, profileBase: $0) },
+            { GMMKPacket.setColor(red: color.red, green: color.green, blue: color.blue,
+                                  profileBase: $0) },
+        ])
+    }
+
     /// Per-key colours: mode `custom` at every profile, then the colour run,
     /// all inside a single transaction.
     ///

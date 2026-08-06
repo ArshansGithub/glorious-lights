@@ -9,6 +9,7 @@ let package = Package(
         .library(name: "GMMKHID", targets: ["GMMKHID"]),
         .library(name: "GloriousMouseProtocol", targets: ["GloriousMouseProtocol"]),
         .library(name: "GloriousMouseHID", targets: ["GloriousMouseHID"]),
+        .library(name: "GloriousSync", targets: ["GloriousSync"]),
         .executable(name: "gmmk-cli", targets: ["gmmk-cli"]),
         .executable(name: "GMMKLightsApp", targets: ["GMMKLightsApp"]),
     ],
@@ -19,14 +20,20 @@ let package = Package(
         // targets deliberately share nothing with the keyboard's.
         .target(name: "GloriousMouseProtocol"),
         .target(name: "GloriousMouseHID", dependencies: ["GloriousMouseProtocol"]),
+        // The one place the two protocols meet: a pure translation layer that
+        // maps a device-neutral look onto each device's own vocabulary.
+        .target(name: "GloriousSync",
+                dependencies: ["GMMKProtocol", "GloriousMouseProtocol"]),
         .executableTarget(name: "gmmk-cli",
                           dependencies: ["GMMKProtocol", "GMMKHID",
                                          "GloriousMouseProtocol", "GloriousMouseHID"]),
         .executableTarget(name: "GMMKLightsApp",
                           dependencies: ["GMMKProtocol", "GMMKHID",
-                                         "GloriousMouseProtocol", "GloriousMouseHID"]),
+                                         "GloriousMouseProtocol", "GloriousMouseHID",
+                                         "GloriousSync"]),
         .testTarget(name: "GMMKProtocolTests", dependencies: ["GMMKProtocol"]),
         .testTarget(name: "GMMKHIDTests", dependencies: ["GMMKHID"]),
         .testTarget(name: "GloriousMouseProtocolTests", dependencies: ["GloriousMouseProtocol"]),
+        .testTarget(name: "GloriousSyncTests", dependencies: ["GloriousSync"]),
     ]
 )
