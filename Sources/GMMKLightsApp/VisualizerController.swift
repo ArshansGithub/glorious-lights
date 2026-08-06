@@ -1,6 +1,7 @@
 import Foundation
 import GMMKHID
 import GMMKProtocol
+import GloriousAudioCapture
 import GloriousVisualizer
 
 /// Runs the audio visualizer: microphone in, spectrum out, frames onto the

@@ -11,11 +11,13 @@ let package = Package(
         .library(name: "GloriousMouseHID", targets: ["GloriousMouseHID"]),
         .library(name: "GloriousSync", targets: ["GloriousSync"]),
         .library(name: "GloriousVisualizer", targets: ["GloriousVisualizer"]),
+        .library(name: "GloriousAudioCapture", targets: ["GloriousAudioCapture"]),
         .executable(name: "gmmk-cli", targets: ["gmmk-cli"]),
         .executable(name: "GMMKLightsApp", targets: ["GMMKLightsApp"]),
         // Development tool. Deliberately not part of the app bundle, which
         // Scripts/make-app.sh builds by product name.
         .executable(name: "viz-sim", targets: ["viz-sim"]),
+        .executable(name: "viz-diag", targets: ["viz-diag"]),
     ],
     targets: [
         .target(name: "GMMKProtocol"),
@@ -31,15 +33,21 @@ let package = Package(
         // Audio analysis and the bar-graph render, kept out of the app target so
         // the mapping and the colour ramp are unit-testable without a device.
         .target(name: "GloriousVisualizer", dependencies: ["GMMKProtocol"]),
+        // Capture lives outside the app target so command-line tools can drive
+        // the same microphone and process-tap code the app uses.
+        .target(name: "GloriousAudioCapture", dependencies: ["GloriousVisualizer"]),
         .executableTarget(name: "gmmk-cli",
                           dependencies: ["GMMKProtocol", "GMMKHID",
                                          "GloriousMouseProtocol", "GloriousMouseHID"]),
         .executableTarget(name: "GMMKLightsApp",
                           dependencies: ["GMMKProtocol", "GMMKHID",
                                          "GloriousMouseProtocol", "GloriousMouseHID",
-                                         "GloriousSync", "GloriousVisualizer"]),
+                                         "GloriousSync", "GloriousVisualizer",
+                                         "GloriousAudioCapture"]),
         .executableTarget(name: "viz-sim",
                           dependencies: ["GMMKProtocol", "GloriousVisualizer"]),
+        .executableTarget(name: "viz-diag",
+                          dependencies: ["GloriousVisualizer", "GloriousAudioCapture"]),
         .testTarget(name: "GMMKProtocolTests", dependencies: ["GMMKProtocol"]),
         .testTarget(name: "GMMKHIDTests", dependencies: ["GMMKHID"]),
         .testTarget(name: "GloriousMouseProtocolTests", dependencies: ["GloriousMouseProtocol"]),

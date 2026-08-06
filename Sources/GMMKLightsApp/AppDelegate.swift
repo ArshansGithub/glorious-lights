@@ -1,5 +1,6 @@
 import AppKit
 import GMMKProtocol
+import GloriousAudioCapture
 import GloriousMouseProtocol
 import GloriousSync
 import GloriousVisualizer
@@ -477,9 +478,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sourceItem.submenu = visualizerSourceMenu
         submenu.addItem(sourceItem)
 
-        // A multiplier, so the steps are geometric — the difference between 1x
-        // and 2x matters far more than between 7x and 8x.
-        for multiplier in [0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0] {
+        // Centred on 1.0, which is where the pipeline's own normalisation puts
+        // a typical loud passage at full height. The steps are geometric
+        // because the difference between 1x and 1.5x matters far more than
+        // between 3x and 4x.
+        for multiplier in [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0] {
             let item = NSMenuItem(title: String(format: "%.1f×", multiplier),
                                   action: #selector(selectVisualizerSensitivity(_:)),
                                   keyEquivalent: "")
