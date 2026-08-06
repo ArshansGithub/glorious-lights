@@ -48,6 +48,8 @@ final class VisualizerController {
     private let keyboard = GMMKKeyboard()
     private var engine: VisualizerEngine?
     private let frameSlot = FrameSlot()
+    private let budgetLock = NSLock()
+    private var budget = PacketBudget()
     private var renderThread: Thread?
     private var transportThread: Thread?
 
@@ -224,6 +226,13 @@ final class VisualizerController {
                       100 * telemetry.staleFraction,
                       delivered > 0
                           ? 100 * Double(frameSlot.deliveredFrames) / Double(delivered) : 0)
+            + (packetSummary.map { ", " + $0 } ?? "")
+    }
+
+    private var packetSummary: String? {
+        budgetLock.lock()
+        defer { budgetLock.unlock() }
+        return budget.summary
     }
 
     /// The last run's timing summary, for the menu to show.
@@ -272,7 +281,7 @@ final class VisualizerController {
             engine.autoGain = settings.autoGain
 
             // Compose for the SCHEDULED time, not for `now`.
-            frameSlot.put(engine.renderFrame(at: next))
+            frameSlot.put(engine.renderFrame(at: next), scheduledFor: next)
 
             next += interval
             // Catch up by whole intervals if we overran, so the phase of the
@@ -287,6 +296,10 @@ final class VisualizerController {
     /// Owns the keyboard and the echo pacer. Takes whatever frame is in the slot
     /// and writes only the keys whose bytes changed.
     private func transportLoop() {
+        // Captured once: `engine` is written on the main thread at teardown, and
+        // reading it per frame from here would be a data race on the one path
+        // that runs at 30 Hz.
+        let engine = self.engine
         keyboard.replyTimeout = Self.visualizerReplyTimeout
         keyboard.maxSendAttempts = Self.visualizerSendAttempts
         do {
@@ -307,16 +320,26 @@ final class VisualizerController {
                 continue
             }
 
-            let packets = Self.packets(for: frame, lastSent: lastSent)
-            lastSent = frame
-            guard !packets.isEmpty else { continue }
+            let plan = FramePackets.plan(for: frame.colors, lastSent: lastSent)
+            lastSent = frame.colors
+            budgetLock.lock()
+            budget.record(plan)
+            budgetLock.unlock()
+            guard !plan.packets.isEmpty else { continue }
 
             do {
-                try keyboard.sendFrame(packets: GMMKTransaction.bracket(packets))
+                try keyboard.sendFrame(packets: GMMKTransaction.bracket(plan.packets))
             } catch {
                 reportFailure(String(describing: error))
                 break
             }
+            // `END` has been echoed by the time `sendFrame` returns, so this is
+            // exactly §8.2-R's `t_END_echoed − t_scheduled` — the one term of
+            // `L̂` that has to come from the wire. P10: the compensating latency
+            // is measured live, never assumed.
+            engine?.reportDelivery(
+                lag: ProcessInfo.processInfo.systemUptime - frame.scheduledFor)
+
         }
 
         keyboard.endStreaming()
@@ -331,47 +354,34 @@ final class VisualizerController {
         DispatchQueue.main.async { [weak self] in self?.stop(because: message) }
     }
 
-    /// Dirty-region diffing (§7.2).
+    /// §7.2-R's packet budget, measured rather than hoped for.
     ///
-    /// The old path sent a full 126-LED repaint every frame — `START`, seven
-    /// colour packets, `END`, all echo-paced — whatever was on screen. On
-    /// typical material most keys do not change between frames, and the colour
-    /// command takes an arbitrary start index and length, so a frame costs one
-    /// packet per contiguous run of changed keys. That is what makes 30 fps
-    /// reachable at all.
-    static func packets(for frame: [RGB], lastSent: [RGB]?) -> [[UInt8]] {
-        guard let lastSent, lastSent.count == frame.count else {
-            return GMMKPacket.customColorPackets(startKeyIndex: GMMKKeyMap.minLEDIndex,
-                                                 colors: frame)
+    /// The audit's single biggest measurement gap was that nothing counted
+    /// anything, so "does the board actually run at 30 fps?" had no answer off
+    /// the simulator. The packet count per frame is the other half of that: it
+    /// is what decides whether the transport can deliver a frame inside its
+    /// slot, and it is the input to `L̂`.
+    private struct PacketBudget {
+        var counts: [Int] = []
+        var fallbacks = 0
+        var frames = 0
+
+        mutating func record(_ plan: FramePackets.Plan) {
+            frames += 1
+            counts.append(plan.colourPackets)
+            if counts.count > 4096 { counts.removeFirst(counts.count - 4096) }
+            if plan.fullRepaint { fallbacks += 1 }
         }
-        var packets: [[UInt8]] = []
-        var index = 0
-        while index < frame.count {
-            guard frame[index] != lastSent[index] else {
-                index += 1
-                continue
+
+        var summary: String? {
+            guard !counts.isEmpty else { return nil }
+            let sorted = counts.sorted()
+            func at(_ fraction: Double) -> Int {
+                sorted[min(sorted.count - 1, Int((Double(sorted.count - 1) * fraction).rounded()))]
             }
-            var end = index
-            // A run ends after a few unchanged keys rather than at the first
-            // one: two packets with a one-key gap cost more than one packet
-            // that repaints the gap.
-            var gap = 0
-            var scan = index
-            while scan < frame.count {
-                if frame[scan] != lastSent[scan] {
-                    end = scan
-                    gap = 0
-                } else {
-                    gap += 1
-                    if gap > 4 { break }
-                }
-                scan += 1
-            }
-            packets += GMMKPacket.customColorPackets(
-                startKeyIndex: GMMKKeyMap.minLEDIndex + UInt16(index),
-                colors: Array(frame[index...end]))
-            index = end + 1
+            return String(format: "packets/frame p50 %d / p95 %d / max %d, %.1f %% repaint",
+                          at(0.5), at(0.95), sorted.last ?? 0,
+                          100 * Double(fallbacks) / Double(max(frames, 1)))
         }
-        return packets
     }
 }
