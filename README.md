@@ -72,9 +72,15 @@ swift build -c release
   firmware version, RGB effect, color, brightness, speed, DPI stages, polling
   rate and debounce. It reads the mouse's settings on connect and never writes
   anything until you pick something.
-- **One desk, one look:** *Desk Themes* applies a curated look — Mint Uniform,
-  Seafoam Wave, Ocean, Ember, Ice, Midnight — to every device that's plugged in,
-  translating it into each one's own vocabulary. *Sync Devices* keeps them
+- **One desk, one look:** *Desk Themes* applies a curated look to every device
+  that's plugged in, translating it into each one's own vocabulary. Two groups:
+  *Easy on the switches* (Mint Uniform, Seafoam Wave, Ocean, Ember, Ice,
+  Midnight) stays in the greens and blues a mixed-switch board renders evenly,
+  and *Loud* (Magenta Blast, Ultraviolet, Acid, Electric, Toxic, Synthwave,
+  Crimson, Sunset) doesn't hold back. Crimson and Sunset are red-heavy on
+  purpose — they'll show a mixed-switch board's mix, and they route through your
+  compensation profile exactly like a manual color pick rather than being
+  softened. *Sync Devices* keeps them
   together after that: a color, effect or brightness change made to either
   device is applied to the other as well. The two disagree about almost every
   scale (the keyboard's speed field is a *delay* running backwards, and its

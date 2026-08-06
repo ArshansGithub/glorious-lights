@@ -401,8 +401,118 @@ final class GloriousSyncTests: XCTestCase {
 
     // MARK: - Themes
 
+    /// Every theme, both devices, byte for byte. A theme is a fixed promise
+    /// about what the desk will look like, so the expectations are spelled out
+    /// rather than recomputed from the same table that produces them.
+    func testEveryThemeTranslatesToBothDevices() {
+        // name → (keyboard mode, rainbow, brightness level, delay,
+        //         mouse effect, mouse colour or nil, mouse speed, mouse brightness)
+        let expected: [String: (LightingMode, Bool, UInt8, UInt8,
+                                MouseRGBEffect, String?, UInt8, UInt8)] = [
+            // Easy on the switches
+            "Mint Uniform":  (.fixed, false, 4, 2, .single, "66ffaa", 2, 4),
+            "Seafoam Wave":  (.horizontalWave, false, 4, 2, .rainbow, nil, 2, 4),
+            "Ocean":         (.horizontalWave, true, 4, 2, .rainbow, nil, 2, 4),
+            "Ember":         (.breathing, false, 3, 2, .breathing1, "ff5500", 2, 3),
+            "Ice":           (.fixed, false, 4, 2, .single, "99e6ff", 2, 4),
+            "Midnight":      (.fixed, false, 1, 2, .single, "3344ff", 2, 2),
+            // Loud
+            "Magenta Blast": (.fixed, false, 4, 2, .single, "ff00ff", 2, 4),
+            "Ultraviolet":   (.breathing, false, 4, 2, .breathing1, "8800ff", 2, 4),
+            "Acid":          (.horizontalWave, false, 4, 2, .rainbow, nil, 2, 4),
+            "Electric":      (.horizontalWave, false, 4, 0, .rainbow, nil, 3, 4),
+            "Toxic":         (.fixed, false, 4, 2, .single, "39ff14", 2, 4),
+            "Synthwave":     (.horizontalWave, true, 4, 0, .rainbow, nil, 3, 4),
+            "Crimson":       (.breathing, false, 4, 2, .breathing1, "ff0022", 2, 4),
+            "Sunset":        (.fixed, false, 4, 2, .single, "ff4400", 2, 4),
+        ]
+        XCTAssertEqual(Set(expected.keys), Set(DeskTheme.all.map(\.name)),
+                       "a theme was added or renamed without updating this table")
+
+        for entry in DeskTheme.all {
+            guard let want = expected[entry.name] else { continue }
+            let keyboard = GloriousSync.keyboardPlan(for: entry.look)
+            XCTAssertEqual(keyboard.mode, want.0, "\(entry.name) keyboard mode")
+            XCTAssertEqual(keyboard.rainbow, want.1, "\(entry.name) rainbow flag")
+            XCTAssertEqual(keyboard.brightnessLevel, want.2, "\(entry.name) keyboard brightness")
+            XCTAssertEqual(keyboard.delay, want.3, "\(entry.name) keyboard delay")
+            XCTAssertEqual(keyboard.color, entry.look.color.keyboardColor,
+                           "\(entry.name) keyboard colour")
+
+            let mouse = GloriousSync.mousePlan(for: entry.look)
+            XCTAssertEqual(mouse.effect, want.4, "\(entry.name) mouse effect")
+            XCTAssertEqual(mouse.color, want.5.map { MouseRGB(hex: $0)! },
+                           "\(entry.name) mouse colour")
+            XCTAssertEqual(mouse.parameter.speed, want.6, "\(entry.name) mouse speed")
+            XCTAssertEqual(mouse.parameter.brightness, want.7, "\(entry.name) mouse brightness")
+        }
+    }
+
+    /// The loud group is loud: every one of its themes is at full brightness on
+    /// both devices, which is the whole point of the group.
+    func testLoudThemesAreFullBrightness() {
+        for entry in DeskTheme.loud.entries {
+            XCTAssertEqual(GloriousSync.keyboardPlan(for: entry.look).brightnessLevel,
+                           Brightness.max, entry.name)
+            XCTAssertEqual(GloriousSync.mousePlan(for: entry.look).parameter.brightness,
+                           MouseModeParameter.maxBrightness, entry.name)
+        }
+    }
+
+    /// **Red-heavy themes are passed through unchanged.** Crimson and Sunset
+    /// will show a mixed-switch board's mix, and that is the user's choice —
+    /// nothing here desaturates or shifts them on the way to either device.
+    func testRedHeavyThemesAreNotSoftened() {
+        for name in ["Crimson", "Sunset"] {
+            let entry = DeskTheme.all.first { $0.name == name }!
+            XCTAssertGreaterThan(SwitchCompensation.redFraction(entry.look.color.keyboardColor),
+                                 SwitchCompensation.redHeavyThreshold,
+                                 "\(name) should be red-heavy — it is meant to be")
+            // Byte-for-byte the colour that was named, on both devices.
+            XCTAssertEqual(GloriousSync.keyboardPlan(for: entry.look).color,
+                           entry.look.color.keyboardColor, name)
+            XCTAssertEqual(GloriousSync.mousePlan(for: entry.look).color,
+                           entry.look.color.mouseColor, name)
+        }
+    }
+
+    /// The switch-friendly group is green and blue with **one** documented
+    /// exception: Ember, a warm look kept there because it is calm rather than
+    /// loud. Pinning the count to one is what makes this a real check — add
+    /// another red theme to that group and this fails.
+    func testSwitchFriendlyGroupHasExactlyOneRedHeavyException() {
+        let redHeavy = DeskTheme.switchFriendly.entries.filter {
+            SwitchCompensation.isRedHeavy($0.look.color.keyboardColor)
+        }
+        XCTAssertEqual(redHeavy.map(\.name), ["Ember"])
+    }
+
+    /// The loud group is where red-heavy looks are expected rather than
+    /// excepted, so it has to actually contain some.
+    func testLoudGroupContainsRedHeavyThemes() {
+        let redHeavy = DeskTheme.loud.entries.filter {
+            SwitchCompensation.isRedHeavy($0.look.color.keyboardColor)
+        }
+        XCTAssertTrue(redHeavy.map(\.name).contains("Crimson"))
+        XCTAssertTrue(redHeavy.map(\.name).contains("Sunset"))
+    }
+
+    func testGroupsCoverEveryThemeExactlyOnce() {
+        XCTAssertEqual(DeskTheme.groups.count, 2)
+        XCTAssertEqual(DeskTheme.all.count,
+                       DeskTheme.groups.reduce(0) { $0 + $1.entries.count })
+        let names = DeskTheme.all.map(\.name)
+        XCTAssertEqual(Set(names).count, names.count, "a theme name is duplicated across groups")
+        for group in DeskTheme.groups {
+            XCTAssertFalse(group.name.isEmpty)
+            XCTAssertFalse(group.entries.isEmpty)
+        }
+    }
+
     func testEveryThemeIsUsable() {
-        XCTAssertEqual(DeskTheme.all.count, 6)
+        XCTAssertEqual(DeskTheme.all.count, 14)
+        XCTAssertEqual(DeskTheme.switchFriendly.entries.count, 6)
+        XCTAssertEqual(DeskTheme.loud.entries.count, 8)
         let names = DeskTheme.all.map(\.name)
         XCTAssertEqual(Set(names).count, names.count)
         XCTAssertFalse(names.contains(""))

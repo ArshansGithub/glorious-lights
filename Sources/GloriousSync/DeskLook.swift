@@ -130,13 +130,21 @@ public struct DeskColor: Equatable, Hashable, Sendable {
 
 // MARK: - Themes
 
-/// Curated looks, applied to whichever devices are present.
+/// Curated looks, applied to whichever devices are present, in two groups.
 ///
-/// The palette leans green and blue on purpose: those are the hues a tinted
-/// switch housing barely changes (see `SwitchFriendlyPalette` in the app), so a
-/// theme looks the same across a mixed-switch keyboard *and* matches the mouse,
-/// which has no such problem. Ember is the deliberate exception — a warm look
-/// is worth having even though it is the case switch compensation exists for.
+/// The split is about the *keyboard's switch housings*, not about taste. A board
+/// that mixes clear and tinted switches shows the mix worst on red-dominant
+/// colours, because a cyan housing absorbs red and there is no headroom to
+/// correct it back (see `SwitchCompensation` in the app). So the first group
+/// stays green and blue, where both housings render nearly the same and the
+/// board reads as one colour with no correction at all.
+///
+/// The second group ignores that on purpose. Saturated and warm looks are worth
+/// having, and a user who picks Crimson has chosen loud knowing what their board
+/// does with red — so nothing here is filtered, softened or desaturated. On a
+/// keyboard with a tuned compensation profile they route through it exactly as a
+/// manual colour pick does, which is the most that can be done for them; on an
+/// untuned board they look how red looks on that board.
 public enum DeskTheme {
 
     public struct Entry: Equatable, Sendable {
@@ -149,6 +157,17 @@ public enum DeskTheme {
         }
     }
 
+    /// A named set of themes, shown as one block in the menu.
+    public struct Group: Equatable, Sendable {
+        public let name: String
+        public let entries: [Entry]
+
+        public init(_ name: String, _ entries: [Entry]) {
+            self.name = name
+            self.entries = entries
+        }
+    }
+
     /// Parses a hex literal that is known-good at the call site below.
     private static func color(_ hex: String) -> DeskColor {
         guard let color = DeskColor(hex: hex) else {
@@ -157,7 +176,10 @@ public enum DeskTheme {
         return color
     }
 
-    public static let all: [Entry] = [
+    /// Green and blue looks a mixed-switch board renders evenly — with one
+    /// exception, Ember, which is warm but calm enough to belong here rather
+    /// than in ``loud``. A test pins that it stays the only one.
+    public static let switchFriendly = Group("Easy on the switches", [
         Entry("Mint Uniform",
               DeskLook(family: .solid, color: color("66ffaa"), brightness: 1.0)),
         Entry("Seafoam Wave",
@@ -172,5 +194,34 @@ public enum DeskTheme {
               DeskLook(family: .solid, color: color("99e6ff"), brightness: 1.0)),
         Entry("Midnight",
               DeskLook(family: .solid, color: color("3344ff"), brightness: 0.25)),
-    ]
+    ])
+
+    /// Saturated looks, full brightness unless noted. Crimson and Sunset are
+    /// deliberately red-heavy — see the type's discussion.
+    public static let loud = Group("Loud", [
+        Entry("Magenta Blast",
+              DeskLook(family: .solid, color: color("ff00ff"), brightness: 1.0)),
+        Entry("Ultraviolet",
+              DeskLook(family: .breathing, color: color("8800ff"),
+                       brightness: 1.0, speed: 0.5)),
+        Entry("Acid",
+              DeskLook(family: .wave, color: color("66ff00"), brightness: 1.0, speed: 0.5)),
+        Entry("Electric",
+              DeskLook(family: .wave, color: color("00ffff"), brightness: 1.0, speed: 1.0)),
+        Entry("Toxic",
+              DeskLook(family: .solid, color: color("39ff14"), brightness: 1.0)),
+        Entry("Synthwave",
+              DeskLook(family: .rainbowCycle, color: color("ff00aa"),
+                       brightness: 1.0, speed: 1.0)),
+        Entry("Crimson",
+              DeskLook(family: .breathing, color: color("ff0022"),
+                       brightness: 1.0, speed: 0.5)),
+        Entry("Sunset",
+              DeskLook(family: .solid, color: color("ff4400"), brightness: 1.0)),
+    ])
+
+    public static let groups: [Group] = [switchFriendly, loud]
+
+    /// Every theme, both groups, flattened.
+    public static let all: [Entry] = groups.flatMap(\.entries)
 }

@@ -178,14 +178,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(syncItem)
 
         let themesMenu = NSMenu()
-        for theme in DeskTheme.all {
-            let item = NSMenuItem(title: theme.name,
-                                  action: #selector(selectTheme(_:)),
-                                  keyEquivalent: "")
-            item.target = self
-            item.representedObject = theme.look
-            item.image = swatchImage(nsColor(theme.look.color.keyboardColor))
-            themesMenu.addItem(item)
+        for (index, group) in DeskTheme.groups.enumerated() {
+            if index > 0 { themesMenu.addItem(.separator()) }
+            let header = NSMenuItem(title: group.name, action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            themesMenu.addItem(header)
+            for theme in group.entries {
+                let item = NSMenuItem(title: theme.name,
+                                      action: #selector(selectTheme(_:)),
+                                      keyEquivalent: "")
+                item.target = self
+                item.representedObject = theme.look
+                item.image = swatchImage(nsColor(theme.look.color.keyboardColor))
+                item.indentationLevel = 1
+                themesMenu.addItem(item)
+            }
         }
         themesItem.submenu = themesMenu
         menu.addItem(themesItem)
