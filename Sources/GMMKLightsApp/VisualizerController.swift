@@ -4,65 +4,53 @@ import GMMKProtocol
 import GloriousAudioCapture
 import GloriousVisualizer
 
-/// Runs the audio visualizer: microphone in, spectrum out, frames onto the
-/// keyboard.
+/// Runs the audio visualizer: audio in, frames onto the keyboard.
 ///
-/// ## Threads
+/// ## Four clocks, and the boundaries between them are the design
 ///
-/// Three, and the boundaries between them are the whole design.
+/// * **The capture thread** copies samples into ``VisualizerEngine`` and does
+///   nothing else. It never touches the transport and never blocks.
+/// * **The analysis stage** runs inside the engine at ~94 Hz, on the capture
+///   thread's back, independent of the display rate.
+/// * **The render thread**, created here, runs a **fixed-rate clock**: it waits
+///   for a deadline, composes the frame *for that deadline's timestamp*, hands
+///   it to a single-slot buffer and returns. It never waits on the transport.
+/// * **The transport thread** owns the keyboard, takes whatever frame is in the
+///   slot, diffs it against the last one sent and writes only the keys that
+///   changed.
 ///
-/// * **AVAudioEngine's render thread** delivers sample buffers. It does the FFT
-///   and stores the result in ``latestLevels``. It never touches the transport
-///   and never blocks — a render thread that waits on USB drops audio.
-/// * **The render thread**, created here, owns its own ``GMMKKeyboard`` and its
-///   own run loop, because that class is one-thread-at-a-time by design. It
-///   loops: take the newest levels, smooth, paint, send, sleep the remainder of
-///   the frame.
-/// * **The main thread** starts and stops all of it and owns the UI.
-///
-/// The two hand-offs are a lock around ``latestLevels`` and a ``TransportLease``
-/// that stops the menu's own keyboard instance from sending while this one is
-/// running.
-///
-/// ## Coalescing rather than queueing
-///
-/// The audio thread *overwrites* the pending levels instead of appending to a
-/// queue. If the transport falls behind, the frames it missed are simply gone —
-/// which is what a live display wants. A queue would build a backlog and the
-/// bars would drift steadily further behind the music.
-///
-/// > TODO: the mouse's six LEDs could pulse to the beat alongside this. Not
-/// > built — the mouse's write path is a whole-blob read-modify-write, so it
-/// > cannot sustain a frame rate and would need its own much slower beat-driven
-/// > path rather than a share of this one.
+/// The old loop did all of this on one thread and slept "the remainder of the
+/// frame" after the USB write, which meant the frame rate was whatever the
+/// transport sustained and a stalled packet froze the display for seconds. Now
+/// a slow transport shows up as *dropped frames* and nothing else: the model's
+/// timing is untouched, and because gestures are continuous functions of time
+/// the next delivered frame shows them where they genuinely are (P6).
 final class VisualizerController {
 
-    /// Frames per second to aim for. Fast enough to read as live, slow enough
-    /// that the echo-paced transport can keep up without the render loop
-    /// spending all its time waiting.
-    static let targetFrameRate: Double = 15
+    /// Display frames per second. Reachable because the transport writes only
+    /// changed keys; the design is correct at 15 too, and every ballistic clamp
+    /// in the engine is expressed in terms of the frame interval rather than in
+    /// terms of any particular rate.
+    static let targetFrameRate: Double = 30
+
+    /// What the visualizer asks of the transport: a short reply timeout and few
+    /// attempts. A frame is worth at most a frame's time; a packet that has not
+    /// been echoed in 60 ms will not be echoed.
+    static let visualizerReplyTimeout: TimeInterval = 0.060
+    static let visualizerSendAttempts = 2
 
     private let lease: TransportLease
-    /// Built per session from ``source``, because the two sources are different
-    /// objects with different lifetimes — everything downstream is identical.
     private var capture: AudioSourceCapturing?
 
-    /// Which source the next start will use. Changing it while running has no
-    /// effect until the session is restarted; the delegate does that.
+    /// Which source the next start will use.
     var source: AudioSource
 
-    /// The visualizer's own transport, touched only from ``renderThread``.
     private let keyboard = GMMKKeyboard()
-
-    /// The shared analysis-and-display pipeline. The audio thread feeds it and
-    /// the render thread advances it; it owns the coalescing, so there is no
-    /// second copy of the gate, gain or smoothing here for the simulator to
-    /// drift away from.
-    private var pipeline: VisualizerPipeline?
+    private var engine: VisualizerEngine?
+    private let frameSlot = FrameSlot()
     private var renderThread: Thread?
+    private var transportThread: Thread?
 
-    /// Set on the main thread, read by the render thread; guarded by its own
-    /// lock so a style change mid-frame cannot tear.
     private let settingsLock = NSLock()
     private var mode: VisualizerMode
     private var themeColor: RGB
@@ -71,13 +59,8 @@ final class VisualizerController {
 
     private var isStopping = false
 
-    /// Whether the visualizer is running. Main thread only.
     private(set) var isRunning = false
-
-    /// Last error, for the menu to show. Main thread only.
     private(set) var lastError: String?
-
-    /// Fires when ``isRunning`` or ``lastError`` changes.
     var onStatusChange: (() -> Void)?
 
     init(lease: TransportLease,
@@ -117,9 +100,6 @@ final class VisualizerController {
 
     // MARK: - Lifecycle
 
-    /// Starts capture and rendering. Main thread.
-    ///
-    /// - Returns: `false` if it could not start, with ``lastError`` set.
     @discardableResult
     func start() -> Bool {
         guard !isRunning else { return true }
@@ -134,47 +114,57 @@ final class VisualizerController {
         self.capture = capture
 
         let settings = currentSettings
-        let pipeline = VisualizerPipeline(
-            sampleRate: Float(capture.sampleRate),
-            bandCount: VisualizerLayout.columns.count,
-            tuning: .init(sensitivity: settings.sensitivity,
-                          autoGain: settings.autoGain,
-                          sourceProfile: source == .microphone ? .room : .music))
-        self.pipeline = pipeline
-        // The FFT happens on the audio thread, so the render thread only ever
-        // does arithmetic on 17 floats before sending.
-        capture.onSamples = { [weak pipeline] samples in pipeline?.analyze(samples) }
+        let engine = VisualizerEngine(sampleRate: capture.sampleRate,
+                                      frameRate: Self.targetFrameRate,
+                                      mode: settings.mode,
+                                      themeColor: settings.color)
+        engine.sensitivity = settings.sensitivity
+        self.engine = engine
+
+        // The capture callback does one thing: hand the samples over. The FFT
+        // runs inside, on this thread, but nothing else does — no locks held
+        // across it, no transport, no allocation of frames.
+        capture.onSamples = { [weak engine] samples in
+            engine?.ingest(samples, hostTime: ProcessInfo.processInfo.systemUptime)
+        }
 
         do {
             try capture.start()
         } catch {
             self.capture = nil
+            self.engine = nil
             lease.release(.visualizer)
             return fail(String(describing: error))
         }
 
-        // The tap reports its own rate, which need not be the 48 kHz assumed
-        // before it started, and the band edges are derived from it — so the
-        // pipeline is rebuilt once the real rate is known.
-        if abs(capture.sampleRate - Double(pipeline.sampleRate)) > 1 {
-            let corrected = VisualizerPipeline(
-                sampleRate: Float(capture.sampleRate),
-                bandCount: VisualizerLayout.columns.count,
-                tuning: .init(sensitivity: settings.sensitivity,
-                              autoGain: settings.autoGain,
-                              sourceProfile: source == .microphone ? .room : .music))
-            self.pipeline = corrected
-            capture.onSamples = { [weak corrected] samples in corrected?.analyze(samples) }
+        // The tap reports its own rate, which need not be the one assumed before
+        // it started, and every band edge derives from it.
+        if abs(capture.sampleRate - engine.analyzer.sampleRate) > 1 {
+            let corrected = VisualizerEngine(sampleRate: capture.sampleRate,
+                                             frameRate: Self.targetFrameRate,
+                                             mode: settings.mode,
+                                             themeColor: settings.color)
+            corrected.sensitivity = settings.sensitivity
+            self.engine = corrected
+            capture.onSamples = { [weak corrected] samples in
+                corrected?.ingest(samples, hostTime: ProcessInfo.processInfo.systemUptime)
+            }
         }
 
         isStopping = false
-        let thread = Thread { [weak self] in self?.renderLoop() }
-        thread.name = "com.glorious-lights.visualizer"
+        let transport = Thread { [weak self] in self?.transportLoop() }
+        transport.name = "com.glorious-lights.visualizer.transport"
+        transport.qualityOfService = .userInitiated
+        transportThread = transport
+        transport.start()
+
+        let render = Thread { [weak self] in self?.renderLoop() }
+        render.name = "com.glorious-lights.visualizer.render"
         // Above default so a busy main thread does not stutter the display, but
         // below the audio thread, which must never wait on us.
-        thread.qualityOfService = .userInitiated
-        renderThread = thread
-        thread.start()
+        render.qualityOfService = .userInitiated
+        renderThread = render
+        render.start()
 
         isRunning = true
         lastError = nil
@@ -183,9 +173,6 @@ final class VisualizerController {
     }
 
     /// Stops rendering and hands the transport back. Main thread.
-    ///
-    /// Returns once the render thread has finished, so a caller can immediately
-    /// re-apply the user's own look without racing a final frame.
     func stop() {
         guard isRunning else { return }
         capture?.stop()
@@ -193,13 +180,12 @@ final class VisualizerController {
         capture = nil
 
         isStopping = true
-        // The render loop checks the flag once per frame, so this is bounded by
-        // one frame plus one transaction.
-        while renderThread?.isFinished == false {
+        while renderThread?.isFinished == false || transportThread?.isFinished == false {
             Thread.sleep(forTimeInterval: 0.005)
         }
         renderThread = nil
-        pipeline = nil
+        transportThread = nil
+        engine = nil
 
         lease.release(.visualizer)
         isRunning = false
@@ -222,12 +208,49 @@ final class VisualizerController {
 
     // MARK: - Render loop
 
+    /// The fixed-rate clock of §1.1.
+    ///
+    /// Two properties matter and both were wrong before:
+    ///
+    /// * frames are composed **for their scheduled timestamp**, not for the
+    ///   instant the thread happened to wake, so a late wake-up does not become
+    ///   motion jitter;
+    /// * the deadline advances by a whole frame interval, so the loop cannot
+    ///   free-run — the old "sleep whatever is left of the frame" pattern let
+    ///   USB latency set the frame rate.
     private func renderLoop() {
-        let frameInterval = 1 / Self.targetFrameRate
-        var lastFrame = ProcessInfo.processInfo.systemUptime
-        let renderer = ModeRenderer(mode: currentSettings.mode,
-                                    themeColor: currentSettings.color)
+        guard let engine else { return }
+        let interval = engine.frameInterval
+        var next = ProcessInfo.processInfo.systemUptime + interval
 
+        while !isStopping {
+            let now = ProcessInfo.processInfo.systemUptime
+            if next > now { Thread.sleep(forTimeInterval: next - now) }
+            if isStopping { break }
+
+            let settings = currentSettings
+            engine.mode = settings.mode
+            engine.themeColor = settings.color
+            engine.sensitivity = settings.sensitivity
+
+            // Compose for the SCHEDULED time, not for `now`.
+            frameSlot.put(engine.renderFrame(at: next))
+
+            next += interval
+            // Catch up by whole intervals if we overran, so the phase of the
+            // clock is preserved rather than drifting with each late frame.
+            let after = ProcessInfo.processInfo.systemUptime
+            if next < after { next = after + interval }
+        }
+    }
+
+    // MARK: - Transport loop
+
+    /// Owns the keyboard and the echo pacer. Takes whatever frame is in the slot
+    /// and writes only the keys whose bytes changed.
+    private func transportLoop() {
+        keyboard.replyTimeout = Self.visualizerReplyTimeout
+        keyboard.maxSendAttempts = Self.visualizerSendAttempts
         do {
             try keyboard.open()
             try keyboard.beginStreaming()
@@ -238,45 +261,73 @@ final class VisualizerController {
             return
         }
 
+        var lastSent: [RGB]?
         while !isStopping {
-            let frameStart = ProcessInfo.processInfo.systemUptime
-            let elapsed = frameStart - lastFrame
-            lastFrame = frameStart
+            guard let frame = frameSlot.take() else {
+                // Nothing new to send. Sleep a fraction of a frame rather than
+                // spinning; the render clock is what decides timing.
+                Thread.sleep(forTimeInterval: 0.002)
+                continue
+            }
 
-            // The pipeline holds the newest analysis and drops anything older,
-            // so a slow frame loses intermediate audio rather than accumulating
-            // a backlog.
-            let settings = currentSettings
-            guard let pipeline else { break }
-            pipeline.tuning.sensitivity = settings.sensitivity
-            pipeline.tuning.autoGain = settings.autoGain
-
-            renderer.mode = settings.mode
-            renderer.themeColor = settings.color
-            let musical = pipeline.musicalFrame(elapsed: elapsed)
-            let colors = renderer.render(musical, elapsed: elapsed)
+            let packets = Self.packets(for: frame, lastSent: lastSent)
+            lastSent = frame
+            guard !packets.isEmpty else { continue }
 
             do {
-                try keyboard.sendFrame(
-                    packets: GMMKTransaction.bracket(
-                        GMMKPacket.customColorPackets(startKeyIndex: GMMKKeyMap.minLEDIndex,
-                                                      colors: colors)))
+                try keyboard.sendFrame(packets: GMMKTransaction.bracket(packets))
             } catch {
                 let message = String(describing: error)
                 DispatchQueue.main.async { [weak self] in self?.fail(message) }
                 break
             }
-
-            // Sleep only what is left of the frame. If the transaction took
-            // longer than the interval, go straight round again — the display
-            // simply runs at whatever rate the transport sustains.
-            let spent = ProcessInfo.processInfo.systemUptime - frameStart
-            if spent < frameInterval {
-                Thread.sleep(forTimeInterval: frameInterval - spent)
-            }
         }
 
         keyboard.endStreaming()
         keyboard.stop()
+    }
+
+    /// Dirty-region diffing (§7.2).
+    ///
+    /// The old path sent a full 126-LED repaint every frame — `START`, seven
+    /// colour packets, `END`, all echo-paced — whatever was on screen. On
+    /// typical material most keys do not change between frames, and the colour
+    /// command takes an arbitrary start index and length, so a frame costs one
+    /// packet per contiguous run of changed keys. That is what makes 30 fps
+    /// reachable at all.
+    static func packets(for frame: [RGB], lastSent: [RGB]?) -> [[UInt8]] {
+        guard let lastSent, lastSent.count == frame.count else {
+            return GMMKPacket.customColorPackets(startKeyIndex: GMMKKeyMap.minLEDIndex,
+                                                 colors: frame)
+        }
+        var packets: [[UInt8]] = []
+        var index = 0
+        while index < frame.count {
+            guard frame[index] != lastSent[index] else {
+                index += 1
+                continue
+            }
+            var end = index
+            // A run ends after a few unchanged keys rather than at the first
+            // one: two packets with a one-key gap cost more than one packet
+            // that repaints the gap.
+            var gap = 0
+            var scan = index
+            while scan < frame.count {
+                if frame[scan] != lastSent[scan] {
+                    end = scan
+                    gap = 0
+                } else {
+                    gap += 1
+                    if gap > 4 { break }
+                }
+                scan += 1
+            }
+            packets += GMMKPacket.customColorPackets(
+                startKeyIndex: GMMKKeyMap.minLEDIndex + UInt16(index),
+                colors: Array(frame[index...end]))
+            index = end + 1
+        }
+        return packets
     }
 }

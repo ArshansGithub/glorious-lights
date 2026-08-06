@@ -1,148 +1,69 @@
 import Accelerate
 import Foundation
 
-/// Turns a window of mono audio into one level per display column.
+/// The FFT front end: a window of mono audio in, a magnitude spectrum out.
 ///
-/// A real-time FFT with the parameters chosen for *this* display rather than
-/// for analysis: 17 columns of at most 5 rows is a very low-resolution output,
-/// so the job is to land energy in the right column and be stable frame to
-/// frame, not to resolve pitch.
+/// It does the transform and nothing else. Every level decision that used to
+/// live here — a fixed pink-noise tilt across the bands, a per-band mean scaled
+/// by a static weight — has moved to ``AdaptiveWhitening``, which learns the
+/// tilt of *this* material instead of assuming one.
 ///
-/// ## Log-spaced bands
+/// Window 2048 / hop 512 gives 93.75 Hz at 48 kHz. **Latency is set by the hop,
+/// not the window**: shrinking the window to chase latency costs low-frequency
+/// resolution, which is exactly where kick discrimination lives.
 ///
-/// FFT bins are linear in frequency and hearing is not: with 2048 samples at
-/// 48 kHz each bin is ~23 Hz, so a linear split would give the bottom two
-/// octaves a single column and the top octave nine. The band edges are
-/// therefore geometric between ``minimumFrequency`` and ``maximumFrequency``,
-/// which puts roughly one musical octave-and-a-bit in each column and makes
-/// bass, mids and treble all visibly move.
-///
-/// A class rather than a struct because it owns a `vDSP` FFT setup, which is a
-/// manually-managed allocation that has to be destroyed exactly once.
+/// A class rather than a struct because it owns a `vDSP` FFT setup, a manually
+/// managed allocation that must be destroyed exactly once.
 public final class SpectrumAnalyzer {
 
-    /// Window size. A power of two for the FFT, and at 48 kHz about 43 ms —
-    /// long enough to resolve bass, short enough that a fifteen-frames-a-second
-    /// display is not showing stale audio.
+    /// Window size, a power of two: 2048 is ~43 ms at 48 kHz, enough to resolve
+    /// the bottom two octaves.
     public static let windowSize = 2048
 
-    /// Bottom of the displayed range. Below this is mostly rumble and DC.
-    public static let minimumFrequency: Float = 40
-    /// Top of the displayed range. Above this there is little musical energy
-    /// and the columns would sit dark.
-    public static let maximumFrequency: Float = 16_000
+    /// Band edges in Hz (§2.1). Eight bands, log-spaced, named for what they
+    /// carry rather than for an arbitrary split.
+    public static let bandEdges: [Float] = [20, 60, 120, 250, 500, 1_000, 2_500, 6_000, 16_000]
+
+    /// Which bands each display register is formed from — a view of the band
+    /// set, not a second analysis.
+    public static let registerBands: [ClosedRange<Int>] = [0...1, 2...2, 3...3, 4...4, 5...6, 7...7]
 
     public let sampleRate: Float
-    public let bandCount: Int
-
-    /// Whether the pink-noise equalisation is applied. Off is the pre-tuning
-    /// behaviour, kept so the simulator can measure before and after with one
-    /// binary rather than by checking out an old commit.
-    public let isEqualized: Bool
-
     private let log2n: vDSP_Length
     private let fftSetup: FFTSetup
     private let window: [Float]
-    /// Inclusive bin range for each band, precomputed once.
-    private let bandBins: [(lower: Int, upper: Int)]
-    /// Per-band multiplier that flattens pink noise. See ``pinkEqualization(for:sampleRate:)``.
-    private let bandWeights: [Float]
 
-    /// - Parameters:
-    ///   - sampleRate: the capture rate, e.g. 48000.
-    ///   - bandCount: how many columns the display has.
-    public init(sampleRate: Float, bandCount: Int, equalized: Bool = true) {
-        precondition(bandCount > 0, "a spectrum needs at least one band")
+    /// Inclusive bin range per band, precomputed.
+    public let bandBins: [(lower: Int, upper: Int)]
+
+    public init(sampleRate: Float) {
         self.sampleRate = sampleRate
-        self.bandCount = bandCount
-        self.isEqualized = equalized
         self.log2n = vDSP_Length(log2(Float(Self.windowSize)).rounded())
         guard let setup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) else {
             preconditionFailure("vDSP_create_fftsetup failed for \(Self.windowSize) samples")
         }
         self.fftSetup = setup
 
-        // Hann: the spectrum is displayed, not measured, so leakage into
-        // neighbouring columns matters more than amplitude accuracy.
         var hann = [Float](repeating: 0, count: Self.windowSize)
         vDSP_hann_window(&hann, vDSP_Length(Self.windowSize), Int32(vDSP_HANN_NORM))
         self.window = hann
 
-        self.bandBins = Self.bandBinRanges(sampleRate: sampleRate, bandCount: bandCount)
-        self.bandWeights = equalized
-            ? Self.pinkEqualization(for: bandBins, sampleRate: sampleRate)
-            : [Float](repeating: 1, count: bandCount)
+        let binWidth = sampleRate / Float(Self.windowSize)
+        let binCount = Self.windowSize / 2
+        self.bandBins = (0..<(Self.bandEdges.count - 1)).map { index in
+            // Bin 0 is DC; never let a band include it.
+            let lower = max(1, min(Int(Self.bandEdges[index] / binWidth), binCount - 1))
+            let upper = max(lower, min(Int(Self.bandEdges[index + 1] / binWidth), binCount - 1))
+            return (lower, upper)
+        }
     }
 
     deinit { vDSP_destroy_fftsetup(fftSetup) }
 
-    /// Geometric band edges converted to inclusive FFT bin ranges.
-    ///
-    /// Exposed for testing: the mapping from bins to columns is the part of this
-    /// file that can be wrong in a way nobody notices except that the display
-    /// looks bass-heavy.
-    static func bandBinRanges(sampleRate: Float, bandCount: Int) -> [(lower: Int, upper: Int)] {
-        let binCount = windowSize / 2
-        let binWidth = sampleRate / Float(windowSize)
-        let ratio = pow(maximumFrequency / minimumFrequency, 1 / Float(bandCount))
+    /// Number of spectrum bins produced.
+    public var binCount: Int { Self.windowSize / 2 }
 
-        var ranges: [(lower: Int, upper: Int)] = []
-        ranges.reserveCapacity(bandCount)
-        var lowerFrequency = minimumFrequency
-        for _ in 0..<bandCount {
-            let upperFrequency = lowerFrequency * ratio
-            var lower = Int((lowerFrequency / binWidth).rounded(.down))
-            var upper = Int((upperFrequency / binWidth).rounded(.down))
-            // Bin 0 is DC; never let a band include it.
-            lower = max(1, min(lower, binCount - 1))
-            upper = max(lower, min(upper, binCount - 1))
-            ranges.append((lower, upper))
-            lowerFrequency = upperFrequency
-        }
-        return ranges
-    }
-
-    /// Per-band multipliers that make **pink noise produce a flat display**.
-    ///
-    /// This is the fix for a spectrum analyser that looks like it only has bass.
-    /// Music is roughly pink — power falls as `1/f` — so with equal weighting the
-    /// bottom bands pin at full scale while the top of the board sits dark, no
-    /// matter what the gain is set to. Weighting each band by the inverse of the
-    /// response pink noise *would* produce there turns "flat display" into the
-    /// meaning of "typical music", which is what makes the whole board move.
-    ///
-    /// Pink noise has power ∝ `1/f`, so magnitude ∝ `f^-1/2`. The expected mean
-    /// magnitude of a band is therefore the mean of `f^-1/2` across the bins it
-    /// actually covers — computed here from the real bin ranges rather than from
-    /// a centre-frequency approximation, because the low bands span very few
-    /// bins and the approximation is worst exactly there.
-    ///
-    /// Weights are normalised to a geometric mean of 1, so equalisation changes
-    /// the *shape* of the display without changing its overall level — a
-    /// sensitivity that worked before still works.
-    static func pinkEqualization(for bands: [(lower: Int, upper: Int)],
-                                 sampleRate: Float) -> [Float] {
-        let binWidth = sampleRate / Float(windowSize)
-        let expected: [Float] = bands.map { range in
-            var total: Float = 0
-            for bin in range.lower...range.upper {
-                total += 1 / sqrt(Float(bin) * binWidth)
-            }
-            return total / Float(range.upper - range.lower + 1)
-        }
-        // Geometric mean, so one very low band cannot drag the normaliser the
-        // way an arithmetic mean would.
-        let logSum = expected.reduce(Float(0)) { $0 + log($1) }
-        let geometricMean = exp(logSum / Float(expected.count))
-        return expected.map { geometricMean / $0 }
-    }
-
-    /// The raw FFT magnitude spectrum for a window — half the window size, one
-    /// per bin.
-    ///
-    /// Exposed because the musical layer needs the spectrum itself: onset
-    /// detection works on per-band flux and the centroid is a weighted mean over
-    /// bins, neither of which can be recovered from the 17 band means.
+    /// The magnitude spectrum of one window.
     public func magnitudes(from samples: [Float]) -> [Float] {
         var real = [Float](repeating: 0, count: Self.windowSize)
         let count = min(samples.count, Self.windowSize)
@@ -166,19 +87,6 @@ public final class SpectrumAnalyzer {
         return magnitudes
     }
 
-    /// Band means (with the pink equalisation applied) from a magnitude
-    /// spectrum, so a caller that already has one does not transform twice.
-    public func bandLevels(fromMagnitudes magnitudes: [Float]) -> [Float] {
-        bandBins.enumerated().map { index, range in
-            let upper = min(range.upper, magnitudes.count - 1)
-            guard range.lower <= upper else { return 0 }
-            let slice = magnitudes[range.lower...upper]
-            var mean: Float = 0
-            vDSP_meanv(Array(slice), 1, &mean, vDSP_Length(slice.count))
-            return mean * bandWeights[index]
-        }
-    }
-
     /// Inclusive bin range covering a frequency span, clamped into the spectrum.
     public func binRange(forHz range: ClosedRange<Float>) -> (lower: Int, upper: Int) {
         let binWidth = sampleRate / Float(Self.windowSize)
@@ -187,52 +95,16 @@ public final class SpectrumAnalyzer {
         return (lower, max(lower, upper))
     }
 
-    /// Spectral centroid in Hz — the "centre of mass" of the spectrum, and the
-    /// closest single number to how *bright* a sound is.
-    public func centroid(ofMagnitudes magnitudes: [Float]) -> Float {
-        let binWidth = sampleRate / Float(Self.windowSize)
-        var weighted: Float = 0
-        var total: Float = 0
-        for bin in 1..<magnitudes.count {
-            weighted += Float(bin) * binWidth * magnitudes[bin]
-            total += magnitudes[bin]
+    /// Spectral centroid in Hz of an already-whitened spectrum — the closest
+    /// single number to how *bright* a sound is.
+    public func centroid(of spectrum: [Double]) -> Double {
+        let binWidth = Double(sampleRate) / Double(Self.windowSize)
+        var weighted: Double = 0
+        var total: Double = 0
+        for bin in 1..<spectrum.count {
+            weighted += Double(bin) * binWidth * spectrum[bin]
+            total += spectrum[bin]
         }
         return total > 1e-9 ? weighted / total : 0
-    }
-
-    /// One magnitude per band for a window of samples, each roughly `0…1` for
-    /// ordinary programme material — but **not clamped**, because the caller's
-    /// gain stage is what decides what counts as full scale.
-    ///
-    /// Fewer samples than ``windowSize`` are zero-padded; more are truncated.
-    public func levels(from samples: [Float]) -> [Float] {
-        var real = [Float](repeating: 0, count: Self.windowSize)
-        let count = min(samples.count, Self.windowSize)
-        real.replaceSubrange(0..<count, with: samples[0..<count])
-        vDSP_vmul(real, 1, window, 1, &real, 1, vDSP_Length(Self.windowSize))
-
-        var imaginary = [Float](repeating: 0, count: Self.windowSize)
-        var magnitudes = [Float](repeating: 0, count: Self.windowSize / 2)
-
-        real.withUnsafeMutableBufferPointer { realPointer in
-            imaginary.withUnsafeMutableBufferPointer { imaginaryPointer in
-                var split = DSPSplitComplex(realp: realPointer.baseAddress!,
-                                            imagp: imaginaryPointer.baseAddress!)
-                vDSP_fft_zip(fftSetup, &split, 1, log2n, FFTDirection(FFT_FORWARD))
-                vDSP_zvabs(&split, 1, &magnitudes, 1, vDSP_Length(Self.windowSize / 2))
-            }
-        }
-
-        // Normalise out the transform length so the scale does not depend on
-        // the window size, then take each band's mean.
-        var scale = 2 / Float(Self.windowSize)
-        vDSP_vsmul(magnitudes, 1, &scale, &magnitudes, 1, vDSP_Length(magnitudes.count))
-
-        return bandBins.enumerated().map { index, range in
-            let slice = magnitudes[range.lower...range.upper]
-            var mean: Float = 0
-            vDSP_meanv(Array(slice), 1, &mean, vDSP_Length(slice.count))
-            return mean * bandWeights[index]
-        }
     }
 }
