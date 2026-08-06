@@ -54,6 +54,17 @@ public final class GloriousMouse {
     /// that something landed inside the documented `[123, 167]` window (doc §3).
     public private(set) var lastConfigObservedLength: Int?
 
+    /// Called when a matching vendor collection appears and is opened.
+    public var onConnect: (() -> Void)?
+    /// Called when the open collection is removed.
+    public var onDisconnect: (() -> Void)?
+    /// Called when a collection appeared but could not be opened.
+    public var onOpenFailure: ((GloriousMouseHIDError) -> Void)?
+
+    private var isStarted = false
+    private var scheduledRunLoop: CFRunLoop?
+    private var scheduledMode: CFRunLoopMode = .defaultMode
+
     public init() {
         // `kIOHIDManagerOptionIndependentDevices` keeps `IOHIDManagerOpen` from
         // propagating to every VID/PID match — which would open the pointer
@@ -92,6 +103,77 @@ public final class GloriousMouse {
             self.device = nil
         }
         isConnected = false
+        if isStarted {
+            if let scheduledRunLoop {
+                IOHIDManagerUnscheduleFromRunLoop(manager, scheduledRunLoop, scheduledMode.rawValue)
+            }
+            IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+            isStarted = false
+        }
+        scheduledRunLoop = nil
+        scheduledMode = .defaultMode
+    }
+
+    // MARK: - Hot-plug driven use (app)
+
+    /// Schedules the HID manager on `runLoop` and starts delivering matching and
+    /// removal callbacks, opening a collection that is already attached.
+    ///
+    /// Nothing is sent: a mouse holds its own configuration in flash, and this
+    /// only makes the app notice one arriving. Unlike the keyboard there is no
+    /// input-report callback to register — the whole protocol is `GetFeature`
+    /// (doc §1.2), so a device appearing needs opening and nothing else.
+    public func start(on runLoop: RunLoop = .current, mode: CFRunLoopMode = .defaultMode) {
+        guard !isStarted else { return }
+        isStarted = true
+
+        IOHIDManagerSetDeviceMatching(manager, Self.matchingDictionary() as CFDictionary)
+        let context = Unmanaged.passUnretained(self).toOpaque()
+
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, { context, _, _, device in
+            guard let context else { return }
+            Unmanaged<GloriousMouse>.fromOpaque(context).takeUnretainedValue()
+                .handleDeviceMatched(device)
+        }, context)
+
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, { context, _, _, device in
+            guard let context else { return }
+            Unmanaged<GloriousMouse>.fromOpaque(context).takeUnretainedValue()
+                .handleDeviceRemoved(device)
+        }, context)
+
+        let cfRunLoop = runLoop.getCFRunLoop()
+        scheduledRunLoop = cfRunLoop
+        scheduledMode = mode
+        IOHIDManagerScheduleWithRunLoop(manager, cfRunLoop, mode.rawValue)
+        // Opens the manager only: with independent devices this does not open
+        // any matched collection, which matters here more than on the keyboard —
+        // two of this device's three collections carry real mouse input.
+        let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        if result != kIOReturnSuccess {
+            onOpenFailure?(.openFailed(result))
+        }
+    }
+
+    private func handleDeviceMatched(_ candidate: IOHIDDevice) {
+        guard device == nil, Self.isVendorInterface(candidate) else { return }
+        let result = IOHIDDeviceOpen(candidate, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard result == kIOReturnSuccess else {
+            onOpenFailure?(.openFailed(result))
+            return
+        }
+        device = candidate
+        isConnected = true
+        onConnect?()
+    }
+
+    private func handleDeviceRemoved(_ removed: IOHIDDevice) {
+        guard let device, device == removed else { return }
+        self.device = nil
+        isConnected = false
+        lastConfigTransferLength = nil
+        lastConfigObservedLength = nil
+        onDisconnect?()
     }
 
     /// Whether a matching vendor collection is attached. Does not open it.

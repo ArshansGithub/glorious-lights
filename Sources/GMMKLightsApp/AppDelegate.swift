@@ -1,10 +1,21 @@
 import AppKit
 import GMMKProtocol
+import GloriousMouseProtocol
 
-/// Status-item menu: effect picker, brightness, speed, colour, connection state.
+/// Status-item menu for both devices: the keyboard's effect picker, brightness,
+/// speed, colour and switch compensation, then the mouse's own section.
+///
+/// The two halves share nothing but the menu and the colour panel. Keyboard
+/// state is mirrored in `UserDefaults` because the app drives it; mouse state is
+/// read back from the device before every draw because the mouse owns it. Each
+/// section hides itself when its device is absent.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let controller = KeyboardController()
+    private let mouseController = MouseController()
+    private lazy var mouseSection = MouseMenuSection(controller: mouseController) {
+        [weak self] in self?.presentColorPanel(for: .mouse)
+    }
     private var settings = Settings()
 
     private var statusItem: NSStatusItem!
@@ -18,8 +29,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                              action: nil, keyEquivalent: "")
     /// Advisory note under the colour row, shown only for red-heavy colours.
     private let redHintItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    /// True while the shared `NSColorPanel` is targeted at this delegate.
-    private var ownsColorPanel = false
+    /// Which device the shared `NSColorPanel` is currently editing, or `nil`
+    /// when this delegate is not driving it. One panel, two devices, so the
+    /// target has to be remembered rather than inferred.
+    private var colorPanelTarget: ColorPanelTarget?
+
+    private enum ColorPanelTarget {
+        case keyboard
+        case mouse
+    }
+
+    /// How long the colour panel must be still before a mouse colour is sent.
+    static let mouseColorDebounce: TimeInterval = 0.150
+    private var pendingMouseColor: DispatchWorkItem?
     /// Kept across openings so the tuner reopens with its state intact.
     private lazy var tuner = SwitchCompensationWindowController(controller: controller)
 
@@ -49,11 +71,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // own settings in flash, and pushing our restored UI state at login
         // would clobber whatever the user last set by other means.
         controller.start()
+
+        // The mouse is read, never written, on connect: its settings live in its
+        // own flash too, and the menu is drawn from what it reports.
+        mouseController.onStatusChange = { [weak self] in self?.mouseSection.refresh() }
+        mouseController.start()
+
         refreshConnectionItem()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         controller.stop()
+        mouseController.stop()
         settings.save()
     }
 
@@ -109,7 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(row(speedRow))
 
-        colorRow.onClick = { [weak self] in self?.presentColorPanel() }
+        colorRow.onClick = { [weak self] in self?.presentColorPanel(for: .keyboard) }
         menu.addItem(row(colorRow))
 
         // Advisory, never blocking: a red-heavy colour is the one case where a
@@ -126,6 +155,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(redHintItem)
 
         menu.addItem(switchFriendlyItem())
+
+        mouseSection.install(in: menu)
         menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "Quit GMMK Lights",
@@ -228,6 +259,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         refreshConnectionItem()
         refreshEnablement()
+        mouseSection.refresh()
     }
 
     // MARK: - Actions
@@ -307,31 +339,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.setRainbow(settings.rainbow)
     }
 
-    private func presentColorPanel() {
+    /// Opens the shared colour panel pointed at one device or the other.
+    ///
+    /// There is only one `NSColorPanel` in the system, so the two devices take
+    /// turns: whichever asked last owns it, and ``colorPanelTarget`` is what
+    /// routes the continuous updates. Retargeting mid-drag would otherwise send
+    /// a mouse colour to the keyboard.
+    private func presentColorPanel(for target: ColorPanelTarget) {
         let panel = NSColorPanel.shared
         panel.isContinuous = true
-        panel.color = nsColor(settings.color)
+        switch target {
+        case .keyboard:
+            panel.color = nsColor(settings.color)
+        case .mouse:
+            panel.color = mouseSection.currentColor
+                .map { NSColor(srgbRed: CGFloat($0.red) / 255,
+                               green: CGFloat($0.green) / 255,
+                               blue: CGFloat($0.blue) / 255,
+                               alpha: 1) }
+                ?? nsColor(settings.color)
+        }
         panel.setTarget(self)
         panel.setAction(#selector(colorPanelChanged(_:)))
-        ownsColorPanel = true
+        colorPanelTarget = target
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
     }
 
     /// Detaches (and hides) the shared colour panel if we are the one driving it.
     private func dismissColorPanel() {
-        guard ownsColorPanel, NSColorPanel.sharedColorPanelExists else {
-            ownsColorPanel = false
+        guard colorPanelTarget != nil, NSColorPanel.sharedColorPanelExists else {
+            colorPanelTarget = nil
             return
         }
         let panel = NSColorPanel.shared
         panel.setTarget(nil)
         panel.setAction(nil)
         if panel.isVisible { panel.orderOut(nil) }
-        ownsColorPanel = false
+        colorPanelTarget = nil
     }
 
     @objc private func colorPanelChanged(_ sender: NSColorPanel) {
+        switch colorPanelTarget {
+        case .keyboard: keyboardColorPanelChanged(sender)
+        case .mouse:    mouseColorPanelChanged(sender)
+        case nil:       break
+        }
+    }
+
+    private func keyboardColorPanelChanged(_ sender: NSColorPanel) {
         // The row can be disabled while the panel is still on screen.
         guard settings.compensated || settings.mode.usesSolidColor else { return }
         guard let rgb = self.rgb(from: sender.color) else { return }
@@ -348,6 +404,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // One call either way: an active profile turns this into a per-key
         // paint, a neutral one into the global colour write.
         controller.setColor(rgb, compensation: profile)
+    }
+
+    /// A mouse colour change is a read-modify-write of the whole 520-byte blob
+    /// plus a read-back, so a continuous drag is debounced rather than
+    /// throttled: the mouse only needs the colour the user settles on, and the
+    /// intermediate ones would each cost two feature transfers.
+    private func mouseColorPanelChanged(_ sender: NSColorPanel) {
+        guard let effect = mouseSection.colorEditableEffect else { return }
+        guard let rgb = self.rgb(from: sender.color) else { return }
+        let color = MouseRGB(red: rgb.red, green: rgb.green, blue: rgb.blue)
+        pendingMouseColor?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingMouseColor = nil
+            guard color != self.mouseSection.currentColor else { return }
+            self.mouseController.setColor(color, for: effect)
+        }
+        pendingMouseColor = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.mouseColorDebounce, execute: item)
     }
 
     // MARK: - Colour conversion
