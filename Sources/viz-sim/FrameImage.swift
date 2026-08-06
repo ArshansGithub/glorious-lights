@@ -30,16 +30,33 @@ enum FrameImage {
         return CGSize(width: width, height: height)
     }
 
-    /// Writes one PNG. `colors` is indexed as the renderer produces it: offset
-    /// `n` is LED index `n + GMMKKeyMap.minLEDIndex`.
+    /// Renders one frame to an image. `colors` is indexed as the renderer
+    /// produces it: offset `n` is LED index `n + GMMKKeyMap.minLEDIndex`.
+    static func image(colors: [RGB]) throws -> CGImage {
+        try draw(colors: colors)
+    }
+
+    /// Writes one PNG.
     static func write(colors: [RGB], to url: URL) throws {
+        let image = try draw(colors: colors)
+        guard let destination = CGImageDestinationCreateWithURL(
+            url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+            throw SimError.imageFailed(url.path)
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw SimError.imageFailed(url.path)
+        }
+    }
+
+    private static func draw(colors: [RGB]) throws -> CGImage {
         let size = imageSize
         guard let context = CGContext(data: nil,
                                       width: Int(size.width), height: Int(size.height),
                                       bitsPerComponent: 8, bytesPerRow: 0,
                                       space: CGColorSpaceCreateDeviceRGB(),
                                       bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
-            throw SimError.imageFailed(url.path)
+            throw SimError.imageFailed("bitmap context")
         }
 
         // Dark background: the board is unlit plastic, and a white page would
@@ -89,14 +106,9 @@ enum FrameImage {
             }
         }
 
-        guard let image = context.makeImage(),
-              let destination = CGImageDestinationCreateWithURL(
-                url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
-            throw SimError.imageFailed(url.path)
+        guard let image = context.makeImage() else {
+            throw SimError.imageFailed("makeImage")
         }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            throw SimError.imageFailed(url.path)
-        }
+        return image
     }
 }
