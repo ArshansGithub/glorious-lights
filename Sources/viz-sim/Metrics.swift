@@ -403,7 +403,10 @@ struct Metrics {
                 deltaP95 <= scaled(0.22))
         }
 
-        if signal.isRhythmic, hasLatency, perOnsetMode, assertLatency {
+        // …and M3's rise threshold is an absolute 0.05 of board-mean lightness,
+        // so it is subject to the same output gain and is likewise asked at
+        // unity.
+        if signal.isRhythmic, hasLatency, perOnsetMode, assertLatency, assertLiveliness {
             add("M3 latency median", latencyMedian, "≤ 2.0 fr", latencyMedian <= 2.0, format: "%.2f")
             add("M3 latency p90", latencyP90, "≤ 3.5 fr", latencyP90 <= 3.5, format: "%.2f")
             add("M3 miss rate", missRate, "≤ 5 %", missRate <= 0.05)
@@ -548,7 +551,17 @@ struct Metrics {
             add("M9b dropContrast", accumulation.dropContrast, "≥ 0.18",
                 accumulation.dropContrast >= 0.18)
         }
-        if let ceiling = signal.deadFractionCeiling, accumulation.hasDead {
+        if let ceiling = signal.deadFractionCeiling, accumulation.hasDead,
+           assertLiveliness, !signal.isClick {
+            // Not asserted on the `/quiet` arm, for the same reason M2's lower
+            // bound is not: the user's sensitivity is a monotone output gain
+            // applied after the interlock, so "is the board dark" scales with it
+            // by construction and the question is asked at unity gain. Not
+            // asserted on the click cases either: their input is a 12 ms burst
+            // on digital silence, so the run's own p20 of RMS *is* silence and
+            // every gap qualifies as "music is playing" — and on
+            // `click-120-gap` the board is required to go dark, by M8's own
+            // phantom-beat clause.
             add("M9c DeadFrac", accumulation.deadFraction,
                 String(format: "≤ %.2f", ceiling), accumulation.deadFraction <= ceiling)
         }

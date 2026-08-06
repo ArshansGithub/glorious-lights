@@ -596,7 +596,12 @@ public final class ModeRenderer {
             // columns the meter has not reached alive — a meter whose unlit
             // columns are black turns its own swing into a per-key on→off→on
             // cycle at the beat rate.
-            field.shape[column] = 0.45 + 0.55 * edge
+            // The bed floor under the arms is 0.62, not 0.45: a meter that only
+            // occasionally reaches its outermost columns starves them over a
+            // run, and M10d bounds every column to within 0.5…1.8× the board's
+            // own column mean. The arms still carry the meter's shape; what the
+            // floor buys is that an unreached column is dim rather than absent.
+            field.shape[column] = 0.62 + 0.38 * edge
             var value = (0.10 + 0.55 * level) * edge
             if abs(distance) <= 1.5 { value += kick * 0.5 }
             if abs(abs(distance) - reach) < 1.2 { value += snare * 0.5 }
