@@ -35,6 +35,8 @@ public struct QuantileTracker: Equatable, Sendable {
 
     private var estimate: Double = 0
     private var seeded = false
+    /// Seconds of history the estimate has actually seen, for the warm-start.
+    private var elapsed: Double = 0
 
     public init(percentile: Double, window: Double) {
         self.percentile = percentile
@@ -43,15 +45,53 @@ public struct QuantileTracker: Equatable, Sendable {
 
     public var value: Double { estimate }
 
+    /// **A seeding transient, not a shorter window.**
+    ///
+    /// `estimate` is seeded from the *first sample*, and a Robbins–Monro
+    /// estimator then walks from there to its estimand at a rate set by
+    /// `window`. With a 60 s window that walk is 0.55 dB/s, so a seed 16 dB
+    /// away takes half a minute to work off. Measured on `ballad-72`: `p05` was
+    /// still falling when the run ended, `E` ramped 0.116 → 0.697 across the
+    /// whole case, `Σ` reached 0.123, and the bed sat under §6.3's rise
+    /// threshold for most of it — 20 % of playing frames dark against M9c's
+    /// 1 % bound. The board was not failing to accumulate; it was still working
+    /// out what "loud" meant.
+    ///
+    /// The fix has to be careful about *which* problem it solves. Running the
+    /// estimator on the history it has for as long as it likes — the textbook
+    /// bias correction — converges beautifully and then keeps a short window
+    /// for as long as the run is short, which is §11.0's defect exactly: a 16 s
+    /// build gets normalised while it is happening. Measured, that is not
+    /// hypothetical: it took `build-drop`'s `rho_build` from 42 failures to all
+    /// 70 and `dropContrast` from 16 to 35.
+    ///
+    /// So the acceleration is confined to the first ``seedSeconds``, which is
+    /// far shorter than any structure the display is meant to show. Inside it
+    /// the estimate travels far enough to reach any plausible level from any
+    /// seed (the step integrates to `rate · ln(seedSeconds / dt)` ≈ 170 dB);
+    /// after it the step is exactly what it always was, so nothing about how
+    /// slow structure is tracked changes. It converts a *seed* into an
+    /// *estimate* and does nothing else.
+    private var effectiveWindow: Double {
+        elapsed < Self.seedSeconds ? max(elapsed, 1e-3) : window
+    }
+
+    /// How long the estimator is allowed to run on its own short history before
+    /// its real window takes over. Two seconds is longer than a bar at any
+    /// tempo the tracker will see and far shorter than the PHRASE layer, so no
+    /// displayed timescale is inside it.
+    public static let seedSeconds: Double = 2.0
+
     @discardableResult
     public mutating func update(_ sample: Double, dt: Double) -> Double {
         let x = max(sample, 0)
+        elapsed += max(dt, 0)
         guard seeded else {
             seeded = true
             estimate = max(x, Self.floor)
             return estimate
         }
-        let step = min(max(dt, 0) / max(window, 1e-6), 0.5) * Self.rate
+        let step = min(max(dt, 0) / effectiveWindow, 0.5) * Self.rate
         let direction = x > estimate ? percentile : -(1 - percentile)
         estimate = max(Self.floor, estimate * exp(step * direction))
         return estimate
@@ -60,6 +100,7 @@ public struct QuantileTracker: Equatable, Sendable {
     public mutating func reset() {
         estimate = 0
         seeded = false
+        elapsed = 0
     }
 
     /// A numerical guard far below any converter's own noise floor, used only to
