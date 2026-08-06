@@ -23,6 +23,9 @@ public enum GloriousMouseHIDError: Error, CustomStringConvertible {
     case configReadNotEchoed(expected: UInt8, got: UInt8)
     /// The device returned fewer bytes than any documented config size.
     case configReadTooShort(Int)
+    /// A blob was handed to ``GloriousMouse/writeConfig(_:)`` with something
+    /// other than `0x11`/`0x21`/`0x31` in byte `0x01`.
+    case configWriteNotAProfile(UInt8)
     /// A blob was handed to ``GloriousMouse/writeConfig(_:)`` without the
     /// `configSize − 8` write marker at byte `0x03`.
     case blobNotMarkedForWrite
@@ -77,6 +80,13 @@ public enum GloriousMouseHIDError: Error, CustomStringConvertible {
                 \(GloriousMouseDevice.configSizeMin)…\(GloriousMouseDevice.configSizeMax). \
                 Something other than the config blob answered.
                 """
+        case .configWriteNotAProfile(let command):
+            return String(format: """
+                Refusing to write a configuration blob whose byte 0x01 is 0x%02x. That byte \
+                says which profile is being written and must be 0x11, 0x21 or 0x31 \
+                (docs/mouse-protocol.md §4); anything else is not a blob this device \
+                described.
+                """, command)
         case .blobNotMarkedForWrite:
             return """
                 Refusing to write a blob whose byte 0x03 is 0x00. That value means "read"; the \

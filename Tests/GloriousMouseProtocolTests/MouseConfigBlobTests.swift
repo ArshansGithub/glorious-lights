@@ -142,6 +142,20 @@ final class MouseConfigBlobTests: XCTestCase {
         XCTAssertEqual(blob.inferredConfigSize, GloriousMouseDevice.configSizeMax)
     }
 
+    /// A length outside `[123, 167]` is not a config size — 520 is IOKit
+    /// echoing the buffer size — so it must not be clamped into the window and
+    /// presented as a measurement.
+    func testObservedLengthOutsideTheWindowIsDiscardedNotClamped() throws {
+        var report = MouseConfigBlob.empty().bytes
+        report[0x80] = 0x01
+        for bogus in [0, 1, 122, 168, 520] {
+            let blob = try MouseConfigBlob(report: report, observedReadLength: bogus)
+            XCTAssertNil(blob.observedConfigSize, "\(bogus) is not an observation")
+            XCTAssertEqual(blob.effectiveConfigSize, blob.inferredConfigSize,
+                           "\(bogus) must fall back to the inference, not clamp to 167")
+        }
+    }
+
     func testObservedReadLengthWinsOverInference() throws {
         var report = MouseConfigBlob.empty().bytes
         report[0x80] = 0x01
@@ -229,12 +243,20 @@ final class MouseConfigBlobTests: XCTestCase {
                        MouseRGB(red: 0x11, green: 0x22, blue: 0x33))
     }
 
-    func testRBGDecodingIsNotAccidentallySymmetric() {
-        let color = MouseRGB(rbgBytes: [0x01, 0x02, 0x03])
+    func testRBGDecodingIsNotAccidentallySymmetric() throws {
+        let color = try XCTUnwrap(MouseRGB(rbgBytes: [0x01, 0x02, 0x03]))
         XCTAssertEqual(color.red, 0x01)
         XCTAssertEqual(color.blue, 0x02)
         XCTAssertEqual(color.green, 0x03)
         XCTAssertEqual(color.rbgBytes, [0x01, 0x02, 0x03])
+    }
+
+    /// A public initializer that traps turns a caller's slicing mistake into a
+    /// crash; an RBG triple that is not three bytes is now `nil`.
+    func testRBGDecodingRejectsWrongLengths() {
+        XCTAssertNil(MouseRGB(rbgBytes: []))
+        XCTAssertNil(MouseRGB(rbgBytes: [0x01, 0x02]))
+        XCTAssertNil(MouseRGB(rbgBytes: [0x01, 0x02, 0x03, 0x04]))
     }
 
     func testSixConstantColorsRoundTripIndependently() throws {
@@ -481,6 +503,35 @@ final class MouseConfigBlobTests: XCTestCase {
         XCTAssertTrue(text.contains("#ff8822"))
         XCTAssertTrue(text.contains("1200"))
         XCTAssertTrue(text.contains("2 mm"))
+    }
+
+    /// Guessing the sensor when decoding mis-displays a value; guessing it when
+    /// encoding stores the wrong raw byte in flash (doc §6).
+    func testWritingADPIStageRefusesAnUnknownSensor() {
+        var blob = makeBlob()
+        blob.setByte(0x77, at: MouseConfigBlob.Offset.sensor)
+        XCTAssertNil(blob.sensor)
+        // Reading still works, on the documented PMW3360 scaling.
+        XCTAssertEqual(blob.dpiStages[0].x, 1200)
+        XCTAssertThrowsError(try blob.setDPIStage(MouseDPIStage(dpi: 800), at: 0)) { error in
+            guard case MouseFieldError.unknownSensor(0x77) = error else {
+                return XCTFail("expected unknownSensor, got \(error)")
+            }
+        }
+        // And nothing was written.
+        XCTAssertEqual(blob.bytes[MouseConfigBlob.Offset.dpiStages], 0x0B)
+    }
+
+    /// Slugs come from display names, so the obvious short names have to be
+    /// aliases or they resolve to nothing.
+    func testEffectParsingAcceptsTheObviousShortNames() {
+        XCTAssertEqual(MouseRGBEffect.parse("single"), .single)
+        XCTAssertEqual(MouseRGBEffect.parse("Single Colour"), .single)
+        XCTAssertEqual(MouseRGBEffect.parse("breathing7"), .breathing7)
+        XCTAssertEqual(MouseRGBEffect.parse("breathing1"), .breathing1)
+        XCTAssertEqual(MouseRGBEffect.parse("spectrum"), .spectrumBreathing)
+        XCTAssertEqual(MouseRGBEffect.parse("constant"), .constant)
+        XCTAssertNil(MouseRGBEffect.parse("unicorn"))
     }
 
     func testHexDumpIsSixteenBytesPerRow() {

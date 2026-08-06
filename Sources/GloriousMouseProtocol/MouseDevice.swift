@@ -116,6 +116,11 @@ public enum MouseSensor: UInt8, CaseIterable, Sendable {
     }
 
     /// Highest DPI the sensor accepts.
+    ///
+    /// Only the PMW3360's 12000 is in `docs/mouse-protocol.md` (§6); the other
+    /// three are the sensors' published maxima and are **not** doc-sourced.
+    /// They matter only as the clamp in ``raw(dpi:)`` for a unit that is not
+    /// the Model O, which this project has never seen.
     public var maximumDPI: Int {
         switch self {
         case .pmw3360, .pmw3389: return 12000

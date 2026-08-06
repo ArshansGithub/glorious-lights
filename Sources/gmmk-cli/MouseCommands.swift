@@ -22,10 +22,13 @@ let mouseUsage = """
       dump <file> [profile]    Read a profile, write the raw 520-byte report to <file>,
                                and print the decode. TAKE THIS BEFORE ANYTHING WRITES —
                                it is the only way back to the mouse's current settings.
-      restore <file> [--config-size N] --yes
+                               Refuses to overwrite an existing file.
+      restore <file> --config-size N --yes
                                Write a previously dumped blob back. The only writing
                                subcommand. Prints everything it is about to do and
-                               refuses without --yes.
+                               refuses without --yes. --config-size is required: it
+                               sets byte 0x03 (= N - 8), the byte that decides whether
+                               the write is accepted at all. `info` prints what to use.
 
       profile is 1, 2 or 3 (default 1).
 
@@ -124,6 +127,13 @@ func runMouseCommand(_ arguments: [String]) -> Never {
                          + "(%04x:%04x, usage page 0x%04x usage 0x%02x)",
                          GloriousMouse.vendorID, GloriousMouse.productID,
                          GloriousMouse.vendorUsagePage, GloriousMouse.vendorUsage))
+            let matches = GloriousMouse.vendorInterfaceCount()
+            if matches > 1 {
+                print("\(matches) collections match. This CLI does not probe for the one that "
+                      + "answers 05 11 00 00 00 00 (docs/mouse-protocol.md §1.1); it opens the "
+                      + "first in registry order. If reads fail with a transport error rather "
+                      + "than a permissions error, that is the likely reason.")
+            }
             exit(ExitCode.ok.rawValue)
         } else {
             printErr(GloriousMouseHIDError.deviceNotFound.description)
@@ -153,7 +163,18 @@ func runMouseCommand(_ arguments: [String]) -> Never {
             printMouseDeviceFacts(mouse)
             let blob = try mouse.readConfig(profile: profile)
             let url = URL(fileURLWithPath: path)
-            try Data(blob.bytes).write(to: url)
+            // `.withoutOverwriting`: this file is the only way back to the
+            // mouse's current settings, so a second dump must not silently
+            // replace the first one.
+            do {
+                try Data(blob.bytes).write(to: url, options: .withoutOverwriting)
+            } catch {
+                mouse.close()
+                fail("cannot write '\(url.path)': \(error.localizedDescription). "
+                     + "`mouse dump` never overwrites an existing file — a dump is the only "
+                     + "way back to the mouse's current settings. Choose another path.",
+                     .usage)
+            }
             print("")
             print("wrote \(blob.bytes.count) raw bytes to \(url.path)")
             print("")
@@ -218,17 +239,35 @@ func runMouseCommand(_ arguments: [String]) -> Never {
 
         // The dump carries the read marker (0x00 at byte 0x03), so a literally
         // verbatim write would be a no-op. The bytes are restored verbatim; only
-        // the write marker is stamped, and its value is the open question of
-        // doc §11 item 1 — hence the explicit override and the printed source.
-        let configSize = configSizeOverride ?? saved.inferredConfigSize
+        // the write marker is stamped — and byte 0x03 is what decides whether
+        // the device accepts the write at all (doc §4, §11 item 1).
+        //
+        // There is deliberately no default. The trailing-zero inference is a
+        // lower bound: any zero at the tail of the real config subtracts from
+        // it, so a 131-byte config with a zero `unknown4` infers 130 and marks
+        // 0x7A where both sources would say 0x7B. A guess that quiet has no
+        // business being the default path of the one subcommand that writes.
+        guard let configSize = configSizeOverride else {
+            fail("""
+                `mouse restore` needs --config-size N. Byte 0x03 of the write is \
+                <config size> - 8, and that byte is what decides whether the device accepts \
+                the write at all (docs/mouse-protocol.md §4).
+
+                Run `gmmk-cli mouse info` first: if IOKit reports a transfer length inside \
+                \(GloriousMouseDevice.configSizeMin)…\(GloriousMouseDevice.configSizeMax), \
+                that is the answer. If it does not, the candidates are 131 (OpenRGB hardcodes \
+                the resulting marker 0x7b for this device) and 167 \
+                (SINOWEALTH_CONFIG_SIZE_MAX) — §11 item 1. This file's trailing zeros begin \
+                at \(saved.inferredConfigSize), which is a lower bound, not a measurement.
+                """, .usage)
+        }
         let blob = saved.preparedForWrite(profile: profile, configSize: configSize)
 
         print("restore \(path)")
         print("  profile:      \(profile.displayName) (byte 1 = "
               + String(format: "0x%02x", profile.rawValue) + ")")
-        print("  config size:  \(configSize)"
-              + (configSizeOverride == nil ? "  (inferred from trailing zeros — see §11 item 1)"
-                                           : "  (--config-size)"))
+        print("  config size:  \(configSize)  (--config-size; trailing zeros in this file "
+              + "begin at \(saved.inferredConfigSize))")
         print("  write marker: " + String(format: "0x%02x", blob.writeMarker)
               + " at byte 0x03")
         print("  payload:      \(blob.bytes.count) bytes, otherwise byte-for-byte as saved")
@@ -262,12 +301,32 @@ func runMouseCommand(_ arguments: [String]) -> Never {
 }
 
 /// Surfaces whether the transfer length was observable at all — doc §11 item 2
-/// asks exactly this, and bring-up should record the answer.
+/// asks exactly this, and bring-up should record the answer. The three outcomes
+/// are distinguishable here on purpose: "IOKit echoed the buffer size" is an
+/// answer to that question, not an absence of one.
 private func printTransferLengthNote(_ mouse: GloriousMouse) {
-    if let raw = mouse.lastConfigTransferLength {
-        print("IOKit reported \(raw) bytes transferred for the config read.")
+    guard let raw = mouse.lastConfigTransferLength else {
+        print("No config read has happened, so there is no transfer length to report.")
+        return
+    }
+    print("IOKit reported \(raw) bytes transferred for the config read.")
+    if mouse.lastConfigObservedLength == nil {
+        if raw == GloriousMouseDevice.configReportLength {
+            print("  That is exactly the buffer size it was handed, so it is not an "
+                  + "observation of the config size (§11 item 2 — answered: no).")
+        } else if raw == 0 {
+            print("  Zero bytes reported, so the length is not observable this way "
+                  + "(§11 item 2 — answered: no).")
+        } else {
+            print("  That is outside the documented "
+                  + "\(GloriousMouseDevice.configSizeMin)…\(GloriousMouseDevice.configSizeMax) "
+                  + "window, so it is not being treated as the config size.")
+        }
+        print("  The config size above is inferred from where the trailing zeros begin, "
+              + "which is a lower bound — see §11 item 1.")
     } else {
-        print("IOKit did not report a usable transfer length for the config read; "
-              + "the config size above is inferred from where the trailing zeros begin.")
+        print("  That lands inside the documented "
+              + "\(GloriousMouseDevice.configSizeMin)…\(GloriousMouseDevice.configSizeMax) "
+              + "window and settles §11 items 1 and 2. Use it as --config-size.")
     }
 }

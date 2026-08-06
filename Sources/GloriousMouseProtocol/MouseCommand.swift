@@ -184,6 +184,10 @@ public enum MouseISPGuard {
         case ispReportID(UInt8)
         case outOfScopeCommand(UInt8)
         case unknownCommand(UInt8)
+        /// A six-byte command frame whose byte 0 is not `0x05`.
+        case wrongCommandReportID(UInt8)
+        /// A command frame too short to be checked at all.
+        case malformedCommandReport(Int)
 
         public var description: String {
             switch self {
@@ -214,6 +218,21 @@ public enum MouseISPGuard {
                     checksum protection and the destructive verbs sit amid the safe ones, so \
                     unknown bytes are never sent.
                     """, byte)
+            case .wrongCommandReportID(let id):
+                return String(format: """
+                    Refusing to send a six-byte command frame addressed to feature report \
+                    0x%02x. The command channel is report 0x%02x and nothing else \
+                    (docs/mouse-protocol.md §2); a six-byte frame on report 0x04 would be a \
+                    truncated write to the 520-byte configuration blob, and the safe-verb \
+                    allow-list below only means anything on report 5.
+                    """, id, GloriousMouseDevice.commandReportID)
+            case .malformedCommandReport(let count):
+                return String(format: """
+                    Refusing to send a %d-byte frame on the command channel: a report-5 frame \
+                    is exactly %d bytes, report ID included (docs/mouse-protocol.md §2). A \
+                    frame too short to carry a command byte cannot be checked, so it is \
+                    refused rather than passed through.
+                    """, count, GloriousMouseDevice.commandReportLength)
             }
         }
     }
@@ -223,10 +242,18 @@ public enum MouseISPGuard {
     /// Allow-list, not deny-list: anything that is not a documented safe verb is
     /// refused, because the deny-list alone would still let a typo through into
     /// unexplored command space.
+    ///
+    /// The **report ID is part of the check**, not context: byte 0 must be
+    /// `0x05`. A six-byte frame carrying `0x04` at byte 0 is not a command at
+    /// all — it is a truncated configuration write, and the config report's own
+    /// guards (520-byte length, write marker) live in the transport, not here.
+    /// Anything shorter than two bytes is refused rather than waved through,
+    /// because "nothing to check" is not "nothing wrong".
     public static func check(commandReport report: [UInt8]) -> Violation? {
-        guard let id = report.first else { return nil }
+        guard let id = report.first else { return .malformedCommandReport(report.count) }
         if forbiddenReportIDs.contains(id) { return .ispReportID(id) }
-        guard report.count >= 2 else { return nil }
+        guard id == GloriousMouseDevice.commandReportID else { return .wrongCommandReportID(id) }
+        guard report.count >= 2 else { return .malformedCommandReport(report.count) }
         let command = report[1]
         if forbiddenCommandBytes.contains(command) { return .ispCommand(command) }
         if outOfScopeCommandBytes.contains(command) { return .outOfScopeCommand(command) }

@@ -8,9 +8,10 @@ import GloriousMouseProtocol
 ///
 /// Finds the *vendor* HID collection — the one whose device usage pairs include
 /// usage page `0xFF00`, usage `0x01` — opens it non-seizing, and talks to it
-/// with FEATURE reports only. The pointer collection `(0x01, 0x02)` and the
-/// consumer collection are never opened: seizing the interface a mouse actually
-/// moves the cursor with is not something to risk on a lighting app.
+/// with FEATURE reports only. No other collection is ever opened: seizing the
+/// interface a mouse actually moves the cursor with is not something to risk on
+/// a lighting app. Doc §1.1 **[measured]** records this device's three usage
+/// pairs as `(0x01,0x06)`, `(0x0C,0x01)` and `(0xFF00,0x01)`.
 ///
 /// Everything here is synchronous. Unlike the keyboard there is no interrupt
 /// channel, no reply pacing and no run-loop scheduling: `SetReport` and
@@ -35,13 +36,23 @@ public final class GloriousMouse {
     public private(set) var isConnected = false
 
     /// Raw byte count `IOHIDDeviceGetReport` reported for the last config read,
-    /// before any interpretation.
+    /// before any interpretation — no nulling, no shift correction.
     ///
     /// Doc §11 item 2 asks whether macOS can observe this at all — IOKit takes
     /// the length as an in/out parameter, but whether the value coming back is
     /// the real transfer size or just the buffer size it was handed is
-    /// unverified on this device. Recorded verbatim so bring-up can settle it.
+    /// unverified on this device. Recorded verbatim so bring-up can settle it:
+    /// a value of 520 here **is** the answer to that question ("IOKit echoed
+    /// the buffer size"), and must not be reported as "nothing came back".
+    /// `nil` only means no config read has happened yet.
+    ///
+    /// Use ``lastConfigObservedLength`` for the interpreted value.
     public private(set) var lastConfigTransferLength: Int?
+
+    /// The last config read's transfer length *after* interpretation: `nil`
+    /// unless IOKit reported something other than the buffer size or zero and
+    /// that something landed inside the documented `[123, 167]` window (doc §3).
+    public private(set) var lastConfigObservedLength: Int?
 
     public init() {
         // `kIOHIDManagerOptionIndependentDevices` keeps `IOHIDManagerOpen` from
@@ -96,7 +107,10 @@ public final class GloriousMouse {
     ///
     /// Every frame passes ``MouseISPGuard`` first. That check is an allow-list:
     /// anything outside the documented safe verbs is refused, because the
-    /// bootloader's DFU verb `0x75` lives on this very report (doc §9).
+    /// bootloader's DFU verb `0x75` lives on this very report (doc §9). It also
+    /// pins byte 0 to report `0x05`, so this entry point cannot be used to put
+    /// a six-byte payload on the 520-byte config report and bypass
+    /// ``writeConfig(_:)``'s length, report-ID and write-marker guards.
     public func send(commandReport report: [UInt8]) throws {
         guard report.count == GloriousMouseDevice.commandReportLength else {
             throw GloriousMouseHIDError.invalidReportLength(
@@ -120,8 +134,7 @@ public final class GloriousMouse {
         let request = MouseCommandReport.make(command)
         try send(commandReport: request)
         let reply = try getFeature(reportID: GloriousMouseDevice.commandReportID,
-                                   length: GloriousMouseDevice.commandReportLength,
-                                   expectedCommandByte: command.rawValue).bytes
+                                   length: GloriousMouseDevice.commandReportLength).bytes
         guard MouseCommandReport.replyEchoes(command, in: reply) else {
             throw GloriousMouseHIDError.commandNotEchoed(sent: command.rawValue,
                                                          echoed: reply.count > 1 ? reply[1] : 0)
@@ -146,8 +159,7 @@ public final class GloriousMouse {
         let request = MouseCommandReport.readDebounce
         try send(commandReport: request)
         let reply = try getFeature(reportID: GloriousMouseDevice.commandReportID,
-                                   length: GloriousMouseDevice.commandReportLength,
-                                   expectedCommandByte: MouseCommand.debounce.rawValue).bytes
+                                   length: GloriousMouseDevice.commandReportLength).bytes
         return MouseCommandReport.debounceMilliseconds(fromReply: reply)
     }
 
@@ -162,14 +174,19 @@ public final class GloriousMouse {
         try send(commandReport: MouseCommandReport.readConfig(profile))
 
         let read = try getFeature(reportID: GloriousMouseDevice.configReportID,
-                                  length: GloriousMouseDevice.configReportLength,
-                                  expectedCommandByte: profile.rawValue)
-        lastConfigTransferLength = read.transferLength
+                                  length: GloriousMouseDevice.configReportLength)
+        lastConfigTransferLength = read.rawTransferLength
+
+        // Doc §3's length sanity check, on the only value that can carry it:
+        // libratbag rejects a config read outside [123, 167]. A report of 0 or
+        // of the buffer size is IOKit telling us nothing (doc §11 item 2), so
+        // only a length that is informative *and* too short is an error.
+        if let usable = read.usableTransferLength,
+           usable < GloriousMouseDevice.configSizeMin {
+            throw GloriousMouseHIDError.configReadTooShort(usable)
+        }
 
         var bytes = read.bytes
-        guard bytes.count == GloriousMouseDevice.configReportLength else {
-            throw GloriousMouseHIDError.configReadTooShort(bytes.count)
-        }
         bytes[MouseConfigBlob.Offset.reportID] = GloriousMouseDevice.configReportID
         guard bytes[MouseConfigBlob.Offset.command] == profile.rawValue else {
             throw GloriousMouseHIDError.configReadNotEchoed(
@@ -181,10 +198,11 @@ public final class GloriousMouse {
         // window. IOKit reporting back the buffer size it was handed (520) is
         // not an observation of the config size, and treating it as one would
         // put a nonsense write marker on the next write.
-        let observed = read.transferLength.flatMap { length -> Int? in
+        let observed = read.usableTransferLength.flatMap { length -> Int? in
             (GloriousMouseDevice.configSizeMin...GloriousMouseDevice.configSizeMax)
                 .contains(length) ? length : nil
         }
+        lastConfigObservedLength = observed
         return try MouseConfigBlob(report: bytes, observedReadLength: observed)
     }
 
@@ -208,6 +226,10 @@ public final class GloriousMouse {
                 reportID: blob.bytes[MouseConfigBlob.Offset.reportID],
                 expected: GloriousMouseDevice.configReportLength,
                 got: blob.bytes.count)
+        }
+        guard blob.profile != nil else {
+            throw GloriousMouseHIDError.configWriteNotAProfile(
+                blob.bytes[MouseConfigBlob.Offset.command])
         }
         guard blob.isMarkedForWrite else {
             throw GloriousMouseHIDError.blobNotMarkedForWrite
@@ -240,21 +262,33 @@ public final class GloriousMouse {
     private struct FeatureRead {
         /// Always `length` bytes, report ID restored at index 0.
         var bytes: [UInt8]
-        /// What IOKit said it transferred, `nil` if that was not informative.
-        var transferLength: Int?
+        /// What IOKit said it transferred, verbatim.
+        var rawTransferLength: Int
+        /// The same value corrected for a reinstated report-ID byte, or `nil`
+        /// when IOKit reported the buffer size or zero — neither of which is an
+        /// observation of anything (doc §11 item 2).
+        var usableTransferLength: Int?
     }
 
     /// `GetFeature`, normalising the two shapes macOS may hand back.
     ///
     /// IOKit fills a caller-sized buffer and it is not documented whether the
     /// leading report-ID byte is included for a numbered report. Both sources
-    /// this protocol comes from index the buffer *with* the ID at 0, so if the
-    /// reply comes back shifted — recognised by the expected command byte
-    /// sitting at index 0 instead of 1 — it is shifted back and the ID
-    /// reinstated, rather than having every offset in the file be conditional.
-    private func getFeature(reportID: UInt8,
-                            length: Int,
-                            expectedCommandByte: UInt8?) throws -> FeatureRead {
+    /// this protocol comes from index the buffer *with* the ID at 0, so a reply
+    /// that arrives without it is shifted back and the ID reinstated, rather
+    /// than having every offset in the file be conditional.
+    ///
+    /// **The shift decision is made on the report-ID byte alone**, never on the
+    /// expected command byte. The buffer is pre-seeded with `reportID` at index
+    /// 0, so index 0 still holding it means the device wrote payload from index
+    /// 1 (ID included); anything else means the payload started at index 0.
+    /// Keying on the command byte instead would (a) miss the shift whenever the
+    /// byte that lands at index 1 coincidentally equals the expected command —
+    /// silently misaligning every field of a 520-byte blob — and (b) make the
+    /// caller's `buf[1]` echo check tautological, since the shift would be the
+    /// very thing that put the expected byte there. Doc §2's `-EIO` oracle is
+    /// only worth anything if this layer cannot fake it.
+    private func getFeature(reportID: UInt8, length: Int) throws -> FeatureRead {
         guard let device, isConnected else { throw GloriousMouseHIDError.notConnected }
         if let violation = MouseISPGuard.check(reportID: reportID) {
             throw GloriousMouseHIDError.ispHazard(violation)
@@ -276,20 +310,20 @@ public final class GloriousMouse {
             throw GloriousMouseHIDError.getReportFailed(reportID: reportID, result)
         }
 
-        var transferLength: Int? = Int(reportLength)
-        if transferLength == length || transferLength == 0 {
-            // Indistinguishable from "IOKit handed back the buffer size", so it
-            // is not an observation of anything.
-            transferLength = nil
-        }
+        let rawTransferLength = Int(reportLength)
+        // A report equal to the buffer size, or zero, is indistinguishable from
+        // "IOKit handed back what it was given", so it is not an observation.
+        var usableTransferLength: Int? =
+            (rawTransferLength == length || rawTransferLength == 0) ? nil : rawTransferLength
 
-        if let expected = expectedCommandByte,
-           buffer.count >= 2, buffer[1] != expected, buffer[0] == expected {
+        if buffer.count >= 2, buffer[0] != reportID {
             // The ID was not included: shift right and reinstate it.
             buffer = [reportID] + buffer.dropLast()
-            transferLength = transferLength.map { $0 + 1 }
+            usableTransferLength = usableTransferLength.map { $0 + 1 }
         }
-        return FeatureRead(bytes: buffer, transferLength: transferLength)
+        return FeatureRead(bytes: buffer,
+                           rawTransferLength: rawTransferLength,
+                           usableTransferLength: usableTransferLength)
     }
 
     // MARK: - Matching
@@ -301,23 +335,56 @@ public final class GloriousMouse {
         ]
     }
 
-    /// Enumerates VID/PID matches and returns the one exposing `(0xFF00, 0x01)`.
+    /// Every VID/PID match exposing `(0xFF00, 0x01)`, in a stable order.
     ///
-    /// The usage pair cannot go in the matching dictionary: the collection's
-    /// *primary* usage on this device is the pointer pair, and the vendor pair
-    /// only appears in `DeviceUsagePairs`. Same filtering approach as
-    /// `GMMKKeyboard`.
+    /// The usage pair cannot go in the matching dictionary: the vendor pair is
+    /// one of three in `DeviceUsagePairs` and need not be the primary. Same
+    /// filtering approach as `GMMKKeyboard`.
+    ///
+    /// `IOHIDManagerCopyDevices` returns an unordered `Set`, so the candidates
+    /// are sorted by registry entry ID: two mice, or a unit exposing the vendor
+    /// pair on more than one collection, would otherwise be picked between
+    /// arbitrarily and differently on each run — and doc §1.1 says the
+    /// collection that answers must be found by probing, which this transport
+    /// does not do. A stable choice at least makes a failure reproducible.
+    static func vendorInterfaces(in manager: IOHIDManager) -> [IOHIDDevice] {
+        guard let set = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return [] }
+        return set.filter(isVendorInterface).sorted { registryID(of: $0) < registryID(of: $1) }
+    }
+
+    /// The IORegistry entry ID: unique per collection and stable for as long as
+    /// the device stays plugged in, which is what makes the sort above a
+    /// repeatable choice rather than a different arbitrary one each run.
+    private static func registryID(of device: IOHIDDevice) -> UInt64 {
+        let service = IOHIDDeviceGetService(device)
+        guard service != 0 else { return 0 }
+        var id: UInt64 = 0
+        guard IORegistryEntryGetRegistryEntryID(service, &id) == KERN_SUCCESS else { return 0 }
+        return id
+    }
+
     private static func findVendorInterface(in manager: IOHIDManager) -> IOHIDDevice? {
-        guard let set = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return nil }
-        return set.first(where: isVendorInterface)
+        vendorInterfaces(in: manager).first
+    }
+
+    /// How many collections currently match VID/PID *and* `(0xFF00, 0x01)`.
+    /// More than one means ``open()``'s choice is a guess: doc §1.1 says the
+    /// right collection is the one that answers `05 11 …`, and nothing here
+    /// probes for that.
+    public static func vendorInterfaceCount() -> Int {
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        IOHIDManagerSetDeviceMatching(manager, matchingDictionary() as CFDictionary)
+        return vendorInterfaces(in: manager).count
     }
 
     /// True if the device's usage pairs include usage page `0xFF00` usage `0x01`.
     ///
     /// Note there is **no fall-back to the primary usage** here, unlike the
     /// keyboard's equivalent. A device with no usage-pairs array would be
-    /// matched by its primary pair, and on this device the primary pair belongs
-    /// to the pointer collection — the one that must never be opened.
+    /// matched by whatever its primary pair happens to be, and on this device
+    /// two of the three measured pairs (doc §1.1) belong to collections that
+    /// carry real mouse input. Refusing to match rather than guessing is the
+    /// conservative choice; which pair is primary is not recorded anywhere.
     public static func isVendorInterface(_ device: IOHIDDevice) -> Bool {
         guard let pairs = IOHIDDeviceGetProperty(device, kIOHIDDeviceUsagePairsKey as CFString)
                 as? [[String: Any]] else {

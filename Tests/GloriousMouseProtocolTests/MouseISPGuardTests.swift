@@ -81,4 +81,25 @@ final class MouseISPGuardTests: XCTestCase {
         XCTAssertTrue(safe.isDisjoint(with: MouseISPGuard.forbiddenCommandBytes))
         XCTAssertTrue(safe.isDisjoint(with: MouseISPGuard.outOfScopeCommandBytes))
     }
+
+    /// The command channel is report 5 and nothing else. A six-byte frame with
+    /// 0x04 at byte 0 is a *truncated write to the 520-byte config report* —
+    /// `04 11 00 7b …` even carries a valid write marker at 0x03 — and it must
+    /// not be able to reach `SetFeature` through the command path, where none
+    /// of the config report's length/marker guards apply.
+    func testACommandFrameOnTheConfigReportIsRefused() {
+        XCTAssertEqual(MouseISPGuard.check(commandReport: [0x04, 0x11, 0x00, 0x7B, 0x00, 0x00]),
+                       .wrongCommandReportID(0x04))
+        for id: UInt8 in [0x00, 0x01, 0x04, 0x07, 0x0A, 0xFF] {
+            XCTAssertEqual(MouseISPGuard.check(commandReport: [id, 0x01, 0, 0, 0, 0]),
+                           .wrongCommandReportID(id),
+                           String(format: "report 0x%02x is not the command channel", id))
+        }
+    }
+
+    /// "Too short to check" is not "nothing wrong".
+    func testFramesTooShortToCheckAreRefused() {
+        XCTAssertEqual(MouseISPGuard.check(commandReport: []), .malformedCommandReport(0))
+        XCTAssertEqual(MouseISPGuard.check(commandReport: [0x05]), .malformedCommandReport(1))
+    }
 }

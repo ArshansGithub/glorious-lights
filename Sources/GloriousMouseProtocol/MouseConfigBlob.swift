@@ -159,8 +159,15 @@ public struct MouseConfigBlob: Equatable, Sendable {
     /// `[123, 167]` window — the only way to guess the config size on a
     /// transport that cannot report the transfer length (doc §11 item 2).
     ///
-    /// This is a *guess*. Prefer ``observedReadLength`` when the transport
-    /// supplied one.
+    /// This is a *guess, and a lower bound*: every trailing zero byte of the
+    /// real config subtracts from it. A 131-byte config whose `unknown4` byte
+    /// (`0x82`) happens to be zero infers 130, and a blob whose tail past the
+    /// effect bytes is zero infers the clamp floor of 123 — where both
+    /// libratbag's `size − 8` and OpenRGB's hardcoded literal would give
+    /// `0x7B`. Since byte `0x03` decides whether a write is accepted at all
+    /// (doc §4, §11 item 1), never write a marker derived from this without
+    /// saying out loud that that is what you are doing. Prefer
+    /// ``observedReadLength`` when the transport supplied one.
     public var inferredConfigSize: Int {
         let lastNonZero = bytes.lastIndex(where: { $0 != 0 }).map { $0 + 1 } ?? 0
         return min(max(lastNonZero, GloriousMouseDevice.configSizeMin),
@@ -169,13 +176,22 @@ public struct MouseConfigBlob: Equatable, Sendable {
 
     /// The config size to use for a write: the observed length if the transport
     /// could see one, otherwise the inference above.
-    public var effectiveConfigSize: Int {
-        if let observed = observedReadLength,
-           (GloriousMouseDevice.configSizeMin...GloriousMouseDevice.configReportLength)
-            .contains(observed) {
-            return min(observed, GloriousMouseDevice.configSizeMax)
-        }
-        return inferredConfigSize
+    ///
+    /// "Observed" means *inside the documented `[123, 167]` window* — the same
+    /// rule the transport applies (doc §3). A length outside it is not a short
+    /// config, it is evidence that something other than a config read answered
+    /// (520 is IOKit echoing the buffer size), so it is discarded rather than
+    /// clamped into range.
+    public var effectiveConfigSize: Int { observedConfigSize ?? inferredConfigSize }
+
+    /// ``observedReadLength`` if it lands inside the documented window, else
+    /// `nil`. Also what tells a caller whether ``effectiveConfigSize`` is a
+    /// measurement or a guess.
+    public var observedConfigSize: Int? {
+        guard let observed = observedReadLength,
+              (GloriousMouseDevice.configSizeMin...GloriousMouseDevice.configSizeMax)
+                .contains(observed) else { return nil }
+        return observed
     }
 
     // MARK: - Sensor, polling, flags
@@ -226,6 +242,9 @@ public struct MouseConfigBlob: Equatable, Sendable {
     /// All 8 slots decoded to DPI using the sensor's scaling. Slots beyond
     /// ``dpiSlotCount`` are still returned — a bring-up dump should show them.
     public var dpiStages: [MouseDPIStage] {
+        // A dump of an unknown unit should still show numbers; the PMW3360
+        // scaling is the one this device is documented to use (doc §6). The
+        // write side refuses instead — see `setDPIStage`.
         let sensor = self.sensor ?? .pmw3360
         let independent = hasIndependentXYDPI
         return (0..<GloriousMouseDevice.dpiSlotCount).map { slot in
@@ -245,7 +264,13 @@ public struct MouseConfigBlob: Equatable, Sendable {
         guard (0..<GloriousMouseDevice.dpiSlotCount).contains(slot) else {
             throw MouseFieldError.dpiSlotOutOfRange(slot)
         }
-        let sensor = self.sensor ?? .pmw3360
+        // No `?? .pmw3360` here, unlike the read side: guessing the sensor when
+        // decoding mis-displays a value, guessing it when encoding writes the
+        // wrong raw byte into flash. The two scalings differ by one step
+        // (doc §6), so a wrong guess is a silently wrong DPI.
+        guard let sensor = self.sensor else {
+            throw MouseFieldError.unknownSensor(sensorRawValue)
+        }
         let independent = hasIndependentXYDPI
         if !independent && !stage.isSymmetric {
             throw MouseFieldError.asymmetricDPIWithoutFlag
@@ -266,7 +291,8 @@ public struct MouseConfigBlob: Equatable, Sendable {
     public var dpiStageColors: [MouseRGB] {
         (0..<GloriousMouseDevice.dpiSlotCount).map { slot in
             let base = Offset.dpiStageColors + slot * 3
-            return MouseRGB(rbgBytes: bytes[base..<(base + 3)])
+            // Always in range: the array ends at 0x34 in a 520-byte blob.
+            return MouseRGB(rbgBytes: bytes[base..<(base + 3)]) ?? .black
         }
     }
 
@@ -300,7 +326,8 @@ public struct MouseConfigBlob: Equatable, Sendable {
         guard let array = effect.colorArray else { return nil }
         return (0..<array.count).map { i in
             let base = array.offset + i * 3
-            return MouseRGB(rbgBytes: bytes[base..<(base + 3)])
+            // Always in range: the last colour array ends at 0x80 (doc §5).
+            return MouseRGB(rbgBytes: bytes[base..<(base + 3)]) ?? .black
         }
     }
 
@@ -380,7 +407,9 @@ public struct MouseConfigBlob: Equatable, Sendable {
             lines.append("bytes returned: \(observed)")
         }
         lines.append("config size:    \(effectiveConfigSize)"
-                     + (observedReadLength == nil ? "  (inferred from trailing zeros)" : ""))
+                     + (observedConfigSize == nil
+                        ? "  (inferred from trailing zeros — a lower bound, see §11 item 1)"
+                        : ""))
         lines.append("sensor:         " + (sensor.map { "\($0.displayName) (\(hex($0.rawValue)))" }
                                            ?? "unknown (\(hex(sensorRawValue)))"))
         lines.append("polling rate:   " + (pollingRate.map { "\($0.hertz) Hz" }
@@ -439,6 +468,7 @@ public struct MouseConfigBlob: Equatable, Sendable {
 public enum MouseFieldError: Error, CustomStringConvertible {
     case dpiSlotOutOfRange(Int)
     case asymmetricDPIWithoutFlag
+    case unknownSensor(UInt8)
     case effectHasNoParameters(MouseRGBEffect)
     case effectHasNoColors(MouseRGBEffect)
     case tooManyColors(effect: MouseRGBEffect, given: Int, maximum: Int)
@@ -455,6 +485,13 @@ public enum MouseFieldError: Error, CustomStringConvertible {
                 of blob 0x0A) set, which changes the layout of the whole 16-byte stage array. \
                 Set the flag deliberately or give a symmetric stage.
                 """
+        case .unknownSensor(let raw):
+            return String(format: """
+                Blob byte 0x09 is 0x%02x, which is not a sensor any source documents. The DPI \
+                encoding depends on the sensor (docs/mouse-protocol.md §6), so writing a DPI \
+                stage here would guess the scaling and store the wrong raw byte. Reading is \
+                still fine.
+                """, raw)
         case .effectHasNoParameters(let effect):
             return "Effect \(effect.displayName) has no speed/brightness byte."
         case .effectHasNoColors(let effect):

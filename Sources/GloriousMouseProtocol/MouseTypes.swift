@@ -25,14 +25,16 @@ public struct MouseRGB: Equatable, Hashable, Sendable {
     /// The three bytes as the device stores them: red, **blue**, green.
     public var rbgBytes: [UInt8] { [red, blue, green] }
 
-    /// Decodes three device bytes in R, B, G order.
-    public init(rbgBytes bytes: ArraySlice<UInt8>) {
+    /// Decodes three device bytes in R, B, G order. `nil` for anything that is
+    /// not exactly three bytes — a public initializer that traps turns a
+    /// caller's slicing mistake into a crash.
+    public init?(rbgBytes bytes: ArraySlice<UInt8>) {
+        guard bytes.count == 3 else { return nil }
         let b = Array(bytes)
-        precondition(b.count == 3, "an RBG triple is exactly 3 bytes")
         self.init(red: b[0], green: b[2], blue: b[1])
     }
 
-    public init(rbgBytes bytes: [UInt8]) {
+    public init?(rbgBytes bytes: [UInt8]) {
         self.init(rbgBytes: bytes[...])
     }
 
@@ -135,11 +137,28 @@ public enum MouseRGBEffect: UInt8, CaseIterable, Sendable {
         displayName.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 
-    /// Resolves a slug, a display name, a decimal ID or a `0x`-prefixed hex ID.
+    /// Short names for the effects whose slug is an awkward mouthful, because
+    /// the slug is derived from the display name: `single` beats
+    /// `singlecolour`, `breathing7` beats `breathing7colours`.
+    static let aliases: [String: MouseRGBEffect] = [
+        "single": .single,
+        "singlecolor": .single,
+        "breathing": .breathing1,
+        "breathing1": .breathing1,
+        "breathing1color": .breathing1,
+        "breathing7": .breathing7,
+        "breathing7color": .breathing7,
+        "spectrum": .spectrumBreathing,
+        "constant": .constant,
+    ]
+
+    /// Resolves a slug, an alias, a display name, a decimal ID or a
+    /// `0x`-prefixed hex ID.
     public static func parse(_ input: String) -> MouseRGBEffect? {
         let trimmed = input.trimmingCharacters(in: .whitespaces)
         let normalized = trimmed.lowercased().filter { $0.isLetter || $0.isNumber }
         if let effect = allCases.first(where: { $0.slug == normalized }) { return effect }
+        if let effect = aliases[normalized] { return effect }
         if trimmed.lowercased().hasPrefix("0x"), let id = UInt8(trimmed.dropFirst(2), radix: 16) {
             return MouseRGBEffect(rawValue: id)
         }
