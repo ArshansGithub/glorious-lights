@@ -1,0 +1,258 @@
+import Foundation
+import GMMKHID
+import GMMKProtocol
+import GloriousVisualizer
+
+/// Runs the audio visualizer: microphone in, spectrum out, frames onto the
+/// keyboard.
+///
+/// ## Threads
+///
+/// Three, and the boundaries between them are the whole design.
+///
+/// * **AVAudioEngine's render thread** delivers sample buffers. It does the FFT
+///   and stores the result in ``latestLevels``. It never touches the transport
+///   and never blocks — a render thread that waits on USB drops audio.
+/// * **The render thread**, created here, owns its own ``GMMKKeyboard`` and its
+///   own run loop, because that class is one-thread-at-a-time by design. It
+///   loops: take the newest levels, smooth, paint, send, sleep the remainder of
+///   the frame.
+/// * **The main thread** starts and stops all of it and owns the UI.
+///
+/// The two hand-offs are a lock around ``latestLevels`` and a ``TransportLease``
+/// that stops the menu's own keyboard instance from sending while this one is
+/// running.
+///
+/// ## Coalescing rather than queueing
+///
+/// The audio thread *overwrites* the pending levels instead of appending to a
+/// queue. If the transport falls behind, the frames it missed are simply gone —
+/// which is what a live display wants. A queue would build a backlog and the
+/// bars would drift steadily further behind the music.
+///
+/// > TODO: the mouse's six LEDs could pulse to the beat alongside this. Not
+/// > built — the mouse's write path is a whole-blob read-modify-write, so it
+/// > cannot sustain a frame rate and would need its own much slower beat-driven
+/// > path rather than a share of this one.
+final class VisualizerController {
+
+    /// Frames per second to aim for. Fast enough to read as live, slow enough
+    /// that the echo-paced transport can keep up without the render loop
+    /// spending all its time waiting.
+    static let targetFrameRate: Double = 15
+
+    private let lease: TransportLease
+    private let capture = AudioCapture()
+
+    /// The visualizer's own transport, touched only from ``renderThread``.
+    private let keyboard = GMMKKeyboard()
+
+    private var analyzer: SpectrumAnalyzer?
+    private var renderThread: Thread?
+
+    /// Written by the audio thread, read by the render thread.
+    private let levelsLock = NSLock()
+    private var latestLevels: [Float]?
+
+    /// Set on the main thread, read by the render thread; guarded by its own
+    /// lock so a style change mid-frame cannot tear.
+    private let settingsLock = NSLock()
+    private var style: VisualizerStyle
+    private var themeColor: RGB
+    private var sensitivity: Double
+    private var autoGainEnabled: Bool
+
+    private var isStopping = false
+
+    /// Whether the visualizer is running. Main thread only.
+    private(set) var isRunning = false
+
+    /// Last error, for the menu to show. Main thread only.
+    private(set) var lastError: String?
+
+    /// Fires when ``isRunning`` or ``lastError`` changes.
+    var onStatusChange: (() -> Void)?
+
+    init(lease: TransportLease,
+         style: VisualizerStyle,
+         themeColor: RGB,
+         sensitivity: Double,
+         autoGain: Bool) {
+        self.lease = lease
+        self.style = style
+        self.themeColor = themeColor
+        self.sensitivity = sensitivity
+        self.autoGainEnabled = autoGain
+    }
+
+    // MARK: - Settings
+
+    func update(style: VisualizerStyle? = nil,
+                themeColor: RGB? = nil,
+                sensitivity: Double? = nil,
+                autoGain: Bool? = nil) {
+        settingsLock.lock()
+        if let style { self.style = style }
+        if let themeColor { self.themeColor = themeColor }
+        if let sensitivity { self.sensitivity = sensitivity }
+        if let autoGain { self.autoGainEnabled = autoGain }
+        settingsLock.unlock()
+    }
+
+    private var currentSettings: (style: VisualizerStyle, color: RGB,
+                                  sensitivity: Double, autoGain: Bool) {
+        settingsLock.lock()
+        defer { settingsLock.unlock() }
+        return (style, themeColor, sensitivity, autoGainEnabled)
+    }
+
+    // MARK: - Lifecycle
+
+    /// Starts capture and rendering. Main thread.
+    ///
+    /// - Returns: `false` if it could not start, with ``lastError`` set.
+    @discardableResult
+    func start() -> Bool {
+        guard !isRunning else { return true }
+        guard lease.acquire(.visualizer) else {
+            return fail("Something else is driving the keyboard right now.")
+        }
+
+        let analyzer = SpectrumAnalyzer(sampleRate: Float(capture.sampleRate),
+                                        bandCount: VisualizerLayout.columns.count)
+        self.analyzer = analyzer
+        capture.onSamples = { [weak self] samples in
+            guard let self else { return }
+            // The FFT happens here, on the audio thread, so the render thread
+            // only ever does arithmetic on 17 floats before sending.
+            let levels = analyzer.levels(from: samples)
+            self.levelsLock.lock()
+            self.latestLevels = levels
+            self.levelsLock.unlock()
+        }
+
+        do {
+            try capture.start()
+        } catch {
+            lease.release(.visualizer)
+            return fail(String(describing: error))
+        }
+
+        isStopping = false
+        let thread = Thread { [weak self] in self?.renderLoop() }
+        thread.name = "com.glorious-lights.visualizer"
+        // Above default so a busy main thread does not stutter the display, but
+        // below the audio thread, which must never wait on us.
+        thread.qualityOfService = .userInitiated
+        renderThread = thread
+        thread.start()
+
+        isRunning = true
+        lastError = nil
+        onStatusChange?()
+        return true
+    }
+
+    /// Stops rendering and hands the transport back. Main thread.
+    ///
+    /// Returns once the render thread has finished, so a caller can immediately
+    /// re-apply the user's own look without racing a final frame.
+    func stop() {
+        guard isRunning else { return }
+        capture.stop()
+        capture.onSamples = nil
+
+        isStopping = true
+        // The render loop checks the flag once per frame, so this is bounded by
+        // one frame plus one transaction.
+        while renderThread?.isFinished == false {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        renderThread = nil
+        analyzer = nil
+
+        levelsLock.lock()
+        latestLevels = nil
+        levelsLock.unlock()
+
+        lease.release(.visualizer)
+        isRunning = false
+        onStatusChange?()
+    }
+
+    @discardableResult
+    private func fail(_ message: String) -> Bool {
+        lastError = message
+        onStatusChange?()
+        return false
+    }
+
+    // MARK: - Render loop
+
+    private func renderLoop() {
+        let frameInterval = 1 / Self.targetFrameRate
+        var smoother = LevelSmoother(bandCount: VisualizerLayout.columns.count)
+        var autoGain = AutoGain()
+        var lastFrame = ProcessInfo.processInfo.systemUptime
+
+        do {
+            try keyboard.open()
+            try keyboard.beginStreaming()
+        } catch {
+            let message = String(describing: error)
+            DispatchQueue.main.async { [weak self] in self?.fail(message) }
+            keyboard.stop()
+            return
+        }
+
+        while !isStopping {
+            let frameStart = ProcessInfo.processInfo.systemUptime
+            let elapsed = frameStart - lastFrame
+            lastFrame = frameStart
+
+            // Take the newest analysis and drop anything older. Nothing is
+            // queued, so a slow frame loses intermediate audio rather than
+            // accumulating a backlog.
+            levelsLock.lock()
+            let raw = latestLevels
+            levelsLock.unlock()
+
+            let settings = currentSettings
+            var levels = raw ?? [Float](repeating: 0, count: VisualizerLayout.columns.count)
+
+            var gain = Float(settings.sensitivity)
+            if settings.autoGain {
+                gain *= autoGain.update(observedPeak: levels.max() ?? 0, elapsed: elapsed)
+            }
+            for index in levels.indices {
+                levels[index] = min(max(levels[index] * gain, 0), 1)
+            }
+
+            let smoothed = smoother.update(with: levels, elapsed: elapsed)
+            let renderer = BarRenderer(style: settings.style, themeColor: settings.color)
+            let colors = renderer.frame(levels: smoothed)
+
+            do {
+                try keyboard.sendFrame(
+                    packets: GMMKTransaction.bracket(
+                        GMMKPacket.customColorPackets(startKeyIndex: GMMKKeyMap.minLEDIndex,
+                                                      colors: colors)))
+            } catch {
+                let message = String(describing: error)
+                DispatchQueue.main.async { [weak self] in self?.fail(message) }
+                break
+            }
+
+            // Sleep only what is left of the frame. If the transaction took
+            // longer than the interval, go straight round again — the display
+            // simply runs at whatever rate the transport sustains.
+            let spent = ProcessInfo.processInfo.systemUptime - frameStart
+            if spent < frameInterval {
+                Thread.sleep(forTimeInterval: frameInterval - spent)
+            }
+        }
+
+        keyboard.endStreaming()
+        keyboard.stop()
+    }
+}

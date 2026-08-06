@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "GloriousMouseProtocol", targets: ["GloriousMouseProtocol"]),
         .library(name: "GloriousMouseHID", targets: ["GloriousMouseHID"]),
         .library(name: "GloriousSync", targets: ["GloriousSync"]),
+        .library(name: "GloriousVisualizer", targets: ["GloriousVisualizer"]),
         .executable(name: "gmmk-cli", targets: ["gmmk-cli"]),
         .executable(name: "GMMKLightsApp", targets: ["GMMKLightsApp"]),
     ],
@@ -24,16 +25,20 @@ let package = Package(
         // maps a device-neutral look onto each device's own vocabulary.
         .target(name: "GloriousSync",
                 dependencies: ["GMMKProtocol", "GloriousMouseProtocol"]),
+        // Audio analysis and the bar-graph render, kept out of the app target so
+        // the mapping and the colour ramp are unit-testable without a device.
+        .target(name: "GloriousVisualizer", dependencies: ["GMMKProtocol"]),
         .executableTarget(name: "gmmk-cli",
                           dependencies: ["GMMKProtocol", "GMMKHID",
                                          "GloriousMouseProtocol", "GloriousMouseHID"]),
         .executableTarget(name: "GMMKLightsApp",
                           dependencies: ["GMMKProtocol", "GMMKHID",
                                          "GloriousMouseProtocol", "GloriousMouseHID",
-                                         "GloriousSync"]),
+                                         "GloriousSync", "GloriousVisualizer"]),
         .testTarget(name: "GMMKProtocolTests", dependencies: ["GMMKProtocol"]),
         .testTarget(name: "GMMKHIDTests", dependencies: ["GMMKHID"]),
         .testTarget(name: "GloriousMouseProtocolTests", dependencies: ["GloriousMouseProtocol"]),
         .testTarget(name: "GloriousSyncTests", dependencies: ["GloriousSync"]),
+        .testTarget(name: "GloriousVisualizerTests", dependencies: ["GloriousVisualizer"]),
     ]
 )

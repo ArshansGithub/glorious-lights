@@ -2,6 +2,7 @@ import AppKit
 import GMMKProtocol
 import GloriousMouseProtocol
 import GloriousSync
+import GloriousVisualizer
 
 /// Status-item menu for both devices: the keyboard's effect picker, brightness,
 /// speed, colour and switch compensation, then the mouse's own section.
@@ -22,6 +23,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                             mouse: mouseController) { [weak self] in
         self?.settings.compensationProfile ?? .neutral
     }
+
+    private lazy var visualizer = VisualizerController(
+        lease: controller.lease,
+        style: settings.visualizerStyle,
+        themeColor: settings.color,
+        sensitivity: settings.visualizerSensitivity,
+        autoGain: settings.visualizerAutoGain)
+    private let visualizerItem = NSMenuItem(title: "Audio Visualizer",
+                                            action: nil, keyEquivalent: "")
+    private let visualizerOptionsItem = NSMenuItem(title: "Visualizer Options",
+                                                   action: nil, keyEquivalent: "")
+    private let visualizerStyleMenu = NSMenu()
+    private let visualizerSensitivityMenu = NSMenu()
+    private let visualizerAutoGainItem = NSMenuItem(title: "Auto Gain",
+                                                    action: nil, keyEquivalent: "")
 
     private let syncSeparator = NSMenuItem.separator()
     private let syncItem = NSMenuItem(title: "Sync Devices", action: nil, keyEquivalent: "")
@@ -88,10 +104,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mouseController.onStatusChange = { [weak self] in self?.mouseSection.refresh() }
         mouseController.start()
 
+        visualizer.onStatusChange = { [weak self] in self?.refreshVisualizerItems() }
+
         refreshConnectionItem()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Stop the visualizer first: it holds the transport lease and its own
+        // keyboard handle, and it restores the user's look on the way out.
+        if visualizer.isRunning { stopVisualizer() }
         controller.stop()
         mouseController.stop()
         settings.save()
@@ -131,6 +152,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                   keyEquivalent: "")
         tuneItem.target = self
         menu.addItem(tuneItem)
+
+        visualizerItem.action = #selector(toggleVisualizer(_:))
+        visualizerItem.target = self
+        menu.addItem(visualizerItem)
+        menu.addItem(buildVisualizerOptions())
         menu.addItem(.separator())
 
         brightnessRow.onChange = { [weak self] percent in
@@ -257,6 +283,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshEnablement() {
+        // While the visualizer holds the transport, the controls that would
+        // fight it are disabled rather than silently dropped: the lease already
+        // drops their sends, and a control that looks live but does nothing is
+        // worse than one that says it is unavailable.
+        let visualizing = visualizer.isRunning
+        for item in [effectItem, rainbowItem, compensatedItem] {
+            item.isEnabled = !visualizing
+            item.toolTip = visualizing ? "Stop the audio visualizer to change this." : nil
+        }
+
         for item in effectMenu.items {
             let mode = item.representedObject as? LightingMode
             item.state = (mode == settings.mode && !settings.compensated) ? .on : .off
@@ -268,14 +304,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rainbowItem.state = settings.rainbow ? .on : .off
         rainbowItem.isEnabled = settings.mode.usesSolidColor
 
-        speedRow.isControlEnabled = settings.mode.isAnimated
+        brightnessRow.isControlEnabled = !visualizing
+        speedRow.isControlEnabled = settings.mode.isAnimated && !visualizing
         // A colour write only shows up when the mode uses the solid colour and
         // the rainbow flag is off — clicking through to the panel otherwise
         // would look like the app was broken. The compensated paint is the
         // exception: it is in mode `custom`, which ignores the config colour,
         // but the same swatch is its target.
-        let colorEnabled = settings.compensated
-            || (settings.mode.usesSolidColor && !settings.rainbow)
+        let colorEnabled = !visualizing
+            && (settings.compensated || (settings.mode.usesSolidColor && !settings.rainbow))
         colorRow.setEnabled(colorEnabled)
         // The hint is about the colour the board is actually showing, so it is
         // pointless when the colour is not in play at all.
@@ -304,6 +341,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshEnablement()
         mouseSection.refresh()
         refreshSyncSection()
+        refreshVisualizerItems()
     }
 
     /// The sync section is about *both* devices, so it only appears when at
@@ -320,7 +358,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ? "Apply a change made to one device to the other as well."
             : "Both the keyboard and the mouse have to be connected to sync them."
         // Themes need no partner: they apply to whatever is plugged in.
+        // A theme writes to the keyboard, so it waits for the visualizer too —
+        // unless only the mouse is present, which the visualizer never touches.
         themesItem.isEnabled = anyDevice
+            && !(visualizer.isRunning && controller.isConnected)
     }
 
     // MARK: - Actions
@@ -390,6 +431,167 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.settings.save()
         }
         ledPicker.present(colors: settings.mouseLEDColors)
+    }
+
+    // MARK: - Visualizer
+
+    private func buildVisualizerOptions() -> NSMenuItem {
+        let submenu = NSMenu()
+
+        for style in VisualizerStyle.allCases {
+            let item = NSMenuItem(title: style.displayName,
+                                  action: #selector(selectVisualizerStyle(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = style
+            visualizerStyleMenu.addItem(item)
+        }
+        let styleItem = NSMenuItem(title: "Style", action: nil, keyEquivalent: "")
+        styleItem.submenu = visualizerStyleMenu
+        submenu.addItem(styleItem)
+
+        // A multiplier, so the steps are geometric — the difference between 1x
+        // and 2x matters far more than between 7x and 8x.
+        for multiplier in [0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0] {
+            let item = NSMenuItem(title: String(format: "%.1f×", multiplier),
+                                  action: #selector(selectVisualizerSensitivity(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = multiplier
+            visualizerSensitivityMenu.addItem(item)
+        }
+        let sensitivityItem = NSMenuItem(title: "Sensitivity", action: nil, keyEquivalent: "")
+        sensitivityItem.submenu = visualizerSensitivityMenu
+        submenu.addItem(sensitivityItem)
+
+        visualizerAutoGainItem.action = #selector(toggleVisualizerAutoGain(_:))
+        visualizerAutoGainItem.target = self
+        visualizerAutoGainItem.toolTip = "Normalise to the loudest sound heard recently, "
+            + "so quiet and loud material both fill the board."
+        submenu.addItem(visualizerAutoGainItem)
+
+        visualizerOptionsItem.submenu = submenu
+        return visualizerOptionsItem
+    }
+
+    private func refreshVisualizerItems() {
+        visualizerItem.state = visualizer.isRunning ? .on : .off
+        let authorization = AudioCapture.Authorization.current
+
+        switch authorization {
+        case .denied:
+            visualizerItem.title = "Audio Visualizer — microphone access needed"
+            visualizerItem.toolTip = "Grant access in System Settings › Privacy & Security "
+                + "› Microphone, then try again."
+        case .granted, .undetermined:
+            visualizerItem.title = "Audio Visualizer"
+            visualizerItem.toolTip = visualizer.lastError
+        }
+        // Still clickable when denied: the click is what opens System Settings.
+        visualizerItem.isEnabled = controller.isConnected || authorization == .denied
+
+        for item in visualizerStyleMenu.items {
+            item.state = (item.representedObject as? VisualizerStyle) == settings.visualizerStyle
+                ? .on : .off
+        }
+        for item in visualizerSensitivityMenu.items {
+            item.state = (item.representedObject as? Double) == settings.visualizerSensitivity
+                ? .on : .off
+        }
+        visualizerAutoGainItem.state = settings.visualizerAutoGain ? .on : .off
+        visualizerOptionsItem.isEnabled = true
+    }
+
+    @objc private func toggleVisualizer(_ sender: NSMenuItem) {
+        if AudioCapture.Authorization.current == .denied {
+            openMicrophoneSettings()
+            return
+        }
+        if visualizer.isRunning {
+            stopVisualizer()
+            return
+        }
+        // Asking is asynchronous the first time, so the start hangs off the
+        // answer rather than racing it.
+        if AudioCapture.Authorization.current == .undetermined {
+            AudioCapture.requestAuthorization { [weak self] authorization in
+                guard let self else { return }
+                if authorization == .granted { self.startVisualizer() }
+                self.refreshVisualizerItems()
+            }
+            return
+        }
+        startVisualizer()
+    }
+
+    private func startVisualizer() {
+        visualizer.update(style: settings.visualizerStyle,
+                          themeColor: settings.color,
+                          sensitivity: settings.visualizerSensitivity,
+                          autoGain: settings.visualizerAutoGain)
+        visualizer.start()
+        refreshVisualizerItems()
+        refreshEnablement()
+    }
+
+    /// Stops the visualizer and puts the board back where the user left it.
+    ///
+    /// The restore matters: the visualizer leaves the board in mode `custom`
+    /// showing whatever the last frame was, which is not a state anyone chose.
+    /// `stop()` blocks until the render thread is done, so this cannot race a
+    /// final frame.
+    private func stopVisualizer() {
+        visualizer.stop()
+        reapplyCurrentLook()
+        refreshVisualizerItems()
+        refreshEnablement()
+    }
+
+    /// Re-sends the persisted keyboard state — the same thing the menu would
+    /// send if the user picked it again.
+    private func reapplyCurrentLook() {
+        let profile = settings.compensationProfile
+        if settings.compensated {
+            controller.setBrightness(percent: settings.brightnessPercent)
+            controller.paintCompensated(target: settings.color,
+                                        profile: profile,
+                                        throttleKey: nil)
+            return
+        }
+        controller.applyLook(mode: settings.mode,
+                             rainbow: settings.rainbow,
+                             brightness: Brightness.level(fromPercent: settings.brightnessPercent),
+                             delay: Delay.delay(fromSpeed: settings.speed),
+                             color: settings.color)
+    }
+
+    private func openMicrophoneSettings() {
+        let url = URL(string:
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+        if let url { NSWorkspace.shared.open(url) }
+    }
+
+    @objc private func selectVisualizerStyle(_ sender: NSMenuItem) {
+        guard let style = sender.representedObject as? VisualizerStyle else { return }
+        settings.visualizerStyle = style
+        settings.save()
+        visualizer.update(style: style, themeColor: settings.color)
+        refreshVisualizerItems()
+    }
+
+    @objc private func selectVisualizerSensitivity(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? Double else { return }
+        settings.visualizerSensitivity = value
+        settings.save()
+        visualizer.update(sensitivity: value)
+        refreshVisualizerItems()
+    }
+
+    @objc private func toggleVisualizerAutoGain(_ sender: NSMenuItem) {
+        settings.visualizerAutoGain.toggle()
+        settings.save()
+        visualizer.update(autoGain: settings.visualizerAutoGain)
+        refreshVisualizerItems()
     }
 
     @objc private func openTuner(_ sender: NSMenuItem) {

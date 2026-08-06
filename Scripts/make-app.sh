@@ -76,6 +76,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Glorious Lights listens to the microphone only while the audio visualizer is running, to turn what it hears into a spectrum on your keyboard. Audio is analysed in memory and never recorded, saved or sent anywhere.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>MIT licensed. https://github.com/ArshansGithub/glorious-lights</string>
 	<key>NSPrincipalClass</key>

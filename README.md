@@ -135,6 +135,12 @@ release archive and print its SHA-256.
   scale (the keyboard's speed field is a *delay* running backwards, and its
   brightness has an "off" level the mouse can't express), so the translation
   lives in one tested place — see `Sources/GloriousSync`.
+- **Audio visualizer:** *Audio Visualizer* turns the keyboard into a live
+  spectrum analyzer — 17 columns of keys as bars, the function row flashing on
+  peaks, in either the heat ramp or your own color. It listens to the microphone
+  (asked for on first use, analysed in memory and never recorded), and it takes
+  over the keyboard while running, handing it back and restoring your look when
+  you stop.
 - **CLI:** `swift run -c release gmmk-cli help`
 
 ```sh

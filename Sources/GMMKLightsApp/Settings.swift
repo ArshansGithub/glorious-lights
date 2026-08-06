@@ -2,6 +2,7 @@ import Foundation
 import GMMKProtocol
 import GloriousMouseProtocol
 import GloriousSync
+import GloriousVisualizer
 
 /// Last-used UI state, persisted in `UserDefaults`.
 ///
@@ -30,6 +31,9 @@ struct Settings {
         static let lookBrightness = "sync.look.brightness"
         static let lookSpeed = "sync.look.speed"
         static let mouseLEDColors = "mouse.ledColors"
+        static let visualizerStyle = "visualizer.style"
+        static let visualizerSensitivity = "visualizer.sensitivity"
+        static let visualizerAutoGain = "visualizer.autoGain"
         /// What ``markedLEDIndices`` was called when the marked set could only
         /// mean "the Lynx-switch keys". Read once, for migration.
         static let legacyLynxLEDIndices = "compensation.lynxLEDIndices"
@@ -84,6 +88,14 @@ struct Settings {
                                                                green: 0xE5,
                                                                blue: 0xFF),
                                            count: MouseLED.count)
+
+    /// How the audio visualizer paints its bars.
+    var visualizerStyle: VisualizerStyle = .heat
+    /// Input gain multiplier, 0.5x to 8x. Not persisted as a percentage because
+    /// it is a multiplier, and the useful range is far from linear.
+    var visualizerSensitivity: Double = 2.0
+    /// Whether the visualizer normalises to recent peaks.
+    var visualizerAutoGain: Bool = true
 
     /// The four compensation fields as the protocol layer wants them.
     var compensationProfile: SwitchCompensation.Profile {
@@ -166,6 +178,16 @@ struct Settings {
         if let stored = defaults.object(forKey: Key.lookSpeed) as? Double {
             deskLook.speed = min(max(stored, 0), 1)
         }
+        if let raw = defaults.string(forKey: Key.visualizerStyle),
+           let stored = VisualizerStyle(rawValue: raw) {
+            visualizerStyle = stored
+        }
+        if let stored = defaults.object(forKey: Key.visualizerSensitivity) as? Double {
+            visualizerSensitivity = min(max(stored, 0.5), 8)
+        }
+        if let stored = defaults.object(forKey: Key.visualizerAutoGain) as? Bool {
+            visualizerAutoGain = stored
+        }
         if let stored = defaults.array(forKey: Key.mouseLEDColors) as? [String] {
             // A malformed entry falls back to the default for that LED rather
             // than discarding the whole set.
@@ -194,5 +216,8 @@ struct Settings {
         defaults.set(deskLook.brightness, forKey: Key.lookBrightness)
         defaults.set(deskLook.speed, forKey: Key.lookSpeed)
         defaults.set(mouseLEDColors.map(\.hexString), forKey: Key.mouseLEDColors)
+        defaults.set(visualizerStyle.rawValue, forKey: Key.visualizerStyle)
+        defaults.set(visualizerSensitivity, forKey: Key.visualizerSensitivity)
+        defaults.set(visualizerAutoGain, forKey: Key.visualizerAutoGain)
     }
 }
