@@ -420,7 +420,7 @@ public struct MouseConfigBlob: Equatable, Sendable {
         lines.append("DPI slots:      \(dpiSlotCount) present, active ordinal "
                      + "\(activeDPIOrdinal) (1-based, enabled slots only)")
         for (i, stage) in dpiStages.enumerated() {
-            let mark = stage.isEnabled ? " " : "x"
+            let mark = stage.isEnabled ? "x" : " "
             let color = dpiStageColors[i].hexString
             lines.append("  [\(mark)] slot \(i + 1): \(stage.displayValue) dpi   #\(color)")
         }
