@@ -13,6 +13,9 @@ let package = Package(
         .library(name: "GloriousVisualizer", targets: ["GloriousVisualizer"]),
         .executable(name: "gmmk-cli", targets: ["gmmk-cli"]),
         .executable(name: "GMMKLightsApp", targets: ["GMMKLightsApp"]),
+        // Development tool. Deliberately not part of the app bundle, which
+        // Scripts/make-app.sh builds by product name.
+        .executable(name: "viz-sim", targets: ["viz-sim"]),
     ],
     targets: [
         .target(name: "GMMKProtocol"),
@@ -35,6 +38,8 @@ let package = Package(
                           dependencies: ["GMMKProtocol", "GMMKHID",
                                          "GloriousMouseProtocol", "GloriousMouseHID",
                                          "GloriousSync", "GloriousVisualizer"]),
+        .executableTarget(name: "viz-sim",
+                          dependencies: ["GMMKProtocol", "GloriousVisualizer"]),
         .testTarget(name: "GMMKProtocolTests", dependencies: ["GMMKProtocol"]),
         .testTarget(name: "GMMKHIDTests", dependencies: ["GMMKHID"]),
         .testTarget(name: "GloriousMouseProtocolTests", dependencies: ["GloriousMouseProtocol"]),
