@@ -7,15 +7,20 @@ let package = Package(
     products: [
         .library(name: "GMMKProtocol", targets: ["GMMKProtocol"]),
         .library(name: "GMMKHID", targets: ["GMMKHID"]),
+        .library(name: "GloriousMouseProtocol", targets: ["GloriousMouseProtocol"]),
         .executable(name: "gmmk-cli", targets: ["gmmk-cli"]),
         .executable(name: "GMMKLightsApp", targets: ["GMMKLightsApp"]),
     ],
     targets: [
         .target(name: "GMMKProtocol"),
         .target(name: "GMMKHID", dependencies: ["GMMKProtocol"]),
+        // The mouse is a different device with a different protocol; its
+        // targets deliberately share nothing with the keyboard's.
+        .target(name: "GloriousMouseProtocol"),
         .executableTarget(name: "gmmk-cli", dependencies: ["GMMKProtocol", "GMMKHID"]),
         .executableTarget(name: "GMMKLightsApp", dependencies: ["GMMKProtocol", "GMMKHID"]),
         .testTarget(name: "GMMKProtocolTests", dependencies: ["GMMKProtocol"]),
         .testTarget(name: "GMMKHIDTests", dependencies: ["GMMKHID"]),
+        .testTarget(name: "GloriousMouseProtocolTests", dependencies: ["GloriousMouseProtocol"]),
     ]
 )
