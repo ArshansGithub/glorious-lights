@@ -185,6 +185,33 @@ func runMouseCommand(_ arguments: [String]) -> Never {
             blob.hexDumpLines(upTo: GloriousMouseDevice.configSizeMax).forEach { print("  " + $0) }
         }
 
+    case "color", "colour":
+        // First mutating field command: set solid colour. Read-modify-write of
+        // the whole blob, config size taken from the observed read length, and
+        // a read-back diff to confirm the write landed.
+        guard let hex = rest.first, let rgb = MouseRGB(hex: hex) else {
+            fail("`mouse color` needs a hex colour, RRGGBB", .usage)
+        }
+        withMouse { mouse in
+            var blob = try mouse.readConfig(profile: .one)
+            guard let size = blob.observedConfigSize else {
+                fail("could not observe the config size from the read; refusing to write", .transport)
+            }
+            blob.effect = .single
+            try blob.setColors([rgb], for: .single)
+            if let param = blob.modeParameter(for: .single) {
+                try blob.setModeParameter(MouseModeParameter(speed: param.speed, brightness: 4),
+                                          for: .single)
+            }
+            let prepared = blob.preparedForWrite(profile: .one, configSize: size)
+            try mouse.writeConfig(prepared)
+            let after = try mouse.readConfig(profile: .one)
+            let ok = after.effect == .single
+                && after.colors(for: .single)?.first == rgb
+            print("color -> #\(rgb.hexString) (solid), write "
+                  + (ok ? "verified by read-back" : "NOT confirmed by read-back — check the mouse"))
+        }
+
     case "restore":
         guard let path = rest.first else {
             fail("`mouse restore` needs the path of a file written by `mouse dump`", .usage)
