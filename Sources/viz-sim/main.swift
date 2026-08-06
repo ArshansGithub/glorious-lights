@@ -49,7 +49,9 @@ let usage = """
     INPUT (one of):
       --signal <name>       edm-128 | edm-128-kick | ballad-72 | speech |
                             crescendo | cut-transitions | sustained-tone |
-                            pink | white | near-silence | dnb-174 | polyrhythm
+                            pink | white | near-silence | dnb-174 | polyrhythm |
+                            click-120 | click-112 | click-90-ramp |
+                            click-120-gap | build-drop
       --file <path>         An audio file (wav / m4a / mp3 / anything AVAudioFile reads)
 
     PIPELINE OPTIONS (mirroring the app):
@@ -61,6 +63,10 @@ let usage = """
       --fps <n>             Display frame rate (default: 30)
       --duration <seconds>  How much audio to run (default: 30)
       --jitter <ms>         Gaussian jitter on the display wake-up (default: 0)
+      --output-latency <ms> Delay between a frame being composed and being
+                            visible. M8 is only meaningful with this on: a
+                            simulator that shows a frame the instant it is
+                            composed measures the model, not the pipeline.
       --stall <ms>@<hz>     Inject a transport stall of <ms> at <hz>
       --every <seconds>     How often to write a PNG (default: 0.15; 0 disables)
       --csv <path>          Per-frame per-LED lightness, which every metric is
@@ -85,6 +91,7 @@ var sensitivity = 1.0
 var fps = 30.0
 var duration = 30.0
 var jitterMilliseconds = 0.0
+var outputLatencyMilliseconds = 0.0
 var stall: (length: Double, rate: Double)?
 var every = 0.15
 var csvPath: String?
@@ -138,6 +145,11 @@ while let option = arguments.first {
             fail("--duration needs a number")
         }
         duration = parsed
+    case "--output-latency":
+        guard let parsed = Double(value("--output-latency")), parsed >= 0 else {
+            fail("--output-latency needs milliseconds")
+        }
+        outputLatencyMilliseconds = parsed
     case "--jitter":
         guard let parsed = Double(value("--jitter")), parsed >= 0 else {
             fail("--jitter needs milliseconds")
@@ -193,10 +205,17 @@ struct BatteryArm {
     var jitter: Double = 0
     var sensitivity: Double = 1
     var stall: (length: Double, rate: Double)?
-    /// See ``Metrics/checks(for:frameInterval:perOnsetMode:assertLatency:assertLiveliness:)``.
+    /// See ``Metrics/checks(for:frameInterval:perOnsetMode:assertLatency:assertLiveliness:beatAligned:)``.
     var assertLatency = true
     var assertLiveliness = true
+    /// The display-side delay, seconds. M8 is asserted only where this is
+    /// non-zero.
+    var outputLatency: Double = 0
 }
+
+/// The §7.2-R transport median plus the display latch. `/latency` is the only
+/// arm on which M8 means anything.
+let batteryOutputLatency = 0.012
 
 let batteryArms: [BatteryArm] = [
     BatteryArm(name: "", fps: fps),
@@ -205,50 +224,79 @@ let batteryArms: [BatteryArm] = [
     BatteryArm(name: "/15fps", fps: 15),
     BatteryArm(name: "/quiet", fps: fps, sensitivity: 0.5, assertLiveliness: false),
     BatteryArm(name: "/loud", fps: fps, sensitivity: 2.0, assertLiveliness: false),
+    BatteryArm(name: "/latency", fps: fps, outputLatency: batteryOutputLatency),
 ]
 
 if battery {
-    var rows: [(String, [Metrics.Check])] = []
     var failures = 0
     var checksRun = 0
     let start = Date()
 
     print("viz-sim --battery — \(Signal.battery.count) signals × "
-          + "\(VisualizerMode.allCases.count) modes × \(batteryArms.count) arms, "
-          + "\(Int(duration)) s each")
+          + "\(VisualizerMode.allCases.count) modes × \(batteryArms.count) arms")
     print("")
 
+    struct Job {
+        var signal: Signal
+        var mode: VisualizerMode
+        var arm: BatteryArm
+        var label: String
+    }
+    var jobs: [Job] = []
     for signal in Signal.battery {
         for mode in VisualizerMode.allCases {
             for arm in batteryArms {
-                var run = SimRun(signal: signal, mode: mode, sampleRate: sampleRate,
-                                 frameRate: arm.fps, duration: duration, jitter: arm.jitter)
-                run.stall = arm.stall
-                run.sensitivity = arm.sensitivity
-                let result: SimRun.Result
-                do {
-                    result = try run.run()
-                } catch {
-                    fail(String(describing: error))
-                }
-                let metrics = Metrics.measure(result, signal: signal)
-                let checks = metrics.checks(for: signal, frameInterval: result.frameInterval,
-                                            perOnsetMode: mode == .pulse || mode == .ripple,
-                                            assertLatency: arm.assertLatency,
-                                            assertLiveliness: arm.assertLiveliness)
-                let label = "\(signal.name)/\(mode.rawValue)" + arm.name
-                rows.append((label, checks))
-                checksRun += checks.count
-                failures += checks.filter { !$0.passed }.count
+                jobs.append(Job(signal: signal, mode: mode, arm: arm,
+                                label: "\(signal.name)/\(mode.rawValue)" + arm.name))
             }
         }
     }
 
+    // The runs share nothing, so the battery is embarrassingly parallel. It is
+    // also a CI gate that a developer has to be willing to run before every
+    // commit, and a gate nobody runs is not a gate.
+    var results = [[Metrics.Check]?](repeating: nil, count: jobs.count)
+    let resultsLock = NSLock()
+    var runFailure: String?
+    DispatchQueue.concurrentPerform(iterations: jobs.count) { index in
+        let job = jobs[index]
+        let length = job.signal.duration(default: duration)
+        var run = SimRun(signal: job.signal, mode: job.mode, sampleRate: sampleRate,
+                         frameRate: job.arm.fps, duration: length, jitter: job.arm.jitter)
+        run.stall = job.arm.stall
+        run.sensitivity = job.arm.sensitivity
+        run.outputLatency = job.arm.outputLatency
+        do {
+            let result = try run.run()
+            var metrics = Metrics.measure(result, signal: job.signal)
+            metrics.wideHueSpread = job.mode == .spectrum
+            metrics.centreExempt = job.mode == .vu
+            let checks = metrics.checks(
+                for: job.signal, frameInterval: result.frameInterval,
+                perOnsetMode: job.mode == .pulse || job.mode == .ripple,
+                assertLatency: job.arm.assertLatency,
+                assertLiveliness: job.arm.assertLiveliness,
+                beatAligned: job.arm.outputLatency > 0 && job.arm.stall == nil
+                    && job.mode.isBeatScheduled)
+            resultsLock.lock()
+            results[index] = checks
+            resultsLock.unlock()
+        } catch {
+            resultsLock.lock()
+            runFailure = String(describing: error)
+            resultsLock.unlock()
+        }
+    }
+    if let runFailure { fail(runFailure) }
+
     var report = ""
-    for (label, checks) in rows {
+    for (index, job) in jobs.enumerated() {
+        guard let checks = results[index] else { continue }
         let failed = checks.filter { !$0.passed }
+        checksRun += checks.count
+        failures += failed.count
         guard verbose || !failed.isEmpty else { continue }
-        report += "\n\(label)\n"
+        report += "\n\(job.label)\n"
         for check in (verbose ? checks : failed) {
             report += String(format: "  %-24@ %-10@ %-16@ %@\n",
                              check.name as NSString, check.value as NSString,
@@ -261,16 +309,32 @@ if battery {
     }
     print(report)
     print(String(format: "%d checks over %d runs, %d failed, %.0f s",
-                 checksRun, rows.count, failures, Date().timeIntervalSince(start)))
+                 checksRun, jobs.count, failures, Date().timeIntervalSince(start)))
     print(failures == 0 ? "BATTERY: PASS" : "BATTERY: FAIL")
     exit(failures == 0 ? 0 : 1)
 }
 
+/// Median signed offset between the beats the tracker published and the nearest
+/// ground-truth beat. Separates "the grid is late" from "the scheduler is late",
+/// which is §10.5's fifth open measurement gap.
+func gridOffset(_ result: SimRun.Result) -> Double {
+    guard !result.beats.isEmpty else { return 0 }
+    var errors: [Double] = []
+    for beat in result.publishedBeats where beat >= 5 {
+        guard let nearest = result.beats.min(by: { abs($0 - beat) < abs($1 - beat) }) else { continue }
+        let error = beat - nearest
+        if abs(error) < 0.15 { errors.append(error) }
+    }
+    return errors.isEmpty ? 0 : percentile(errors, 0.5)
+}
+
 // MARK: - Single run
 
+duration = signal.duration(default: duration)
 var run = SimRun(signal: signal, mode: mode, sampleRate: sampleRate, frameRate: fps,
                  duration: duration, jitter: jitterMilliseconds / 1000, stall: stall,
-                 sensitivity: sensitivity, useThemeColour: useThemeColour)
+                 sensitivity: sensitivity, useThemeColour: useThemeColour,
+                 outputLatency: outputLatencyMilliseconds / 1000)
 
 let result: SimRun.Result
 do {
@@ -278,7 +342,9 @@ do {
 } catch {
     fail(String(describing: error))
 }
-let metrics = Metrics.measure(result, signal: signal)
+var metrics = Metrics.measure(result, signal: signal)
+metrics.wideHueSpread = mode == .spectrum
+metrics.centreExempt = mode == .vu
 
 do {
     try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
@@ -343,6 +409,7 @@ var report = """
 
     tempo
       median BPM:        \(String(format: "%.1f", percentile(result.bpm, 0.5)))
+      final BPM:         \(String(format: "%.1f", result.bpm.suffix(20).first ?? 0))
       mean confidence:   \(String(format: "%.3f", mean(result.tempoConfidence)))
 
     onsets (\(metrics.onsetCount) total, \(String(format: "%.2f", metrics.onsetRate)) per second)
@@ -369,7 +436,9 @@ report += "\n      first: "
         .joined(separator: " ")
 report += "\n\n    metrics\n"
 for check in metrics.checks(for: signal, frameInterval: result.frameInterval,
-                            perOnsetMode: mode == .pulse || mode == .ripple) {
+                            perOnsetMode: mode == .pulse || mode == .ripple,
+                            beatAligned: outputLatencyMilliseconds > 0
+                                && mode.isBeatScheduled) {
     report += String(format: "      %-24@ %-10@ %-16@ %@\n",
                      check.name as NSString, check.value as NSString,
                      check.bound as NSString, (check.passed ? "PASS" : "FAIL") as NSString)
@@ -380,7 +449,24 @@ report += String(format: """
         frames dropped:        %d
         stale frames:          %.2f%%
 
-    """, metrics.boardMeanBrightness, metrics.droppedFrames, metrics.staleFraction * 100)
+    the three timescales (\u{03A6} phrase / \u{03A3} section / E energy)
+        E    mean %.3f  min %.3f  max %.3f
+        \u{03A6}    mean %.3f  min %.3f  max %.3f
+        \u{03A3}    mean %.3f  min %.3f  max %.3f
+        \u{03C3}_\u{03C6}  median %.4f beats
+        beat schedule  %d launched / %d confirmed / %d missed
+        grid offset    median %.1f ms against ground truth
+        packets/frame  p50 %d  p95 %d  max %d, %.1f %% repaint
+
+    """, metrics.boardMeanBrightness, metrics.droppedFrames, metrics.staleFraction * 100,
+         mean(result.energy), result.energy.min() ?? 0, result.energy.max() ?? 0,
+         mean(result.phrase), result.phrase.min() ?? 0, result.phrase.max() ?? 0,
+         mean(result.section), result.section.min() ?? 0, result.section.max() ?? 0,
+         percentile(result.phaseSigma, 0.5),
+         result.beatLaunches, result.beatConfirmations, result.beatMisses,
+         gridOffset(result) * 1000,
+         metrics.packetMedian, metrics.packetP95, metrics.packetMax,
+         metrics.repaintFraction * 100)
 
 do {
     try report.write(to: outputDirectory.appendingPathComponent("stats.txt"),

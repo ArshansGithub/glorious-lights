@@ -11,12 +11,37 @@ struct Track {
     var samples: [Float]
     /// Every percussive event actually synthesised, in seconds.
     var events: [(time: Double, kind: OnsetKind)] = []
+    /// **Exact beat times**, for M8. The whole reason the click cases exist:
+    /// alignment error is a real number rather than an estimate, because the
+    /// generator knows where the beats are.
+    var beats: [Double] = []
+    /// Per-hop RMS of the generated audio, for M9b and M9c.
+    ///
+    /// Ground truth from the *signal*, never from our own analyser — deriving it
+    /// inside the metric would be measuring the analyser against itself.
+    var rmsEnvelope: [(time: Double, rms: Double)] = []
     /// Whether this case contains a periodic beat at all.
     var hasBeat = false
     /// Whether the case is stationary — the board is *supposed* to be still.
     var isStationary = false
     /// Whether the case is silent enough that a dark board is correct.
     var isSilence = false
+
+    /// Fills ``rmsEnvelope`` from the samples, at the analysis hop rate.
+    mutating func measureRMS(sampleRate: Double, hop: Int = 512) {
+        rmsEnvelope.removeAll(keepingCapacity: true)
+        var index = 0
+        while index + hop <= samples.count {
+            var sum = 0.0
+            for offset in index..<(index + hop) {
+                let value = Double(samples[offset])
+                sum += value * value
+            }
+            rmsEnvelope.append((Double(index + hop) / sampleRate,
+                                (sum / Double(hop)).squareRoot()))
+            index += hop
+        }
+    }
 }
 
 /// The synthetic battery (§10.1).
@@ -54,6 +79,20 @@ enum Signal {
     case dnb174
     /// 3-against-4. Ambiguous tempo; must not free-run a wrong grid.
     case polyrhythm
+    /// A bare click track — **M8's ground truth.** Beat times are known
+    /// exactly, so alignment error is a real number rather than an estimate.
+    case click(bpm: Double)
+    /// 90 BPM for 10 s, ramping to 100 over 10 s, then 100 for 10 s. Prediction
+    /// must not overshoot on a tempo change.
+    case clickRamp
+    /// `click-120` with four seconds muted mid-run. **The phantom-gesture
+    /// test:** §2.3.4's credit rule must stop the board beating through the gap.
+    case clickGap
+    /// 8 s intro → 16 s build → 1 s pre-drop silence → 12 s drop → 8 s
+    /// breakdown. **M9's main case**, and deliberately not a synthetic
+    /// abstraction: it is the shape of the material the user was listening to
+    /// when they used the word "cliff".
+    case buildDrop
     case file(URL)
 
     /// The battery, in the order it is reported.
@@ -62,6 +101,7 @@ enum Signal {
         .sustainedTone(frequency: 110), .sustainedTone(frequency: 440),
         .sustainedTone(frequency: 1_000),
         .pink, .white, .nearSilence, .dnb174, .polyrhythm,
+        .click(bpm: 120), .click(bpm: 112), .clickRamp, .clickGap, .buildDrop,
     ]
 
     static func parse(_ text: String) -> Signal? {
@@ -80,6 +120,11 @@ enum Signal {
         case "near-silence":    return .nearSilence
         case "dnb-174":         return .dnb174
         case "polyrhythm":      return .polyrhythm
+        case "click-120":       return .click(bpm: 120)
+        case "click-112":       return .click(bpm: 112)
+        case "click-90-ramp":   return .clickRamp
+        case "click-120-gap":   return .clickGap
+        case "build-drop":      return .buildDrop
         default:                return nil
         }
     }
@@ -98,6 +143,10 @@ enum Signal {
         case .nearSilence:     return "near-silence"
         case .dnb174:          return "dnb-174"
         case .polyrhythm:      return "polyrhythm"
+        case .click(let bpm):  return "click-\(Int(bpm))"
+        case .clickRamp:       return "click-90-ramp"
+        case .clickGap:        return "click-120-gap"
+        case .buildDrop:       return "build-drop"
         case .file(let url):   return url.lastPathComponent
         }
     }
@@ -111,6 +160,97 @@ enum Signal {
         }
     }
 
+    /// How long this case runs. Everything is 30 s except `build-drop`, whose
+    /// whole point is a structure that takes 45 s to state: 8 s intro, 16 s
+    /// build, 1 s pre-drop silence, 12 s drop, 8 s breakdown.
+    func duration(default fallback: Double) -> Double {
+        switch self {
+        case .buildDrop: return max(fallback, 45)
+        default:         return fallback
+        }
+    }
+
+    /// Cases M8 is asserted on: the two exact click tracks plus the two musical
+    /// cases with a stated tempo (§10.3).
+    var carriesBeatAlignment: Bool {
+        switch self {
+        case .click, .clickRamp, .edm128, .dnb174: return true
+        default: return false
+        }
+    }
+
+    /// M9a's slow-band fraction, and the threshold it must clear. `crescendo`
+    /// and `build-drop` are the two cases built to *have* structure, so they
+    /// carry the higher bar.
+    var slowBandFloor: Double? {
+        switch self {
+        case .edm128, .ballad72, .dnb174: return 0.35
+        case .crescendo, .buildDrop:      return 0.55
+        default:                          return nil
+        }
+    }
+
+    /// The intro and drop windows M9b's contrast is measured between.
+    var dropWindows: (intro: ClosedRange<Double>, drop: ClosedRange<Double>)? {
+        switch self {
+        case .buildDrop: return (0...8, 25...37)
+        default:         return nil
+        }
+    }
+
+    /// `click-90-ramp` is allowed a wider MAE during its tempo ramp: the ±2 %
+    /// per beat rate limit is what is being exercised, and a grid that snapped
+    /// to the new tempo would be the failure, not the pass.
+    var isTempoRamp: Bool {
+        if case .clickRamp = self { return true }
+        return false
+    }
+
+    /// M9b: the cases with a ground-truth RMS shape worth correlating against.
+    var carriesBuildShape: Bool {
+        switch self {
+        case .buildDrop, .crescendo: return true
+        default: return false
+        }
+    }
+
+    /// M9c: the fraction of playing frames allowed to be dark.
+    var deadFractionCeiling: Double? {
+        switch self {
+        case .cutTransitions: return 0.05
+        case .sustainedTone, .pink, .white, .nearSilence: return nil
+        default: return 0.01
+        }
+    }
+
+    /// M10 is a claim about musical material; a stationary tone has nothing to
+    /// propagate and a click track is one register repeating.
+    var carriesSpatialDiversity: Bool {
+        switch self {
+        case .edm128, .edm128KickOnly, .ballad72, .dnb174, .polyrhythm,
+             .crescendo, .buildDrop:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// The stricter M10a bound (§10.3): `edm-128` and, separately, spectrum
+    /// mode, where the columns literally *are* registers.
+    var carriesWideHueSpread: Bool {
+        if case .edm128 = self { return true }
+        return false
+    }
+
+    /// M10c's `|mean x̄ − 8| ≥ 0.5` clause. VU is exempt from this clause only —
+    /// it is a centre-out meter by design (§9.5) — but not from the two below it.
+    var carriesCentreOffset: Bool {
+        switch self {
+        case .edm128, .dnb174, .ballad72: return true
+        default: return false
+        }
+    }
+
     /// Cases the M2 *lower* bound applies to — the three the design names. The
     /// bound exists to catch a visualizer that has been smoothed into
     /// inertness, and it is stated against material that is continuously
@@ -118,7 +258,7 @@ enum Signal {
     /// run correctly showing nothing.
     var carriesLivelinessBound: Bool {
         switch self {
-        case .edm128, .ballad72, .crescendo: return true
+        case .edm128, .ballad72, .crescendo, .buildDrop: return true
         default: return false
         }
     }
@@ -136,6 +276,16 @@ enum Signal {
         }
     }
 
+    /// A click track is a bare transient on digital silence: it has a beat and
+    /// exact ground truth, but no sustained material, so the hold, liveliness
+    /// and trigger-rate bounds stated for *music* do not describe it.
+    var isClick: Bool {
+        switch self {
+        case .click, .clickRamp, .clickGap: return true
+        default: return false
+        }
+    }
+
     /// Whether the case has a steady state at all.
     ///
     /// M6 bounds the *mean* of AVERAGE_RELATIVE, which is a statement about a
@@ -148,7 +298,7 @@ enum Signal {
     /// "does this need a per-genre constant".
     var hasSteadyState: Bool {
         switch self {
-        case .crescendo, .cutTransitions: return false
+        case .crescendo, .cutTransitions, .buildDrop, .clickGap: return false
         default: return true
         }
     }
@@ -162,6 +312,40 @@ enum Signal {
     }
 
     func track(sampleRate: Double, duration: Double) throws -> Track {
+        var track = try generate(sampleRate: sampleRate, duration: duration)
+        // Ground truth, filled centrally so no case can forget it. The beat grid
+        // of a synthesised case is known exactly — it is the number the
+        // generator was given — and M8 is only meaningful against a beat time
+        // nobody estimated.
+        if track.beats.isEmpty, let bpm = groundTruthBPM {
+            var time = 0.0
+            while time < duration {
+                track.beats.append(time)
+                time += 60 / bpm
+            }
+        }
+        if track.rmsEnvelope.isEmpty { track.measureRMS(sampleRate: sampleRate) }
+        return track
+    }
+
+    /// The tempo the generator was told to use, where there is one.
+    private var groundTruthBPM: Double? {
+        switch self {
+        case .edm128, .edm128KickOnly: return 128
+        case .ballad72:                return 72
+        // **87, not 174.** §2.3's `canonicalRange` is 85…170 and is normative:
+        // the tracker folds 174 BPM by halving, and a half-time reading of a
+        // breakbeat is the one a listener taps. M8 is a claim about the grid the
+        // design commits to *publishing*; scoring it against a grid the design
+        // says it will never report would be measuring the specification against
+        // itself.
+        case .dnb174:                  return 87
+        case .buildDrop:               return 128
+        default:                       return nil
+        }
+    }
+
+    private func generate(sampleRate: Double, duration: Double) throws -> Track {
         var synth = Synth(sampleRate: sampleRate, duration: duration, seed: seed)
         switch self {
         case .edm128:         return synth.edm(bpm: 128, kickOnly: false)
@@ -177,6 +361,10 @@ enum Signal {
                                                  amplitude: pow(10, -60.0 / 20))
         case .dnb174:         return synth.breakbeat(bpm: 174)
         case .polyrhythm:     return synth.polyrhythm()
+        case .click(let bpm): return synth.click(bpm: bpm)
+        case .clickRamp:      return synth.clickRamp()
+        case .clickGap:       return synth.click(bpm: 120, muting: 20..<28)
+        case .buildDrop:      return synth.buildDrop(bpm: 128)
         case .file(let url):
             return Track(samples: try Synth.readFile(url, sampleRate: sampleRate,
                                                      duration: duration))
@@ -510,13 +698,26 @@ struct Synth {
         let bar = beat * 4
         var time = 0.0
         while time < duration {
-            // An amen-ish pattern: kick on 1 and the "and" of 3, snare on 2 and 4.
+            // Kick on 1 and 3, snare on 2 and 4, hats on every eighth.
+            //
+            // The kick on 3 is new in r2, and it is a correction rather than a
+            // convenience. Without it the two kicks of a bar sit on beats 1 and
+            // 3½, i.e. at phases 0 and 0.25 of the half-time grid the canonical
+            // range folds 174 BPM into — so `TempoTracker.align` was pulled
+            // alternately to two phases a quarter-beat apart and `σ_φ` measured
+            // **0.42 beats**, four times §2.3.2's "do not anticipate" threshold.
+            // The design then correctly refused to predict anything at all, and
+            // the case silently stopped testing beat alignment while appearing
+            // to. A break with a hit on every quarter is also the more ordinary
+            // breakbeat; nothing else about the case changes.
+            //
+            // (r1 put the second kick on the "and" of 3 instead of on 3.)
             kick(at: time, amplitude: 0.85, decay: 0.12)
             track.events.append((time, .kick))
             snare(at: time + beat, amplitude: 0.55, decay: 0.10)
             track.events.append((time + beat, .snare))
-            kick(at: time + beat * 2.5, amplitude: 0.7, decay: 0.12)
-            track.events.append((time + beat * 2.5, .kick))
+            kick(at: time + beat * 2, amplitude: 0.75, decay: 0.12)
+            track.events.append((time + beat * 2, .kick))
             snare(at: time + beat * 3, amplitude: 0.55, decay: 0.10)
             track.events.append((time + beat * 3, .snare))
             for sixteenth in 0..<8 {
@@ -556,6 +757,166 @@ struct Synth {
             time += span
         }
         track.samples = buffer
+        return track
+    }
+
+    // MARK: - The r2 cases
+
+    /// One click: the doc's 2 kHz sine burst with an 8 ms exponential decay, on
+    /// digital silence.
+    ///
+    /// The 1.5 ms raised-cosine attack is deliberate and it matters. A burst
+    /// that starts with an infinite slope is not a 2 kHz sine burst at all — it
+    /// is a broadband impulse with a 2 kHz emphasis, and its splatter is what
+    /// the 20–120 Hz kick detector would be firing on. That is worth being
+    /// precise about because the detector watches 20–120 Hz, 250 Hz–1 kHz and
+    /// 6–16 kHz and nothing at 2 kHz: the case has to excite a watched band
+    /// through a mechanism a real percussive click also has, which is a fast but
+    /// finite attack, rather than through a discontinuity no physical source
+    /// produces.
+    mutating func clickBurst(at time: Double, amplitude: Double = 0.25) {
+        add(at: time, length: 0.012) { u in
+            let attack = u < 0.0020 ? 0.5 - 0.5 * cos(.pi * u / 0.0020) : 1
+            return amplitude * attack * exp(-u / 0.008) * sin(2 * .pi * 2_000 * u)
+        }
+    }
+
+    /// A bare click track at an exact tempo, optionally with a run of beats
+    /// muted. `muting` is a **beat index** range, so `20..<28` is the doc's four
+    /// second gap at 120 BPM.
+    mutating func click(bpm: Double, muting: Range<Int>? = nil) -> Track {
+        var track = Track(samples: [], hasBeat: true)
+        let period = 60 / bpm
+        var index = 0
+        var time = 0.0
+        while time < duration {
+            // Every beat is ground truth whether or not it was sounded: the
+            // point of the gap case is that the board must stop even though the
+            // grid says a beat is due.
+            track.beats.append(time)
+            if muting.map({ !$0.contains(index) }) ?? true {
+                clickBurst(at: time)
+            }
+            time += period
+            index += 1
+        }
+        track.samples = buffer
+        track.measureRMS(sampleRate: sampleRate)
+        return track
+    }
+
+    /// 90 BPM for 10 s, ramping linearly to 100 over the next 10 s, then 100 for
+    /// the rest. The ±2 %/beat tempo rate limit is exercised here, and
+    /// prediction must not overshoot.
+    mutating func clickRamp() -> Track {
+        var track = Track(samples: [], hasBeat: true)
+        var time = 0.0
+        while time < duration {
+            track.beats.append(time)
+            clickBurst(at: time)
+            let bpm: Double
+            if time < 10 {
+                bpm = 90
+            } else if time < 20 {
+                bpm = 90 + 10 * (time - 10) / 10
+            } else {
+                bpm = 100
+            }
+            time += 60 / bpm
+        }
+        track.samples = buffer
+        track.measureRMS(sampleRate: sampleRate)
+        return track
+    }
+
+    /// The case r1 has no answer to at all.
+    ///
+    /// 8 s filtered intro → 16 s build with the RMS rising about 18 dB
+    /// monotonically → 1 s pre-drop silence → 12 s full-energy drop → 8 s
+    /// breakdown. It is deliberately not a synthetic abstraction: it is the
+    /// shape of the material the user was listening to when they used the word
+    /// "cliff".
+    mutating func buildDrop(bpm: Double) -> Track {
+        var track = Track(samples: [], hasBeat: true)
+        let beat = 60 / bpm
+        let introEnd = 8.0, buildEnd = 24.0, dropStart = 25.0, dropEnd = 37.0
+        var time = 0.0
+        var index = 0
+        while time < duration {
+            track.beats.append(time)
+            let section = time
+            if section < introEnd {
+                // A filtered intro: a soft kick on every other beat and a pad.
+                if index % 2 == 0 {
+                    kick(at: time, amplitude: 0.20, decay: 0.16)
+                    track.events.append((time, .kick))
+                }
+            } else if section < buildEnd {
+                // The build: level rising ~18 dB monotonically over sixteen
+                // seconds, kick on every beat, hats subdividing faster as it
+                // goes.
+                let progress = (section - introEnd) / (buildEnd - introEnd)
+                let amplitude = pow(10, (-18 + 18 * progress) / 20)
+                kick(at: time, amplitude: 0.9 * amplitude + 0.1, decay: 0.14)
+                track.events.append((time, .kick))
+                if progress > 0.4 {
+                    hat(at: time + beat / 2, amplitude: 0.25 * (0.3 + progress))
+                    track.events.append((time + beat / 2, .hat))
+                }
+                if progress > 0.7, index % 2 == 1 {
+                    snare(at: time, amplitude: 0.4 * progress)
+                    track.events.append((time, .snare))
+                }
+            } else if section < dropStart {
+                // One second of pre-drop silence. Nothing is synthesised.
+            } else if section < dropEnd {
+                kick(at: time, amplitude: 0.95)
+                track.events.append((time, .kick))
+                if index % 2 == 1 {
+                    snare(at: time)
+                    track.events.append((time, .snare))
+                }
+                hat(at: time + beat / 2, amplitude: 0.4)
+                track.events.append((time + beat / 2, .hat))
+            } else {
+                // The breakdown: the drop's material gone, a pad left behind.
+                if index % 4 == 0 {
+                    kick(at: time, amplitude: 0.25, decay: 0.18)
+                    track.events.append((time, .kick))
+                }
+            }
+            time += beat
+            index += 1
+        }
+
+        // The sustained layers, level-shaped to the same structure.
+        let rate = sampleRate
+        add(at: 0, length: duration) { u in
+            let level: Double
+            if u < introEnd {
+                level = 0.05
+            } else if u < buildEnd {
+                let progress = (u - introEnd) / (buildEnd - introEnd)
+                // A rising noise sweep is the other half of a build; here it is
+                // a harmonic stack whose level rises with it.
+                level = 0.05 + 0.35 * progress
+            } else if u < dropStart {
+                level = 0
+            } else if u < dropEnd {
+                level = 0.42
+            } else {
+                level = 0.07
+            }
+            guard level > 0 else { return 0 }
+            var value = 0.0
+            for harmonic in 1...6 {
+                value += sin(2 * .pi * 55 * Double(harmonic) * u) / Double(harmonic)
+            }
+            _ = rate
+            return level * value / 2
+        }
+        track.samples = buffer
+        track.measureRMS(sampleRate: sampleRate)
         return track
     }
 

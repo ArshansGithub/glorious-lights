@@ -25,6 +25,13 @@ struct SimRun {
     var stall: (length: Double, rate: Double)?
     var sensitivity: Double = 1
     var useThemeColour = false
+    /// The display-side delay of the `/latency` arm (§10.1): the frame composed
+    /// for `t` is recorded as *visible* at `t + L_out`.
+    ///
+    /// **M8 is only meaningful with this on.** A simulator that shows a frame the
+    /// instant it is composed is measuring the model, not the pipeline, and
+    /// would report a beat alignment the hardware cannot achieve.
+    var outputLatency: Double = 0
 
     /// What one run produced, in the form every metric is computed from.
     struct Result {
@@ -53,6 +60,32 @@ struct SimRun {
         var frameInterval: Double = 1.0 / 30
         /// The user sensitivity this run used, which the on-threshold follows.
         var sensitivity: Double = 1
+        /// When each frame was actually *visible*: `t_scheduled + L_out`. M8
+        /// measures against these, never against the composition times.
+        var displayTimes: [Double] = []
+        /// Exact beat times from the generator, for M8.
+        var beats: [Double] = []
+        /// The generator's own RMS envelope, for M9b and M9c.
+        var rmsEnvelope: [(time: Double, rms: Double)] = []
+        /// §7.2-R: colour packets per delivered frame, and how many frames fell
+        /// back to a full repaint. Produced by running the real
+        /// ``FramePackets/plan(for:lastSent:)`` over consecutive frames, which is
+        /// the only place that budget can be checked without hardware.
+        var packetCounts: [Int] = []
+        var fullRepaints = 0
+        /// `Φ`, `Σ` and `E` at the analysis rate, for the report.
+        var phrase: [Double] = []
+        var section: [Double] = []
+        var energy: [Double] = []
+        var phaseSigma: [Double] = []
+        /// Every distinct beat the tracker published, so the grid's own offset
+        /// against the ground truth can be measured separately from the
+        /// scheduler's. Without it "off beat" cannot be attributed.
+        var publishedBeats: [Double] = []
+        /// What §2.3.4's credit rule did: launches, confirmations, misses.
+        var beatLaunches = 0
+        var beatConfirmations = 0
+        var beatMisses = 0
     }
 
     func run() throws -> Result {
@@ -63,6 +96,8 @@ struct SimRun {
 
         var result = Result()
         result.events = track.events
+        result.beats = track.beats
+        result.rmsEnvelope = track.rmsEnvelope
         result.frameInterval = engine.frameInterval
         result.sensitivity = sensitivity
 
@@ -75,6 +110,11 @@ struct SimRun {
         var detected: [OnsetEvent] = []
         var confidences: [Double] = []
         var bpms: [Double] = []
+        var phrases: [Double] = []
+        var sections: [Double] = []
+        var energies: [Double] = []
+        var sigmas: [Double] = []
+        var published: [Double] = []
         engine.bus.onPublish = { state, onsets in
             detected += onsets
             // The first five seconds are the warm-up the design explicitly
@@ -91,6 +131,14 @@ struct SimRun {
                 }
                 confidences.append(state.tempo.confidence)
                 if state.tempo.bpm > 0 { bpms.append(state.tempo.bpm) }
+                phrases.append(state.phrase)
+                sections.append(state.section)
+                energies.append(state.energy)
+                sigmas.append(state.tempo.phaseSigma)
+                let beat = state.tempo.nextBeatTime
+                if beat > 0, published.last.map({ abs($0 - beat) > 0.2 }) ?? true {
+                    published.append(beat)
+                }
             }
         }
 
@@ -101,6 +149,7 @@ struct SimRun {
         var scheduled = 0.0
         var lastComposed = 0.0
         var lastColors: [RGB]?
+        var lastPacked: [RGB]?
 
         let totalFrames = Int(duration / dt)
         var frame = 0
@@ -133,6 +182,11 @@ struct SimRun {
                 audioPosition = end
             }
 
+            // The transport's contribution to `L̂`, reported before the frame
+            // that will use it is composed. On hardware this comes from the
+            // echoed `END`; here it is the arm's own injected delay, which is
+            // the same quantity measured the same way (§8.2-R).
+            engine.reportDelivery(lag: outputLatency)
             let colors = engine.renderFrame(at: scheduled)
             result.tickIntervals.append(scheduled - lastComposed)
             lastComposed = scheduled
@@ -140,7 +194,14 @@ struct SimRun {
             // that was delivered if the transport is mid-stall.
             let shown = stalled ? (lastColors ?? colors) : colors
             if stalled { result.droppedFrames += 1 } else { lastColors = colors }
+            if !stalled {
+                let plan = FramePackets.plan(for: colors, lastSent: lastPacked)
+                lastPacked = colors
+                result.packetCounts.append(plan.colourPackets)
+                if plan.fullRepaint { result.fullRepaints += 1 }
+            }
             result.frameTimes.append(scheduled)
+            result.displayTimes.append(scheduled + outputLatency)
             result.levels.append(shown.map { colour in
                 max(KeyInterlock.decode(colour.red),
                     max(KeyInterlock.decode(colour.green), KeyInterlock.decode(colour.blue)))
@@ -156,6 +217,7 @@ struct SimRun {
                 // The board keeps showing the last frame that was delivered.
                 if let lastColors {
                     result.frameTimes.append(Double(next - 1) * dt)
+                    result.displayTimes.append(Double(next - 1) * dt + outputLatency)
                     result.levels.append(result.levels[result.levels.count - 1])
                     result.colors.append(lastColors)
                 }
@@ -167,6 +229,15 @@ struct SimRun {
         result.staleFrames = engine.telemetry.stale
         result.tempoConfidence = confidences
         result.bpm = bpms
+        result.phrase = phrases
+        result.section = sections
+        result.energy = energies
+        result.phaseSigma = sigmas
+        result.publishedBeats = published
+        let beat = engine.renderer.beatTelemetry
+        result.beatLaunches = beat.launches
+        result.beatConfirmations = beat.confirmations
+        result.beatMisses = beat.misses
         for band in 0..<AnalysisState.bandCount where bandCounts[band] > 0 {
             result.bandAverageRelative[band] = bandSums[band] / bandCounts[band]
             // "Present" means the band carried a real share of the spectrum,
