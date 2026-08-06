@@ -98,9 +98,10 @@ struct Settings {
 
     /// How the audio visualizer paints its bars.
     var visualizerStyle: VisualizerStyle = .heat
-    /// Input gain multiplier, 0.5x to 8x. Not persisted as a percentage because
-    /// it is a multiplier, and the useful range is far from linear.
-    var visualizerSensitivity: Double = 2.0
+    /// Gain multiplier applied *on top of* the pipeline's own source-relative
+    /// normalisation, so 1.0 is "what the normaliser thinks is right" rather
+    /// than any absolute level.
+    var visualizerSensitivity: Double = 1.0
     /// Whether the visualizer normalises to recent peaks.
     var visualizerAutoGain: Bool = true
     /// Whether a source has ever been chosen, so the first launch can pick the
@@ -200,7 +201,11 @@ struct Settings {
             visualizerStyle = stored
         }
         if let stored = defaults.object(forKey: Key.visualizerSensitivity) as? Double {
-            visualizerSensitivity = min(max(stored, 0.5), 8)
+            // The old scale meant something else — an absolute multiplier
+            // against full-scale audio — so a stored value from before the
+            // normalisation rework is clamped into the new, narrower range
+            // rather than carried over as-is.
+            visualizerSensitivity = min(max(stored, 0.25), 4)
         }
         if let stored = defaults.object(forKey: Key.visualizerAutoGain) as? Bool {
             visualizerAutoGain = stored

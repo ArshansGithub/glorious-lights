@@ -432,133 +432,255 @@ final class VisualizerTests: XCTestCase {
         XCTAssertEqual(weights, weights.sorted())
     }
 
-    // MARK: - Noise gate
+    // MARK: - Source-relative levelling
 
-    private func pipeline(noiseFloorDB: Double = VisualizerPipeline.defaultNoiseFloorDB,
+    private func pipeline(gateMarginDB: Double = VisualizerPipeline.defaultGateMarginDB,
                           sensitivity: Double = 1,
-                          autoGain: Bool = false) -> VisualizerPipeline {
-        VisualizerPipeline(sampleRate: 48_000, bandCount: 3,
+                          autoGain: Bool = true,
+                          bandCount: Int = 3) -> VisualizerPipeline {
+        VisualizerPipeline(sampleRate: 48_000, bandCount: bandCount,
                            tuning: .init(sensitivity: sensitivity,
                                          autoGain: autoGain,
-                                         noiseFloorDB: noiseFloorDB,
+                                         gateMarginDB: gateMarginDB,
                                          equalization: true))
     }
 
-    /// A band below the floor produces a bar of exactly zero — not a small
-    /// number that still lights the bottom row.
-    func testBandsBelowTheFloorAreFullyDark() {
-        let pipeline = self.pipeline(noiseFloorDB: -40)   // 0.01 linear
-        let quiet: [Float] = [0.001, 0.002, 0.005]
+    /// Runs a constant input for `seconds` and returns the final bar heights.
+    private func settle(_ pipeline: VisualizerPipeline,
+                        levels: [Float],
+                        seconds: Double,
+                        fps: Double = 15) -> [Float] {
         var heights = [Float]()
-        for _ in 0..<20 { heights = pipeline.advance(levels: quiet, elapsed: 1.0 / 15) }
-        XCTAssertEqual(heights, [0, 0, 0])
-        XCTAssertEqual(BarRenderer.rowsLit(level: heights[0], rowCount: 5), 0)
-    }
-
-    /// A band above the floor is unaffected by the gate.
-    func testBandsAboveTheFloorPassThrough() {
-        let pipeline = self.pipeline(noiseFloorDB: -40)
-        let heights = pipeline.advance(levels: [0.5, 0.5, 0.5], elapsed: 1.0 / 15)
-        XCTAssertTrue(heights.allSatisfy { $0 > 0.4 }, "\(heights)")
-    }
-
-    /// **Gating happens before the gain.** Otherwise a high sensitivity — or an
-    /// auto-gain multiplier wound up during a quiet passage — amplifies the room
-    /// noise straight through the gate, which is the flicker this is meant to
-    /// remove.
-    func testTheGateIsNotDefeatedByHighSensitivity() {
-        let pipeline = self.pipeline(noiseFloorDB: -40, sensitivity: 100)
-        var heights = [Float]()
-        for _ in 0..<20 { heights = pipeline.advance(levels: [0.001, 0.001, 0.001],
-                                                     elapsed: 1.0 / 15) }
-        XCTAssertEqual(heights, [0, 0, 0])
-    }
-
-    func testTheGateIsNotDefeatedByAutoGain() {
-        let pipeline = self.pipeline(noiseFloorDB: -40, sensitivity: 1, autoGain: true)
-        var heights = [Float]()
-        for _ in 0..<60 { heights = pipeline.advance(levels: [0.002, 0.002, 0.002],
-                                                     elapsed: 1.0 / 15) }
-        XCTAssertEqual(heights, [0, 0, 0])
-    }
-
-    /// A disabled floor is the pre-tuning behaviour: everything passes.
-    func testTheGateCanBeDisabled() {
-        let pipeline = VisualizerPipeline(sampleRate: 48_000, bandCount: 3,
-                                          tuning: .preTuning)
-        let heights = pipeline.advance(levels: [0.001, 0.001, 0.001], elapsed: 1.0 / 15)
-        XCTAssertTrue(heights.allSatisfy { $0 > 0 }, "\(heights)")
-    }
-
-    // MARK: - Gate hysteresis
-
-    /// **A band sitting on the threshold must not chatter.** Once closed, the
-    /// gate needs a level meaningfully above the floor to reopen, or noise
-    /// hovering at the boundary flickers the bar once per frame — the very
-    /// thing the gate was added to stop.
-    func testAClosedGateNeedsMoreThanTheFloorToReopen() {
-        let pipeline = self.pipeline(noiseFloorDB: -40)
-        let close = Float(pow(10.0, -40.0 / 20.0))            // 0.0100
-
-        // Close it.
-        for _ in 0..<10 { _ = pipeline.advance(levels: [0, 0, 0], elapsed: 1.0 / 15) }
-
-        // Just above the closing threshold is not enough to reopen.
-        let justAbove = close * 1.05
-        var heights = [Float]()
-        for _ in 0..<10 {
-            heights = pipeline.advance(levels: [justAbove, justAbove, justAbove],
-                                       elapsed: 1.0 / 15)
+        for _ in 0..<Int(seconds * fps) {
+            heights = pipeline.advance(levels: levels, elapsed: 1 / fps)
         }
-        XCTAssertEqual(heights, [0, 0, 0], "the gate reopened on a level barely above the floor")
+        return heights
+    }
 
-        // Clearly above the hysteresis margin does reopen it.
-        let open = Float(pow(10.0, (-40.0 + VisualizerPipeline.gateHysteresisDB) / 20.0))
-        heights = pipeline.advance(levels: [open * 1.1, open * 1.1, open * 1.1],
-                                   elapsed: 1.0 / 15)
+    /// **The defect that made the microphone useless.** Live mic input runs
+    /// roughly 40 dB below file audio, and the first tuning pass gated on
+    /// absolute dBFS measured against files — so everything was swallowed. The
+    /// levelling is now relative to the source's own floor, and the same quiet
+    /// input has to fill the board.
+    func testAVeryQuietSourceStillFillsTheBoard() {
+        let pipeline = self.pipeline()
+        // A mic-like signal: a noise floor around -60 dBFS with content ~20 dB
+        // above it — nowhere near full scale.
+        let floor: Float = 0.001
+        let content: Float = 0.01
+
+        _ = settle(pipeline, levels: [floor, floor, floor], seconds: 2)
+        let heights = settle(pipeline, levels: [content, content, content], seconds: 2)
+
+        XCTAssertTrue(heights.allSatisfy { $0 > 0.5 },
+                      "a quiet source should still reach useful bar heights; got \(heights)")
+    }
+
+    /// And the same defaults must not blow up on a loud one.
+    func testAFullScaleSourceIsNotPermanentlyPinned() {
+        let pipeline = self.pipeline()
+        _ = settle(pipeline, levels: [0.5, 0.5, 0.5], seconds: 2)
+        // A quieter passage after loud material must visibly drop rather than
+        // staying at full.
+        let quieter = settle(pipeline, levels: [0.05, 0.05, 0.05], seconds: 1)
+        XCTAssertTrue(quieter.allSatisfy { $0 < 0.9 }, "\(quieter)")
+    }
+
+    /// Two sources ~34 dB apart should end up looking the same, which is the
+    /// whole point of normalising to the source rather than to full scale.
+    func testQuietAndLoudSourcesConvergeToSimilarHeights() {
+        let quiet = self.pipeline()
+        let loud = self.pipeline()
+
+        _ = settle(quiet, levels: [0.001, 0.001, 0.001], seconds: 2)
+        _ = settle(loud, levels: [0.05, 0.05, 0.05], seconds: 2)
+
+        let quietHeights = settle(quiet, levels: [0.02, 0.02, 0.02], seconds: 3)
+        let loudHeights = settle(loud, levels: [1.0, 1.0, 1.0], seconds: 3)
+
+        XCTAssertEqual(Double(quietHeights[0]), Double(loudHeights[0]), accuracy: 0.1,
+                       "a 34 dB level difference should not change the display")
+    }
+
+    /// **Where scale-independence deliberately stops.** A purely relative system
+    /// cannot tell a silent room from music played very quietly, so it would
+    /// happily amplify hiss to full height. ``LoudnessReference/minimumReference``
+    /// is the absolute floor that prevents it — and the price is that sources
+    /// below it are *not* normalised up to match louder ones.
+    func testSourcesBelowTheReferenceFloorAreNotAmplifiedToMatch() {
+        let veryQuiet = self.pipeline()
+        _ = settle(veryQuiet, levels: [0.00001, 0.00001, 0.00001], seconds: 2)
+        // Excess far below the minimum reference.
+        let heights = settle(veryQuiet, levels: [0.0002, 0.0002, 0.0002], seconds: 3)
+        XCTAssertTrue(heights.allSatisfy { $0 < 0.3 },
+                      "near-silence must not be normalised up to fill the board; got \(heights)")
+    }
+
+    /// A source that is only its own noise floor stays dark, whatever that
+    /// floor's absolute level is.
+    func testSteadyNoiseIsGatedOnceTheFloorConverges() {
+        for floor: Float in [0.00001, 0.001, 0.05] {
+            let pipeline = self.pipeline()
+            let heights = settle(pipeline, levels: [floor, floor, floor], seconds: 4)
+            XCTAssertEqual(heights, [0, 0, 0],
+                           "a steady floor of \(floor) should be gated away")
+        }
+    }
+
+    /// Digital silence never divides by a zero floor.
+    func testDigitalSilenceIsDarkAndFinite() {
+        let pipeline = self.pipeline()
+        let heights = settle(pipeline, levels: [0, 0, 0], seconds: 3)
+        XCTAssertEqual(heights, [0, 0, 0])
+        XCTAssertTrue(heights.allSatisfy { $0.isFinite })
+    }
+
+    /// Content well above the floor opens the gate.
+    func testContentAboveTheMarginOpensTheGate() {
+        let pipeline = self.pipeline(gateMarginDB: 9)
+        _ = settle(pipeline, levels: [0.001, 0.001, 0.001], seconds: 2)
+        // +20 dB over the floor is comfortably past a 9 dB margin.
+        let heights = pipeline.advance(levels: [0.01, 0.01, 0.01], elapsed: 1.0 / 15)
         XCTAssertTrue(heights.allSatisfy { $0 > 0 }, "\(heights)")
     }
 
-    /// Once open, the gate does not close until the level falls below the
-    /// *lower* threshold — the other half of the hysteresis.
-    func testAnOpenGateStaysOpenBetweenTheThresholds() {
-        let pipeline = self.pipeline(noiseFloorDB: -40)
-        let close = Float(pow(10.0, -40.0 / 20.0))
-        let open = Float(pow(10.0, (-40.0 + VisualizerPipeline.gateHysteresisDB) / 20.0))
+    /// **Hysteresis**: a band hovering at the margin must not chatter open and
+    /// shut once per frame, which is the flicker the gate exists to remove.
+    func testTheGateDoesNotChatterAtTheMargin() {
+        let pipeline = self.pipeline(gateMarginDB: 9, bandCount: 1)
+        let floor: Float = 0.001
+        _ = settle(pipeline, levels: [floor], seconds: 3)
 
-        _ = pipeline.advance(levels: [open * 2, open * 2, open * 2], elapsed: 1.0 / 15)
-        // Between the two thresholds: still open, so the bar is still driven.
-        let between = (close + open) / 2
-        let heights = pipeline.advance(levels: [between, between, between], elapsed: 1.0 / 15)
-        XCTAssertTrue(heights.allSatisfy { $0 > 0 }, "\(heights)")
+        // Sit just under the opening ratio: it must never open.
+        let justUnder = floor * Float(pow(10.0, 8.0 / 20.0))
+        var opened = 0
+        for _ in 0..<40 {
+            let heights = pipeline.advance(levels: [justUnder], elapsed: 1.0 / 15)
+            if heights[0] > 0 { opened += 1 }
+        }
+        XCTAssertEqual(opened, 0, "the gate opened below its margin")
     }
 
-    /// A gated band decays rather than snapping, so a passage ending does not
-    /// look like the display crashed — but it does reach exactly zero.
+    /// The gate can be disabled, which is what ``Tuning/preTuning`` does.
+    ///
+    /// Driven with a *varying* signal on purpose: the floor tracks a constant
+    /// input exactly, so a constant leaves no excess and lights nothing whether
+    /// the gate is on or off.
+    func testTheGateCanBeDisabled() {
+        let gated = self.pipeline(gateMarginDB: 40)
+        let ungated = VisualizerPipeline(sampleRate: 48_000, bandCount: 3,
+                                         tuning: .preTuning)
+        var gatedLit = false
+        var ungatedLit = false
+        for step in 0..<60 {
+            // Quiet floor with small bumps: under a 40 dB margin the gate keeps
+            // these out, and with no gate at all they get through.
+            let level: Float = step.isMultiple(of: 3) ? 0.0015 : 0.001
+            gatedLit = gatedLit || gated.advance(levels: [level, level, level],
+                                                 elapsed: 1.0 / 15).contains { $0 > 0 }
+            ungatedLit = ungatedLit || ungated.advance(levels: [level, level, level],
+                                                       elapsed: 1.0 / 15).contains { $0 > 0 }
+        }
+        XCTAssertFalse(gatedLit, "a 40 dB margin should reject a 3.5 dB bump")
+        XCTAssertTrue(ungatedLit, "with the gate disabled the same bump should show")
+    }
+
+    /// A gated band decays rather than snapping, and still reaches exactly zero.
     func testAGatedBarDecaysToExactlyZero() {
-        let pipeline = self.pipeline(noiseFloorDB: -40)
-        _ = pipeline.advance(levels: [1, 1, 1], elapsed: 1.0 / 15)
+        let pipeline = self.pipeline()
+        _ = settle(pipeline, levels: [0.0001, 0.0001, 0.0001], seconds: 2)
+        _ = settle(pipeline, levels: [0.05, 0.05, 0.05], seconds: 1)
 
-        let firstAfterGating = pipeline.advance(levels: [0, 0, 0], elapsed: 1.0 / 15)
-        XCTAssertGreaterThan(firstAfterGating[0], 0, "the bar should fall, not snap")
-        XCTAssertLessThan(firstAfterGating[0], 1)
+        let firstAfter = pipeline.advance(levels: [0.0001, 0.0001, 0.0001], elapsed: 1.0 / 15)
+        XCTAssertGreaterThan(firstAfter[0], 0, "the bar should fall, not snap")
 
-        var heights = firstAfterGating
-        for _ in 0..<40 { heights = pipeline.advance(levels: [0, 0, 0], elapsed: 1.0 / 15) }
+        let heights = settle(pipeline, levels: [0.0001, 0.0001, 0.0001], seconds: 4)
         XCTAssertEqual(heights, [0, 0, 0], "an exponential tail must still reach zero")
     }
 
-    /// The pipeline is the one place the app and the simulator share, so a reset
-    /// has to clear everything a session could inherit.
     func testResetClearsDisplayState() {
-        let pipeline = self.pipeline(noiseFloorDB: -40)
-        _ = pipeline.advance(levels: [1, 1, 1], elapsed: 1.0 / 15)
+        let pipeline = self.pipeline()
+        _ = settle(pipeline, levels: [0.5, 0.5, 0.5], seconds: 1)
         pipeline.reset()
         let heights = pipeline.advance(levels: [0, 0, 0], elapsed: 1.0 / 15)
         XCTAssertEqual(heights, [0, 0, 0])
     }
 
-    // MARK: - Source selection
+    // MARK: - Noise floor tracker
+
+    /// A minimum-follower drops to a new minimum immediately, so a session
+    /// converges on the first quiet frame instead of gating everything while it
+    /// eases down.
+    func testTheFloorDropsImmediatelyToANewMinimum() {
+        var tracker = NoiseFloorTracker(bandCount: 1)
+        _ = tracker.update(with: [1.0], elapsed: 0)
+        let floor = tracker.update(with: [0.01], elapsed: 1.0 / 15)[0]
+        XCTAssertEqual(floor, 0.01)
+    }
+
+    /// And rises slowly, so a sustained note is not mistaken for the floor and
+    /// gated away mid-phrase.
+    func testTheFloorRisesSlowly() {
+        var tracker = NoiseFloorTracker(bandCount: 1)
+        _ = tracker.update(with: [0.001], elapsed: 0)
+        var floor: Float = 0
+        for _ in 0..<30 { floor = tracker.update(with: [0.5], elapsed: 1.0 / 15)[0] }
+        XCTAssertLessThan(floor, 0.25, "two seconds of loud audio should not become the floor")
+    }
+
+    /// **The invariant**: the floor is a minimum, so it is never above the
+    /// signal — otherwise the excess over it goes negative and real audio gets
+    /// gated by a floor that walked up past it. An alternating loud/quiet signal
+    /// is what breaks a follower that eases downward instead of snapping.
+    func testTheFloorNeverExceedsTheSignal() {
+        var tracker = NoiseFloorTracker(bandCount: 1)
+        for step in 0..<200 {
+            let value: Float = step.isMultiple(of: 2) ? 0.02 : 0.9
+            let floor = tracker.update(with: [value], elapsed: 1.0 / 15)[0]
+            XCTAssertLessThanOrEqual(floor, value, "step \(step)")
+        }
+    }
+
+    // MARK: - Loudness reference
+
+    /// The reference is a high percentile across bands, not the single peak —
+    /// so one band spiking does not rescale the whole board.
+    func testTheReferenceIsAPercentileNotThePeak() {
+        var loud = [Float](repeating: 0.01, count: 17)
+        loud[3] = 1.0
+        let percentile = LoudnessReference.percentileValue(of: loud)
+        XCTAssertLessThan(percentile, 0.5, "one spike should not define the scale")
+        XCTAssertGreaterThan(percentile, 0)
+    }
+
+    /// It rises quickly, so a track starting fills the board within a second or
+    /// two, and falls slowly, so gaps between phrases do not pump.
+    func testTheReferenceRisesFasterThanItFalls() {
+        var rising = LoudnessReference()
+        let afterRise = rising.update(with: [Float](repeating: 1, count: 3), elapsed: 0.5)
+        XCTAssertGreaterThan(afterRise, 0.5, "should reach most of the way up in half a second")
+
+        // Settle a second one at full, then let it fall for the same half second.
+        var falling = LoudnessReference()
+        for _ in 0..<30 { _ = falling.update(with: [Float](repeating: 1, count: 3),
+                                             elapsed: 1.0 / 15) }
+        XCTAssertGreaterThan(falling.current, 0.9)
+        let afterFall = falling.update(with: [Float](repeating: 0, count: 3), elapsed: 0.5)
+        XCTAssertGreaterThan(afterFall, 0.5,
+                             "half a second of quiet should barely move the reference")
+        XCTAssertLessThan(afterFall, falling.current + 0.001)
+    }
+
+    /// Silence cannot drive the reference to zero and the gain to infinity.
+    func testTheReferenceHasAFloor() {
+        var reference = LoudnessReference()
+        var value: Float = 0
+        for _ in 0..<200 { value = reference.update(with: [0, 0, 0], elapsed: 1) }
+        XCTAssertEqual(value, LoudnessReference.minimumReference)
+        XCTAssertTrue(value > 0)
+    }
+
+    // MARK: - Source selection    // MARK: - Source selection
 
     /// System audio is what someone playing music actually wants — it hears the
     /// mix rather than the room — so it wins when it is already granted.

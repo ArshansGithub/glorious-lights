@@ -47,12 +47,13 @@ let usage = """
 
     PIPELINE OPTIONS (mirroring the app):
       --style theme|heat    Bar colours (default: heat)
-      --sensitivity <x>     Gain multiplier (default: 2.0)
+      --sensitivity <x>     Gain multiplier on top of the normalisation (default: 1.0)
       --agc on|off          Auto gain (default: on)
-      --noise-floor <dB>    Gate, in dBFS (default: -50; use -inf to disable)
+      --gate-margin <dB>    How far above the observed noise floor a band must sit
+                            to count as signal (default: 9; use -inf to disable)
       --eq on|off           Pink-noise equalisation (default: on)
-      --legacy              Shorthand for --eq off --noise-floor -inf: the
-                            behaviour before live-test tuning, for comparison
+      --legacy              Shorthand for --eq off --gate-margin -inf with a flat
+                            2x gain: the behaviour before live-test tuning
 
     RUN OPTIONS:
       --fps <n>             Display frame rate (default: 15)
@@ -71,9 +72,9 @@ let usage = """
 
 var signal: Signal = .pink
 var style: VisualizerStyle = .heat
-var sensitivity = 2.0
+var sensitivity = 1.0
 var autoGain = true
-var noiseFloor = VisualizerPipeline.defaultNoiseFloorDB
+var gateMargin = VisualizerPipeline.defaultGateMarginDB
 var equalization = true
 var fps = 15.0
 var duration = 10.0
@@ -114,14 +115,15 @@ while let option = arguments.first {
         sensitivity = parsed
     case "--agc":
         autoGain = value("--agc") != "off"
-    case "--noise-floor":
-        let text = value("--noise-floor")
-        noiseFloor = text == "-inf" ? -.infinity : (Double(text) ?? { fail("bad --noise-floor") }())
+    case "--gate-margin":
+        let text = value("--gate-margin")
+        gateMargin = text == "-inf" ? -.infinity : (Double(text) ?? { fail("bad --gate-margin") }())
     case "--eq":
         equalization = value("--eq") != "off"
     case "--legacy":
         equalization = false
-        noiseFloor = -.infinity
+        gateMargin = -.infinity
+        sensitivity = 2.0
     case "--fps":
         guard let parsed = Double(value("--fps")), parsed > 0 else { fail("--fps needs a number") }
         fps = parsed
@@ -160,7 +162,7 @@ let pipeline = VisualizerPipeline(
     bandCount: bandCount,
     tuning: .init(sensitivity: sensitivity,
                   autoGain: autoGain,
-                  noiseFloorDB: noiseFloor,
+                  gateMarginDB: gateMargin,
                   equalization: equalization))
 let renderer = BarRenderer(style: style, themeColor: RGB(red: 0x00, green: 0xCC, blue: 0xAA))
 
@@ -176,6 +178,8 @@ let window = SpectrumAnalyzer.windowSize
 let frameCount = max(1, samples.count / samplesPerFrame)
 
 var heightsPerFrame: [[Float]] = []
+var referencePerFrame: [Float] = []
+var floorPerFrame: [Float] = []
 var lastImageTime = -Double.infinity
 var imagesWritten = 0
 
@@ -190,6 +194,11 @@ for frame in 0..<frameCount {
 
     let heights = pipeline.advance(elapsed: frameInterval)
     heightsPerFrame.append(heights)
+    referencePerFrame.append(pipeline.lastReference)
+    if let floorMean = pipeline.lastNoiseFloor.isEmpty
+        ? nil : pipeline.lastNoiseFloor.reduce(0, +) / Float(pipeline.lastNoiseFloor.count) {
+        floorPerFrame.append(floorMean)
+    }
 
     if every > 0, time - lastImageTime >= every - 1e-9 {
         lastImageTime = time
@@ -256,7 +265,7 @@ var report = """
       style:        \(style.rawValue)
       sensitivity:  \(String(format: "%.2f", sensitivity))
       auto gain:    \(autoGain ? "on" : "off")
-      noise floor:  \(noiseFloor == -.infinity ? "disabled" : String(format: "%.0f dBFS", noiseFloor))
+      gate margin:  \(gateMargin == -.infinity ? "disabled" : String(format: "%.0f dB above floor", gateMargin))
       equalisation: \(equalization ? "on" : "off")
       PNGs written: \(imagesWritten)
 
@@ -277,6 +286,12 @@ report += """
       delta / mean height:      \(String(format: "%.3f", overallMean > 0 ? deltaPerColumnFrame / overallMean : 0))  \
     (spazz metric — scale-free, so it is comparable across settings that change bar height)
       frames with any bar lit:  \(String(format: "%.1f%%", litFraction * 100))
+
+    levelling (what the pipeline decided, for tuning)
+      mean noise floor:         \(String(format: "%.6f", floorPerFrame.isEmpty ? 0 : Double(floorPerFrame.reduce(0, +)) / Double(floorPerFrame.count)))
+      final noise floor:        \(String(format: "%.6f", Double(floorPerFrame.last ?? 0)))
+      mean loudness reference:  \(String(format: "%.6f", referencePerFrame.isEmpty ? 0 : Double(referencePerFrame.reduce(0, +)) / Double(referencePerFrame.count)))
+      final loudness reference: \(String(format: "%.6f", Double(referencePerFrame.last ?? 0)))
 
     """
 
