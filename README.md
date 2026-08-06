@@ -50,7 +50,7 @@ brew install --cask glorious-lights
 The `brew trust` step is not optional on Homebrew 6 — without it `brew install`
 refuses to load the cask at all.
 
-**Or download** `Glorious-Lights-1.0.0.zip` from the
+**Or download** the zip from the
 [latest release](https://github.com/ArshansGithub/glorious-lights/releases/latest),
 unzip it, and drag *Glorious Lights.app* to `/Applications`.
 
