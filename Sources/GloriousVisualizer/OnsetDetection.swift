@@ -16,12 +16,23 @@ public struct OnsetEvent: Equatable, Sendable {
     /// gestures rather than being dropped, so the transition from "hit" to
     /// "no hit" is continuous and the board cannot chatter at the boundary.
     public var confidence: Double
+    /// **Which of the eight bands actually fired** — the one inside this kind's
+    /// region carrying the higher relative level on the hop.
+    ///
+    /// §12.4 turns this into geometry: a gesture's origin column is chosen from
+    /// the register that fired, so kicks live on the left of the board and hats
+    /// on the right, and *where* light appears carries information. r1 put every
+    /// kick at exactly the centre column, which is the single largest
+    /// contributor to "the colour is concentrated in the centre".
+    public var band: Int
 
-    public init(time: Double, kind: OnsetKind, strength: Double, confidence: Double) {
+    public init(time: Double, kind: OnsetKind, strength: Double, confidence: Double,
+                band: Int? = nil) {
         self.time = time
         self.kind = kind
         self.strength = strength
         self.confidence = confidence
+        self.band = band ?? kind.bands.lowerBound
     }
 }
 

@@ -95,11 +95,31 @@ public struct TempoEstimate: Equatable, Sendable {
     public var confidence: Double = 0
     /// Position within the current beat, `0` at the beat.
     public var phase: Double = 0
+    /// **Absolute host time of the next beat** (§2.3.1), computed where the
+    /// phase actually lives.
+    ///
+    /// The renderer must never recompute a beat time from `φ` and its own `now`:
+    /// `φ` in an interpolated state has already been advanced by the
+    /// interpolator, and doing the arithmetic twice is how a 10–20 ms error
+    /// enters for free. One absolute timestamp, published once.
+    public var nextBeatTime: Double = 0
+    /// `σ_φ` — the standard deviation of the last eight phase errors, in beats
+    /// (§2.3.2).
+    ///
+    /// **The user's complaint is phase, not BPM.** The tracker's BPM sd is 0.04,
+    /// an order of magnitude better than it needs to be; what was never measured
+    /// is how much the *phase* wanders, and that is what "off beat" feels like.
+    /// This is the one number r1 never had, and it is what decides whether the
+    /// board is allowed to anticipate at all.
+    public var phaseSigma: Double = 1
 
-    public init(bpm: Double = 0, confidence: Double = 0, phase: Double = 0) {
+    public init(bpm: Double = 0, confidence: Double = 0, phase: Double = 0,
+                nextBeatTime: Double = 0, phaseSigma: Double = 1) {
         self.bpm = bpm
         self.confidence = confidence
         self.phase = phase
+        self.nextBeatTime = nextBeatTime
+        self.phaseSigma = phaseSigma
     }
 
     /// Confidence at which gestures may be scheduled on the grid at all.
@@ -120,6 +140,22 @@ public struct TempoEstimate: Equatable, Sendable {
     public var gridWeight: Double {
         guard bpm > 0 else { return 0 }
         return smoothstep(Self.usableConfidence, Self.usableConfidence + 0.2, confidence)
+    }
+
+    /// Phase spread at which the full prediction lead is applied, and at which
+    /// none of it is (§2.3.2).
+    public static let phaseSigmaFull: Double = 0.06
+    public static let phaseSigmaNone: Double = 0.12
+
+    /// How much of the §2.3.3 lead to apply: full when the grid holds within
+    /// ±6 % of a beat (≈ 32 ms at 112 BPM), none when it is worse than ±12 %,
+    /// continuous in between, multiplied by the existing confidence ramp.
+    ///
+    /// With a shaky grid the lead collapses to zero and the board is reactive —
+    /// which is correct, because anticipating a beat you cannot locate is worse
+    /// than being late.
+    public var leadWeight: Double {
+        smoothstep(Self.phaseSigmaNone, Self.phaseSigmaFull, phaseSigma) * gridWeight
     }
 }
 
@@ -146,6 +182,22 @@ public struct TempoTracker: Sendable {
 
     /// Fraction of the way to zero that a detected beat pulls the phase.
     public static let phaseCorrection: Double = 0.20
+    /// …and the fraction of the same error that is fed back into the **period**.
+    ///
+    /// A phase corrector with a proportional term only is a first-order servo,
+    /// and a wrong tempo is a *ramp* disturbance to its input: it settles with a
+    /// standing error of `phaseError / phaseCorrection` — five times the
+    /// per-beat drift. Measured on `click-90-ramp`, the board sat a flat +42 ms
+    /// late for the whole eight seconds it took the autocorrelation window to
+    /// forget the ramp, with `σ_φ` reporting the grid as perfectly stable
+    /// throughout, because a *constant* error has no spread. That is precisely
+    /// the failure mode §2.3.2 says to look for and precisely the one `σ_φ`
+    /// cannot see, so the fix has to be in the loop rather than in the gate.
+    ///
+    /// A frequency term makes it second order: a persistent late phase means the
+    /// period is too long, so shorten it. Small, and still bounded by the ±2 %
+    /// per beat limit §2.3 already states.
+    public static let periodCorrection: Double = 0.10
     /// Maximum tempo change per beat.
     public static let tempoRateLimit: Double = 0.02
     /// Agreeing estimates required before the tempo is allowed to move at all.
@@ -157,6 +209,7 @@ public struct TempoTracker: Sendable {
     private var estimate = TempoEstimate()
     private var observations: [Double] = []
     private var phaseAccumulator: Double = 0
+    private var phaseErrors: [Double] = []
     private var hopsSinceEstimate = 0
     /// Consecutive observations agreeing with a *proposed* new tempo.
     private var pendingTempo: Double = 0
@@ -207,9 +260,36 @@ public struct TempoTracker: Sendable {
         var atBeat = phaseAccumulator - (now - time) / estimate.beatPeriod
         atBeat -= atBeat.rounded(.down)
         let wrapped = atBeat > 0.5 ? atBeat - 1 : atBeat
+        // §2.3.2: the *pre-correction* error is the observation, recorded before
+        // the correction that is about to hide it.
+        phaseErrors.append(wrapped)
+        if phaseErrors.count > Self.phaseErrorWindow {
+            phaseErrors.removeFirst(phaseErrors.count - Self.phaseErrorWindow)
+        }
+        estimate.phaseSigma = Self.sigma(of: phaseErrors)
+        // The frequency half of the loop: a beat that keeps arriving late means
+        // the period is too long. Bounded by the same ±2 % per beat the tempo
+        // median is bounded by, so a single mis-detected beat cannot move it.
+        let nudge = clamp(-wrapped * Self.periodCorrection,
+                          -Self.tempoRateLimit, Self.tempoRateLimit)
+        estimate.bpm = clamp(estimate.bpm * (1 + nudge), Self.minimumBPM, Self.maximumBPM)
         phaseAccumulator -= wrapped * Self.phaseCorrection
         phaseAccumulator -= phaseAccumulator.rounded(.down)
         estimate.phase = phaseAccumulator
+    }
+
+    /// How many phase corrections `σ_φ` is measured over.
+    public static let phaseErrorWindow = 8
+
+    /// `σ_φ` in beats, or a deliberately pessimistic 1.0 until enough
+    /// corrections exist to say anything. An unmeasured grid must not be
+    /// anticipated: ``TempoEstimate/leadWeight`` reads 1.0 as "no lead".
+    static func sigma(of errors: [Double]) -> Double {
+        guard errors.count >= 3 else { return 1 }
+        let mean = errors.reduce(0, +) / Double(errors.count)
+        let variance = errors.reduce(0) { $0 + ($1 - mean) * ($1 - mean) }
+            / Double(errors.count)
+        return variance.squareRoot()
     }
 
     public var current: TempoEstimate { estimate }
@@ -353,6 +433,18 @@ public struct TempoTracker: Sendable {
             + (agreement * min(1, periodicity * 2)) * 0.4
     }
 
-    private static let observationWindow = 16
+    /// How many tempo observations the median is taken over. Re-estimation runs
+    /// twice a second, so this is the window in seconds ×2.
+    ///
+    /// Eight, not sixteen. The median of sixteen observations spans eight
+    /// seconds, so after a tempo change half of what it is averaging is the old
+    /// tempo for a further eight seconds — measured on `click-90-ramp`, the
+    /// reported BPM was still 90.3 four seconds after the music had settled at
+    /// 100, and M8's alignment error stayed at 43 ms because `nextBeatTime` was
+    /// being projected with a period 11 % too long. Eight observations is four
+    /// seconds, which is §10.3's own bound for a settled grid, and the three
+    /// consecutive agreements plus the ±2 %/beat rate limit are what still stop
+    /// a single bad estimate from moving anything.
+    private static let observationWindow = 8
     private static let harmonics = 4
 }
