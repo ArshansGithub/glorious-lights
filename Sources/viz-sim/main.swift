@@ -2,15 +2,15 @@ import Foundation
 import GMMKProtocol
 import GloriousVisualizer
 
-// viz-sim — runs the visualizer's analysis and render pipeline offline, against
-// generated signals or an audio file, and writes PNG frames plus statistics.
+// viz-sim — runs the visualizer offline against generated signals or an audio
+// file, and measures what it actually did.
 //
 // A development tool, not part of the shipped app: `Scripts/make-app.sh` builds
 // only the GMMKLightsApp product, so this never lands in the bundle.
 //
-// It exists so tuning does not need a human, a keyboard and a stereo. It runs
-// the SAME code the app runs — `VisualizerPipeline` and `BarRenderer` — so a
-// number measured here is a claim about the app, not about a copy of it.
+// It drives `VisualizerEngine` — the same object the app drives — with decoupled
+// audio and display clocks, so a number measured here is a claim about the app
+// rather than about a copy of it.
 
 enum SimError: Error, CustomStringConvertible {
     case usage(String)
@@ -32,57 +32,62 @@ enum SimError: Error, CustomStringConvertible {
 }
 
 let usage = """
-    viz-sim — run the keyboard visualizer offline and look at what it would show
+    viz-sim — run the keyboard visualizer offline and measure what it does
 
     USAGE:
-      viz-sim [options]
+      viz-sim --battery [options]
+      viz-sim [--signal <name> | --file <path>] [options]
+
+    THE BATTERY:
+      --battery             Run every synthetic case × every mode × {no jitter,
+                            measured jitter} and print each metric against its
+                            pass threshold. This is the CI gate: a change that
+                            regresses any bound is rejected regardless of how it
+                            looks on any one track.
+      --verbose             Print every check, not just the failures.
 
     INPUT (one of):
-      --signal <name>       Built-in test signal (default: pink)
-                              sine:<hz>      a pure tone, e.g. sine:440
-                              sweep          20 Hz → 18 kHz over the duration
-                              bass-pulses    ~120 bpm kicks at 60-90 Hz over a quiet bed
-                              white          white noise
-                              pink           pink noise — should give a FLAT board
-                              near-silence   -60 dBFS noise — should give a DARK board
-      --file <path>         An audio file instead (wav / m4a / mp3 / anything AVAudioFile reads)
+      --signal <name>       edm-128 | edm-128-kick | ballad-72 | speech |
+                            crescendo | cut-transitions | sustained-tone |
+                            pink | white | near-silence | dnb-174 | polyrhythm
+      --file <path>         An audio file (wav / m4a / mp3 / anything AVAudioFile reads)
 
     PIPELINE OPTIONS (mirroring the app):
       --mode <name>         pulse | wave | ripple | spectrum | vu (default: pulse)
       --theme-colour        Paint in the desk colour instead of the brightness ramp
-      --sensitivity <x>     Gain multiplier on top of the normalisation (default: 1.0)
-      --agc on|off          Auto gain (default: on)
-      --gate-margin <dB>    How far above the observed noise floor a band must sit
-                            to count as signal (default: 9; use -inf to disable)
-      --eq on|off           Pink-noise equalisation (default: on)
-      --legacy              Shorthand for --eq off --gate-margin -inf with a flat
-                            2x gain: the behaviour before live-test tuning
+      --sensitivity <x>     Gain on the composed picture (default: 1.0)
 
     RUN OPTIONS:
-      --fps <n>             Display frame rate (default: 15)
-      --duration <seconds>  How much audio to run (default: 10)
+      --fps <n>             Display frame rate (default: 30)
+      --duration <seconds>  How much audio to run (default: 30)
+      --jitter <ms>         Gaussian jitter on the display wake-up (default: 0)
+      --stall <ms>@<hz>     Inject a transport stall of <ms> at <hz>
       --every <seconds>     How often to write a PNG (default: 0.15; 0 disables)
-      --out <directory>     Where PNGs and stats.txt go (default: ./viz-sim-out)
+      --csv <path>          Per-frame per-LED lightness, which every metric is
+                            computed from
+      --out <directory>     Where PNGs, the movie and stats.txt go
 
     OUTPUT:
-      <out>/animation.mp4         every frame at --fps — watch this, stills cannot
-                                  show whether it flows with the music
-      <out>/frame-<seconds>.png   one per --every of audio (0 disables)
-      <out>/stats.txt             tempo, onsets, gesture coherence and levels
+      <out>/animation.mp4         every frame — watch this; stills cannot show
+                                  whether it flows with the music
+      <out>/frame-<seconds>.png   one per --every of audio
+      <out>/stats.txt             the full metric table
     """
 
 // MARK: - Arguments
 
+var battery = false
+var verbose = false
 var signal: Signal = .pink
 var mode: VisualizerMode = .pulse
 var useThemeColour = false
 var sensitivity = 1.0
-var autoGain = true
-var gateMargin = VisualizerPipeline.defaultGateMarginDB
-var equalization = true
-var fps = 15.0
-var duration = 10.0
+var fps = 30.0
+var duration = 30.0
+var jitterMilliseconds = 0.0
+var stall: (length: Double, rate: Double)?
 var every = 0.15
+var csvPath: String?
 var outputDirectory = URL(fileURLWithPath: "viz-sim-out")
 
 func fail(_ message: String) -> Never {
@@ -102,6 +107,10 @@ while let option = arguments.first {
     case "-h", "--help":
         print(usage)
         exit(0)
+    case "--battery":
+        battery = true
+    case "--verbose":
+        verbose = true
     case "--signal":
         let text = value("--signal")
         guard let parsed = Signal.parse(text) else { fail("unknown signal '\(text)'") }
@@ -121,17 +130,6 @@ while let option = arguments.first {
     case "--sensitivity":
         guard let parsed = Double(value("--sensitivity")) else { fail("--sensitivity needs a number") }
         sensitivity = parsed
-    case "--agc":
-        autoGain = value("--agc") != "off"
-    case "--gate-margin":
-        let text = value("--gate-margin")
-        gateMargin = text == "-inf" ? -.infinity : (Double(text) ?? { fail("bad --gate-margin") }())
-    case "--eq":
-        equalization = value("--eq") != "off"
-    case "--legacy":
-        equalization = false
-        gateMargin = -.infinity
-        sensitivity = 2.0
     case "--fps":
         guard let parsed = Double(value("--fps")), parsed > 0 else { fail("--fps needs a number") }
         fps = parsed
@@ -140,11 +138,25 @@ while let option = arguments.first {
             fail("--duration needs a number")
         }
         duration = parsed
+    case "--jitter":
+        guard let parsed = Double(value("--jitter")), parsed >= 0 else {
+            fail("--jitter needs milliseconds")
+        }
+        jitterMilliseconds = parsed
+    case "--stall":
+        let text = value("--stall")
+        let parts = text.split(separator: "@")
+        guard parts.count == 2, let length = Double(parts[0]), let rate = Double(parts[1]) else {
+            fail("--stall wants <ms>@<hz>, e.g. 200@0.5")
+        }
+        stall = (length / 1000, rate)
     case "--every":
         guard let parsed = Double(value("--every")), parsed >= 0 else {
             fail("--every needs a number")
         }
         every = parsed
+    case "--csv":
+        csvPath = value("--csv")
     case "--out":
         outputDirectory = URL(fileURLWithPath: value("--out"))
     default:
@@ -152,52 +164,92 @@ while let option = arguments.first {
     }
 }
 
-// MARK: - Run
-
 let sampleRate = 48_000.0
-let bandCount = VisualizerLayout.columns.count
 
-let samples: [Float]
+// MARK: - Battery
+
+/// Jitter measured on real hardware is not yet available (§10.5 gap 1), so the
+/// battery's jittered arm uses a deliberately pessimistic 8 ms — a quarter of a
+/// 30 fps frame. The point of the arm is that the *bounds still hold* when the
+/// display wakes late, not that 8 ms is the true distribution.
+let batteryJitter = 0.008
+
+if battery {
+    var rows: [(String, [Metrics.Check])] = []
+    var failures = 0
+    var checksRun = 0
+    let start = Date()
+
+    print("viz-sim --battery — \(Signal.battery.count) signals × "
+          + "\(VisualizerMode.allCases.count) modes × 2 jitter arms, "
+          + "\(Int(duration)) s each at \(Int(fps)) fps")
+    print("")
+
+    for signal in Signal.battery {
+        for mode in VisualizerMode.allCases {
+            for jitter in [0.0, batteryJitter] {
+                var run = SimRun(signal: signal, mode: mode, sampleRate: sampleRate,
+                                 frameRate: fps, duration: duration, jitter: jitter)
+                run.sensitivity = sensitivity
+                let result: SimRun.Result
+                do {
+                    result = try run.run()
+                } catch {
+                    fail(String(describing: error))
+                }
+                let metrics = Metrics.measure(result, signal: signal)
+                let checks = metrics.checks(for: signal, frameInterval: result.frameInterval,
+                                            perOnsetMode: mode == .pulse || mode == .ripple)
+                let label = "\(signal.name)/\(mode.rawValue)"
+                    + (jitter > 0 ? "/jitter" : "")
+                rows.append((label, checks))
+                checksRun += checks.count
+                failures += checks.filter { !$0.passed }.count
+            }
+        }
+    }
+
+    var report = ""
+    for (label, checks) in rows {
+        let failed = checks.filter { !$0.passed }
+        guard verbose || !failed.isEmpty else { continue }
+        report += "\n\(label)\n"
+        for check in (verbose ? checks : failed) {
+            report += String(format: "  %-24@ %-10@ %-16@ %@\n",
+                             check.name as NSString, check.value as NSString,
+                             check.bound as NSString,
+                             (check.passed ? "PASS" : "FAIL") as NSString)
+        }
+    }
+    if !verbose && failures == 0 {
+        report += "\nEvery check passed. Run with --verbose to see them.\n"
+    }
+    print(report)
+    print(String(format: "%d checks over %d runs, %d failed, %.0f s",
+                 checksRun, rows.count, failures, Date().timeIntervalSince(start)))
+    print(failures == 0 ? "BATTERY: PASS" : "BATTERY: FAIL")
+    exit(failures == 0 ? 0 : 1)
+}
+
+// MARK: - Single run
+
+var run = SimRun(signal: signal, mode: mode, sampleRate: sampleRate, frameRate: fps,
+                 duration: duration, jitter: jitterMilliseconds / 1000, stall: stall,
+                 sensitivity: sensitivity, useThemeColour: useThemeColour)
+
+let result: SimRun.Result
 do {
-    samples = try signal.samples(sampleRate: sampleRate, duration: duration)
+    result = try run.run()
 } catch {
     fail(String(describing: error))
 }
-guard !samples.isEmpty else { fail("the input produced no audio") }
+let metrics = Metrics.measure(result, signal: signal)
 
-let pipeline = VisualizerPipeline(
-    sampleRate: Float(sampleRate),
-    bandCount: bandCount,
-    tuning: .init(sensitivity: sensitivity,
-                  autoGain: autoGain,
-                  gateMarginDB: gateMargin,
-                  equalization: equalization))
 do {
     try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
 } catch {
     fail("cannot create '\(outputDirectory.path)': \(error.localizedDescription)")
 }
-
-let frameInterval = 1 / fps
-let samplesPerFrame = Int(sampleRate * frameInterval)
-let frameCount = max(1, samples.count / samplesPerFrame)
-
-let renderer = ModeRenderer(mode: mode,
-                            themeColor: RGB(red: 0x00, green: 0xCC, blue: 0xAA),
-                            useThemeColor: useThemeColour)
-
-var heightsPerFrame: [[Float]] = []
-var referencePerFrame: [Float] = []
-var floorPerFrame: [Float] = []
-var litFractionPerFrame: [Double] = []
-var coherencePerFrame: [Double] = []
-var huePerFrame: [Double] = []
-var brightnessPerFrame: [Double] = []
-var bpmSamples: [Double] = []
-var confidenceSamples: [Double] = []
-var onsetCounts: [OnsetKind: Int] = [:]
-var lastImageTime = -Double.infinity
-var imagesWritten = 0
 
 let movie: MovieWriter?
 do {
@@ -208,142 +260,15 @@ do {
     fail(String(describing: error))
 }
 
-/// Hue of a frame's brightest key, in degrees, and the frame's overall
-/// brightness as the mean luminance across every level key.
-///
-/// Hue is taken from the brightest key rather than averaged: averaging colours
-/// across a frame walks toward grey and would report a narrow spread even for a
-/// vividly varying board.
-func hueAndBrightness(_ colors: [RGB]) -> (hue: Double?, brightness: Double) {
-    func luminance(_ color: RGB) -> Double {
-        (0.2126 * Double(color.red) + 0.7152 * Double(color.green)
-         + 0.0722 * Double(color.blue)) / 255
-    }
-    var total = 0.0
-    var count = 0
-    var brightest = RGB.black
-    var peak = 0.0
-    for column in VisualizerLayout.columns {
-        for row in column.levelRows {
-            for led in row {
-                let offset = Int(led) - Int(GMMKKeyMap.minLEDIndex)
-                guard colors.indices.contains(offset) else { continue }
-                let value = luminance(colors[offset])
-                total += value
-                count += 1
-                if value > peak { peak = value; brightest = colors[offset] }
-            }
-        }
-    }
-    let brightness = count > 0 ? total / Double(count) : 0
-    guard peak > 0.05 else { return (nil, brightness) }
-
-    let r = Double(brightest.red) / 255
-    let g = Double(brightest.green) / 255
-    let b = Double(brightest.blue) / 255
-    let maximum = max(r, max(g, b))
-    let minimum = min(r, min(g, b))
-    let delta = maximum - minimum
-    guard delta > 0.02 else { return (nil, brightness) }
-
-    var hue: Double
-    if maximum == r {
-        hue = 60 * ((g - b) / delta).truncatingRemainder(dividingBy: 6)
-    } else if maximum == g {
-        hue = 60 * ((b - r) / delta + 2)
-    } else {
-        hue = 60 * ((r - g) / delta + 4)
-    }
-    if hue < 0 { hue += 360 }
-    return (hue, brightness)
-}
-
-/// Measures the *shape* of the bright region: how much of the board is
-/// meaningfully lit, and whether those columns form runs rather than specks.
-///
-/// The threshold is relative to the frame's own brightest key, not absolute.
-/// Most modes paint a dim ambient bed so the board is never dead, which means
-/// almost every key is technically non-black — measuring that would report
-/// perfect coherence for a mode that was in fact producing confetti on top of a
-/// wash. What matters is the shape a viewer actually sees.
-func gestureCoherence(_ colors: [RGB]) -> (lit: Double, coherence: Double) {
-    func luminance(_ color: RGB) -> Double {
-        (0.2126 * Double(color.red) + 0.7152 * Double(color.green)
-         + 0.0722 * Double(color.blue)) / 255
-    }
-    let peak = colors.map(luminance).max() ?? 0
-    guard peak > 0.02 else { return (0, 1) }
-    let threshold = peak * 0.45
-
-    var columnLit = [Bool](repeating: false, count: VisualizerLayout.columns.count)
-    var litKeys = 0
-    var totalKeys = 0
-    for (index, column) in VisualizerLayout.columns.enumerated() {
-        for row in column.levelRows {
-            for led in row {
-                totalKeys += 1
-                let offset = Int(led) - Int(GMMKKeyMap.minLEDIndex)
-                guard colors.indices.contains(offset),
-                      luminance(colors[offset]) >= threshold else { continue }
-                litKeys += 1
-                columnLit[index] = true
-            }
-        }
-    }
-    guard litKeys > 0 else { return (0, 1) }
-
-    // Walk the columns, measuring how many lit ones sit in runs of >= 2.
-    var inRun = 0
-    var coherent = 0
-    for lit in columnLit {
-        if lit {
-            inRun += 1
-        } else {
-            if inRun >= 2 { coherent += inRun }
-            inRun = 0
-        }
-    }
-    if inRun >= 2 { coherent += inRun }
-    let litColumns = columnLit.filter { $0 }.count
-    return (Double(litKeys) / Double(totalKeys),
-            litColumns > 0 ? Double(coherent) / Double(litColumns) : 1)
-}
-
-for frame in 0..<frameCount {
-    let time = Double(frame) * frameInterval
-    let end = min((frame + 1) * samplesPerFrame, samples.count)
-    let start = max(0, end - samplesPerFrame)
-    pipeline.analyze(Array(samples[start..<end]))
-
-    let musical = pipeline.musicalFrame(elapsed: frameInterval)
-    heightsPerFrame.append(musical.bandLevels)
-    referencePerFrame.append(pipeline.lastReference)
-    if !pipeline.lastNoiseFloor.isEmpty {
-        floorPerFrame.append(pipeline.lastNoiseFloor.reduce(0, +)
-                             / Float(pipeline.lastNoiseFloor.count))
-    }
-    for (kind, strength) in musical.onsets where strength > 0 {
-        onsetCounts[kind, default: 0] += 1
-    }
-    if musical.tempo.bpm > 0 {
-        bpmSamples.append(musical.tempo.bpm)
-        confidenceSamples.append(musical.tempo.confidence)
-    }
-
-    let colors = renderer.render(musical, elapsed: frameInterval)
-    let measured = gestureCoherence(colors)
-    litFractionPerFrame.append(measured.lit)
-    coherencePerFrame.append(measured.coherence)
-    let appearance = hueAndBrightness(colors)
-    if let hue = appearance.hue { huePerFrame.append(hue) }
-    brightnessPerFrame.append(appearance.brightness)
-
+var lastImageTime = -Double.infinity
+var imagesWritten = 0
+for (index, colors) in result.colors.enumerated() {
+    let time = result.frameTimes[index]
     do {
         try movie?.append(try FrameImage.image(colors: colors))
     } catch {
         fail(String(describing: error))
     }
-
     if every > 0, time - lastImageTime >= every - 1e-9 {
         lastImageTime = time
         let name = String(format: "frame-%06.2fs.png", time)
@@ -356,108 +281,71 @@ for frame in 0..<frameCount {
         }
     }
 }
-
 do { try movie?.finish() } catch { fail(String(describing: error)) }
 
-// MARK: - Statistics
-
-func mean(_ values: [Double]) -> Double {
-    values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
-}
-
-func percentile(_ values: [Double], _ fraction: Double) -> Double {
-    guard !values.isEmpty else { return 0 }
-    let sorted = values.sorted()
-    let index = Int((Double(sorted.count - 1) * fraction).rounded())
-    return sorted[index]
-}
-
-// Hue is circular, so the spread is the widest gap's complement: a run that
-// wraps past 360 is one arc, not two distant ones.
-let hueSpread: Double = {
-    guard huePerFrame.count > 1 else { return 0 }
-    let sorted = huePerFrame.sorted()
-    var widestGap = sorted[0] + 360 - sorted[sorted.count - 1]
-    for index in 1..<sorted.count {
-        widestGap = max(widestGap, sorted[index] - sorted[index - 1])
+if let csvPath {
+    var csv = "time," + (0..<(result.levels.first?.count ?? 0)).map { "led\($0)" }
+        .joined(separator: ",") + "\n"
+    for (index, frame) in result.levels.enumerated() {
+        csv += String(format: "%.4f", result.frameTimes[index]) + ","
+            + frame.map { String(format: "%.4f", $0) }.joined(separator: ",") + "\n"
     }
-    return max(0, 360 - widestGap)
-}()
-let hueSummary: String = huePerFrame.isEmpty
-    ? "none (board never bright enough)"
-    : String(format: "%.0f° – %.0f°", huePerFrame.min()!, huePerFrame.max()!)
-
-let bpmMean = mean(bpmSamples)
-let bpmSorted = bpmSamples.sorted()
-let bpmMedian = bpmSorted.isEmpty ? 0 : bpmSorted[bpmSorted.count / 2]
-// Fraction of frames sitting within 3% of the median — a far better read than
-// standard deviation, which is dominated by the seconds before the estimate
-// first settles.
-let bpmSettled = bpmSamples.isEmpty ? 0
-    : Double(bpmSamples.filter { abs($0 - bpmMedian) / max(bpmMedian, 1) < 0.03 }.count)
-        / Double(bpmSamples.count)
-// Where it ended up, which is what a listener would have seen most of.
-let bpmFinal = bpmSamples.last ?? 0
-// Stability matters more than the absolute value: a tempo that wanders is
-// useless to a mode trying to lock to it.
-let bpmDeviation = bpmSamples.count > 1
-    ? sqrt(mean(bpmSamples.map { ($0 - bpmMean) * ($0 - bpmMean) }))
-    : 0
-let totalOnsets = onsetCounts.values.reduce(0, +)
-let durationSeconds = Double(heightsPerFrame.count) * frameInterval
+    do {
+        try csv.write(to: URL(fileURLWithPath: csvPath), atomically: true, encoding: .utf8)
+    } catch {
+        fail("cannot write '\(csvPath)': \(error.localizedDescription)")
+    }
+}
 
 var report = """
     viz-sim
       signal:       \(signal.name)
       mode:         \(mode.rawValue)
-      duration:     \(String(format: "%.1f", durationSeconds)) s at \(Int(fps)) fps \
-    (\(heightsPerFrame.count) frames)
-      sensitivity:  \(String(format: "%.2f", sensitivity))
-      auto gain:    \(autoGain ? "on" : "off")
-      gate margin:  \(gateMargin == -.infinity ? "disabled" : String(format: "%.0f dB above floor", gateMargin))
-      equalisation: \(equalization ? "on" : "off")
+      duration:     \(String(format: "%.1f", duration)) s at \(Int(fps)) fps \
+    (\(result.levels.count) frames, \(result.droppedFrames) dropped)
+      jitter:       \(String(format: "%.1f", jitterMilliseconds)) ms
       PNGs written: \(imagesWritten)
 
     tempo
-      median BPM:          \(String(format: "%.1f", bpmMedian))
-      final BPM:           \(String(format: "%.1f", bpmFinal))
-      mean BPM:            \(String(format: "%.1f", bpmMean))
-      within 3% of median: \(String(format: "%.1f%%", bpmSettled * 100))  (high = stable lock)
-      BPM std deviation:   \(String(format: "%.2f", bpmDeviation))
-      mean confidence:     \(String(format: "%.3f", mean(confidenceSamples)))
-      frames with a tempo: \(bpmSamples.count) of \(heightsPerFrame.count)
+      median BPM:        \(String(format: "%.1f", percentile(result.bpm, 0.5)))
+      mean confidence:   \(String(format: "%.3f", mean(result.tempoConfidence)))
 
-    onsets (\(totalOnsets) total, \(String(format: "%.2f", Double(totalOnsets) / max(durationSeconds, 0.001))) per second)
+    onsets (\(metrics.onsetCount) total, \(String(format: "%.2f", metrics.onsetRate)) per second)
     """
 for kind in OnsetKind.allCases {
-    let count = onsetCounts[kind] ?? 0
+    let count = result.detectedOnsets.filter { $0.kind == kind }.count
     report += String(format: "\n      %-6@ %4d  (%.2f/s)", kind.rawValue as NSString, count,
-                     Double(count) / max(durationSeconds, 0.001))
+                     Double(count) / max(duration, 0.001))
 }
 
-report += """
+if ProcessInfo.processInfo.environment["VIZ_MISS"] != nil {
+    let missed = result.events.filter { $0.kind == .kick }
+        .filter { truth in
+            !result.detectedOnsets.contains { abs($0.time - truth.time) < 0.05 }
+        }
+        .map { String(format: "%.2f", $0.time) }
+    print("missed kicks (\(missed.count) of "
+          + "\(result.events.filter { $0.kind == .kick }.count)): "
+          + missed.joined(separator: " "))
+}
+report += "\n      first: "
+    + result.detectedOnsets.prefix(12)
+        .map { String(format: "%.2f%@", $0.time, String($0.kind.rawValue.prefix(1))) }
+        .joined(separator: " ")
+report += "\n\n    metrics\n"
+for check in metrics.checks(for: signal, frameInterval: result.frameInterval,
+                            perOnsetMode: mode == .pulse || mode == .ripple) {
+    report += String(format: "      %-24@ %-10@ %-16@ %@\n",
+                     check.name as NSString, check.value as NSString,
+                     check.bound as NSString, (check.passed ? "PASS" : "FAIL") as NSString)
+}
+report += String(format: """
 
+        board mean brightness: %.3f
+        frames dropped:        %d
+        stale frames:          %.2f%%
 
-    colour
-      hue range:           \(hueSummary)
-      hue spread:          \(String(format: "%.0f", hueSpread))°  (of 360; wide = expressive)
-
-    contrast
-      mean brightness:     \(String(format: "%.3f", mean(brightnessPerFrame)))
-      brightness p10:      \(String(format: "%.3f", percentile(brightnessPerFrame, 0.10)))  (dark end)
-      brightness p90:      \(String(format: "%.3f", percentile(brightnessPerFrame, 0.90)))  (bright end)
-      dynamic range p90/p10: \(String(format: "%.1fx", percentile(brightnessPerFrame, 0.10) > 0.001 ? percentile(brightnessPerFrame, 0.90) / percentile(brightnessPerFrame, 0.10) : 0))
-
-    gesture
-      mean lit fraction:   \(String(format: "%.3f", mean(litFractionPerFrame)))  (of all level keys)
-      gesture coherence:   \(String(format: "%.3f", mean(coherencePerFrame)))  \
-    (1 = every lit column sits in a run of 2+, 0 = confetti)
-
-    levelling
-      mean noise floor:         \(String(format: "%.6f", floorPerFrame.isEmpty ? 0 : Double(floorPerFrame.reduce(0, +)) / Double(floorPerFrame.count)))
-      final loudness reference: \(String(format: "%.6f", Double(referencePerFrame.last ?? 0)))
-
-    """
+    """, metrics.boardMeanBrightness, metrics.droppedFrames, metrics.staleFraction * 100)
 
 do {
     try report.write(to: outputDirectory.appendingPathComponent("stats.txt"),
