@@ -588,3 +588,387 @@ observing: **each side strip carries all six LEDs in index order,
 front (cable end) to back; both strips are driven identically (mirrored); the
 scroll wheel follows LED index 1.** Perceived intermediate hues between
 adjacent LEDs are diffuser blending, not extra channels.
+
+---
+
+## 14. Static analysis of Glorious's own Model O software v1.0.9 — is there a RAM / live-preview path?
+
+**Verdict: no. There is no non-persistent lighting path on this device, and
+Glorious's own editor does not have one.** Every lighting change the official
+software can make goes through exactly one code path: the same report-4,
+520-byte, `buf[3] = 0x7B` blob write this document already describes in §4.
+
+This section is **static analysis only — no hardware I/O was performed.**
+Everything is read out of the shipped binaries at the addresses cited.
+
+### 14.1 Provenance
+
+Glorious's legacy-software index (<https://www.gloriousgaming.com/pages/legacy-software>)
+links **one** package for the wired Model O / O-, and its version number matches
+the "v1.0.9 software" libratbag refers to at `driver-sinowealth.c:83-86`:
+
+| | |
+|---|---|
+| URL | `https://downloads.gloriousgamingservices.com/download/ModelO_1-0-9.zip` |
+| SHA-256 | `06bededddf80d98ac55ce8843723ef796a0dda05a3193ca765b7801067c96296` |
+
+Unlike the GMMK keyboard editors (InstallShield, `protocol-tkl-notes.md` §1.1),
+this one is **Inno Setup 5.3.3**; `innoextract` unpacks it directly.
+
+| Member | SHA-256 |
+|---|---|
+| `02 SOFTWARE/Glorious_Software_Setup_V1.0.9.exe` | `53f7653c5a770ca56b437bc152ac8f3be570ea3654913b69787b69550a3cf25a` |
+| `01 FIRMWARE UPDATE/Glorious Model O and O minus FM 1-0-9 UPDATE.exe` | `fd8c4ef8c50c9662abb4bc39fd09965e0fc9dd42426716bd1943358ba33d3518` |
+| `01 FIRMWARE UPDATE/UpdateCodeTool.mtp` | `76f4635a3153728785c47062b0e75c898b14e4a0503318ff7c6a82560a9259b7` |
+
+The installer yields `OemDrv.exe` (2 450 944 bytes, PE32 x86 MSVC/MFC, PE
+timestamp 2019-08-14) — the application — plus `Lowerdev.dll` (57 856 bytes,
+2016-03-25) and `Cfg.ini`. All addresses below are `OemDrv.exe` VAs
+(image base `0x400000`), recovered with Capstone; `Lowerdev.dll` VAs use its own
+base `0x10000000`.
+
+The bundled **firmware updater is a separate executable** and is the only thing
+in the package that touches the ISP bootloader (§14.7).
+
+### 14.2 `Cfg.ini` — the vendor's own device description
+
+The app is a reskinned generic **"BY-COMBO2"** framework (`appdir=BY-COMBO2`)
+driven by an ini file, and that file independently confirms five things this
+document previously had only from community sources:
+
+| `Cfg.ini` line | Confirms |
+|---|---|
+| `[MS] VID=0x258A  PID=0x0036` | §1 device identity |
+| `Sensor = 0x3360` | §1 PMW3360 |
+| **`RGBIndex=0,2,1`** | **§5.2 colour order is R,B,G** — a third independent source, and the vendor's own |
+| **`PSD=0x56,0x31,0x30,0x33`** | `"V103"`. The firmware-version gate; §11 item 10 |
+| `MDNUM=3` | §8, three profiles |
+| `DM=6` | §6, six DPI stages exposed (of eight in the blob) |
+| **`DPI=400,…,12000` against `DPIHW=3,…,119`** | **§6 DPI encoding.** 400 DPI ↔ raw 3, i.e. `DPI = (raw+1) × 100`. The vendor's own table, exactly libratbag's PMW3360 formula |
+| `DEFLEVEL=2` | default brightness 2 (§5.3) |
+
+`LedOpt1`…`LedOpt9` list the effects the UI offers, first field = effect ID:
+**1, 5, 3, 2, 10, 4, 7, 9, 0**. Against §5.1 that is rainbow, full-RGB
+breathing, breathing-7, single, breathing-1, tail, rave, wave, off — and
+**effect `0x06` (`RGB_CONSTANT`) and effect `0x08` (random) are absent.** This
+is direct confirmation of the "In Glorious's own software" column in §5.1, and
+of §13: the per-LED mode really is unused by the vendor.
+
+`ApplyNow=1` is the key behavioural flag; see §14.6.
+
+### 14.3 Transport — feature reports only, and one HID object
+
+`Lowerdev.dll` is a thin HID wrapper exporting `FindHidDevice`,
+`OpenHidDevice`, `SetFeature`, `GetFeature`, `GetInputReport`,
+`SetOutputReport`, `GetProductString`, `GetProductID`. It imports
+`HidD_SetFeature`, `HidD_GetFeature`, `HidD_GetInputReport`,
+`HidD_SetOutputReport` from `HID.DLL`.
+
+`OemDrv.exe` binds only some of them, by `GetProcAddress` at **`0x40FC36`–`0x40FC7C`**,
+into one object:
+
+| Object slot | Function |
+|---|---|
+| `+0x08` | `OpenHidDevice` |
+| `+0x0C` | **`SetFeature`** |
+| `+0x10` | **`GetFeature`** |
+| `+0x14` | `GetInputReport` |
+| `+0x18` | `GetProductString` |
+
+**`SetOutputReport` and `FindHidDevice` are never resolved at all.** The string
+`"SetOutputReport"` does not occur in `OemDrv.exe`. So the official software has
+no output-report path whatsoever — confirming §1.2 from the vendor side.
+(Contrast the GMMK keyboard, where the official tool uses *only* interrupt OUT;
+`protocol-tkl-notes.md` §2.2. The two devices are opposites.)
+
+### 14.4 The four protocol primitives — the entire Model O surface
+
+Four functions, and nothing else, talk to this mouse:
+
+| Address | Role | Byte-exact behaviour |
+|---|---|---|
+| **`0x413A40`** | command write | `buf[0]=0x05`, `buf[1..4]` = caller's 4 bytes, `buf[5]` = caller's 5th; `SetFeature(handle, buf, 6)` |
+| **`0x413B10`** | command read | `buf[0]=0x05`; `GetFeature(handle, buf, 6)`; returns 5 payload bytes |
+| **`0x413BF0`** | config write | `memset(buf+1, 0, 0x207)`; `buf[0]=0x04`; copies **518 bytes** (`rep movsd` ×0x81 + `movsw`) from the caller's struct into `buf+1`; `SetFeature(handle, buf, 0x208)` |
+| **`0x413CB0`** | config read | `memset`; `buf[0]=0x04`; `GetFeature(handle, buf, 0x208)`; copies 500 bytes out on success |
+
+All four retry **up to 3 attempts with `Sleep(200 ms)` between failures**, and
+**none of them computes a checksum** — confirming §1.2's "no checksum anywhere".
+
+There is no fifth primitive. The addresses `0x4106C0`–`0x410C40` in the same
+binary implement report-5/9-byte, report-6/1032-byte and report-9 protocols, but
+those belong to other BY-COMBO products (the 1032-byte report 6 is the
+Sinowealth *keyboard* protocol); no Model O code path reaches them.
+
+> **`GetInputReport` is resolved and then never called.** Zero call sites in the
+> entire binary. See §14.8 for what this means for INPUT report `0x07`.
+
+### 14.5 Complete report-5 verb inventory — no new verbs, no ISP verbs
+
+Every call site of the command-write primitive `0x413A40`, with the command byte
+each one stores:
+
+| Call site | Verb | Purpose |
+|---|---|---|
+| `0x413231` | `0x01` | firmware version. Reply bytes are compared **byte-for-byte against the `PSD` value** (globals `0x61E1A0`–`0x61E1A3` = `"V103"`); a mismatch aborts |
+| `0x4132FF` | `0x11` | arm config read, profile 1 |
+| `0x4133B4` | `0x02` | read active profile; reply validated to be 1, 2 or 3, else forced to `0xFF` |
+| `0x413410` | `0x1A` | read debounce |
+| `0x4136D9` | `0x21` | arm config read, profile 2 |
+| `0x413806` | `0x31` | arm config read, profile 3 |
+| `0x413DB2` | `0x02` | write active profile |
+| `0x413E2C` | `0x02` | write active profile (`index + 1`) |
+| `0x413E9F` | `0x11`/`0x21`/`0x31` | arm config read, profile selected by a 3-way switch |
+| `0x417903` | `0x1A` | write debounce |
+
+**That is the whole list: `0x01`, `0x02`, `0x11`, `0x1A`, `0x21`, `0x31`.** Plus
+`0x12`/`0x22`/`0x32` and `0x30` used as report-4 *write* selectors (§14.6).
+
+Consequences:
+
+* **No undocumented verb exists.** §2.1 is complete; the official software emits
+  a strict subset of it. Nothing was found to add to the safe list, and nothing
+  new to fear.
+* **No ISP verb is ever sent by the editor.** `0x75`, `0x45`, `0x52`, `0x55`,
+  `0x57`, `0x5A` do not appear as command bytes anywhere in `OemDrv.exe`. §9's
+  hazard list stands unchanged, and the door is not one the editor ever opens.
+* **§11 item 4 is resolved: command `0x1A` (debounce) *does* apply to this
+  mouse.** Glorious's own software both reads and writes it, and the README
+  shipped in the same zip documents the Debounce Time control as a supported
+  feature with a 10 ms default. libratbag's "doesn't work on devices with
+  shorter configuration data" caveat does not bite here.
+
+### 14.6 The write path — one form, one marker, no preview
+
+The config-write primitive `0x413BF0` has **exactly four callers**, and only one
+of them writes lighting:
+
+| Caller | `buf[1]` | `buf[3]` | Payload |
+|---|---|---|---|
+| **`0x413F10` — write config** | `0x11`/`0x21`/`0x31` by profile | **`0x7B`** | `0x8C` = 140 bytes at `buf[8]` |
+| `0x413FC0` — write button map | `0x12`/`0x22`/`0x32` | `0x50` | 0x50 bytes |
+| `0x414060` — write macro | `0x30` (`buf[2]=0x02`) | — | — |
+| `0x417FA0` — inline keymap write | `0x32` | `0x25` | — |
+
+`0x413F10` is the only lighting write, and it is reached from **exactly one call
+site**, `0x418041`.
+
+**`buf[3] = 0x7B` is stored unconditionally at `0x413F70`** — there is no branch,
+no alternative marker, and no second form of the report-4 write. Specifically,
+there is **no "preview, don't save" variant**: not a different command byte at
+offset 1, not a different marker at offset 3, not a different report ID.
+
+This resolves **§11 item 1, the document's biggest open question, in OpenRGB's
+favour.** OpenRGB's hardcoded `usb_buf[0x03] = 0x7B`
+(`SinowealthController.cpp:101`) is exactly what the vendor writes. `0x7B` = 123
+= 131 − 8, so the Model O's config blob is **131 bytes**, not 167.
+**Confidence: high** — this is the vendor's own software agreeing with OpenRGB
+against a value libratbag would have computed dynamically.
+
+#### The vendor does not preserve the "unknown" bytes
+
+`0x413F10` builds the blob **from scratch**, not read-modify-write:
+
+```
+memset(struct + 1, 0, 0x205)     ; zero everything
+struct[0] = 0x11 / 0x21 / 0x31   ; -> blob[1], profile selector
+struct[2] = 0x7B                 ; -> blob[3], write marker
+memcpy(struct + 7, payload, 0x8C); -> blob[0x08] .. blob[0x93]
+```
+
+So Glorious's own software writes **zero** into `blob[2]` (`unknown1`) and
+`blob[4]`–`blob[7]` (most of `unknown2`), and **zero from `blob[0x94]` to the end
+of the report.** It never reads the blob back first for the purpose of
+preserving those fields.
+
+Two consequences for §4 and §11 item 6:
+
+* OpenRGB's unexplained `usb_buf[0x06] = 0x00` (§4) is not a quirk — it is
+  precisely what the vendor does.
+* Our "preserve every `unknown*` byte verbatim" advice is **more conservative
+  than the vendor's own software**, which is fine to keep, but the bytes are
+  demonstrably don't-care. Note `blob[0x94]` onward being zeroed is further
+  evidence the blob really ends around 131–148 bytes, not 167.
+
+#### Write cadence: the official UI commits on *every* control change
+
+`Cfg.ini`'s `ApplyNow=1` lands in global **`0x637450`**, read back at
+`0x477A6D`. Roughly thirty UI handlers throughout the binary end with the same
+three instructions:
+
+```
+cmp dword ptr [0x637450], 0      ; if (ApplyNow)
+je  skip
+mov dword ptr [0x63CF7C], <bits> ;   g_flags = which subsystem changed
+call ReleaseSemaphore(g_sem,1,0) ;   wake the apply thread
+```
+
+Three identical worker contexts are created at `0x401060`, `0x401120` and
+`0x4011D0` (`CreateSemaphore(initial 0, max 100)`), each running the thread
+procedure at **`0x401250`**: `WaitForMultipleObjects` → read the flags word →
+mark busy → dispatch. Its logging strings are `"ApplyThread Start"`,
+`"Start Apply: hDevice=0x%x, nFlag=0x%x"` and `"Apply Over"`. The dispatch
+reaches the commit routine at **`0x417730`**, which loops over profiles writing
+button map, macros and then config for each.
+
+There is **no debounce timer, no mouse-up gating, and no dirty-diff.** Moving a
+colour picker in Glorious's software enqueues a full commit of all three
+profiles. The only thing limiting the rate is that the apply thread is
+single-threaded.
+
+The UI has no "preview" concept: the only relevant string in the whole binary is
+`tc_apply` → `"Apply"`. (`AFX_WM_POSTSETPREVIEWFRAME` and `PreviewPages` are
+stock MFC print-preview and are unrelated.)
+
+### 14.7 ☠️ The firmware updater independently confirms §9's hazard list
+
+The separate `Glorious Model O and O minus FM 1-0-9 UPDATE.exe` imports
+`HidD_SetFeature`/`HidD_GetFeature` and contains, as byte immediates stored into
+command buffers, exactly:
+
+`0x45`, `0x52`, `0x57`, `0x72`, `0x75`, `0x77`
+
+That is `CMD_ERASE`, `CMD_INIT_READ`, `CMD_INIT_WRITE`, `XFER_READ_PAGE`,
+`ISP mode`, `XFER_WRITE_PAGE` — matching `sinowisp`'s `isp_device.rs` verb-for-verb.
+**§9 is now confirmed by a third, fully independent source: Glorious's own
+firmware updater.** These verbs live in the updater and *only* in the updater;
+the editor never emits them.
+
+> This also means the hazard is real and reachable. **Do not send anything on
+> report 5 outside the six verbs in §14.5.**
+
+### 14.8 INPUT report `0x07` — §11 item 7 partially resolved
+
+The official editor **never reads it** (`GetInputReport` resolved, zero call
+sites). But `enkore/gloriousctl` documents it, in `gloriousctl.c:220-227`:
+
+```c
+struct change_report {
+    uint8_t report_id;      /* = 7 */
+    uint8_t unk1;           /* always 1 */
+    uint8_t active_dpi:4;
+    uint8_t unk2:4;         /* 6 */
+    uint8_t dpi_x;
+    uint8_t dpi_y;
+    uint8_t unk3[3];        /* always 0 */
+};
+```
+
+It is a **device→host notification emitted when the user presses the DPI
+button**, read at `gloriousctl.c:635`; `dpi_x`/`dpi_y` use the same
+`(raw+1)×100` encoding as the blob. So the earlier guess in §11 was right. It
+carries no lighting information and nothing should be built on it, but it is no
+longer unidentified.
+
+### 14.9 What the community sources say about a RAM path
+
+Re-scanned against this specific question:
+
+* **OpenRGB's wired Model O controller has no direct mode.**
+  `RGBController_Sinowealth.cpp:14-22` declares `@direct :x:`, and all ten modes
+  carry `MODE_FLAG_AUTOMATIC_SAVE`. The merge request that added brightness
+  support says so in as many words: *"Updated modes to reflect nature of the
+  device which does not support direct access"*
+  (<https://gitlab.com/CalcProgrammer1/OpenRGB/-/merge_requests/3090>).
+* **The wireless Model O controller has no direct mode either**
+  (`RGBController_SinowealthGMOW.cpp:14-20`, `@direct :x:`).
+* **A sibling Sinowealth device does.** The PID-`010C` keyboard
+  (`SinowealthKeyboard10cController.cpp:63-84`) has a genuine volatile direct
+  mode — `SetFeature` on **report ID 6**, 520 bytes, header
+  `06 08 00 00 01 00 7A 01` then RGB triples from offset 8 — with a keepalive
+  thread because *"The Sinowealth 010C Keyboard requires a steady stream of
+  packets in order to not revert out of direct mode"*. That proves the vendor's
+  8051 stack *can* implement a RAM LED buffer, in some products.
+  **It does not transfer here, and chasing it on this device is dangerous:**
+  report `0x06` does not exist on the Model O's config interface **[measured]**,
+  and report 6 *is* the ISP bootloader's page-transfer channel (§9). Probing
+  report 6 on this mouse is the single most likely way to brick it.
+* Another Sinowealth contributor reached the same conclusion for a keyboard
+  after examining the vendor software: *"All settings always saved into flash and
+  it takes some time, so dynamically software effects not possible. I couldn't
+  find any way to direct mode driving LEDs, there is not in OEM software which I
+  explored."* (<https://gitlab.com/CalcProgrammer1/OpenRGB/-/merge_requests/665>)
+* `sinowisp`'s ISP protocol addresses **code flash only** — `firmware_size`,
+  `bootloader_size 4096`, `page_size 2048` (`src/platform_spec.rs`). There is no
+  XRAM space, no data-flash region and no config region in it, so it neither
+  confirms nor refutes a RAM shadow behind report 4. It simply has nothing to say.
+* `gloriousctl`'s README carries the only wear-adjacent warning found anywhere:
+  *"this appears to modify the EEPROM/flash of the controller in your mouse"*.
+* **No flash-endurance figure for the SH68F89/SH68F90/BY8948 could be found in
+  any public source.** No datasheet, no app note, no writeup. Any wear budget we
+  assume is an engineering guess, not a sourced number.
+* **No tool that streams colour to a wired Model O in real time appears to
+  exist.** Not OpenRGB, not SignalRGB, not libratbag, not gloriousctl, not any
+  script found. Nobody has reported flash wear because nobody appears to be
+  doing this.
+
+### 14.10 Verdict and recommended probe plan
+
+**There is no RAM / live-preview path for the wired Model O.**
+
+* That none is *documented or discoverable* — **confidence: high.** Four
+  independent implementations (Glorious's own editor, OpenRGB, libratbag,
+  gloriousctl) converge on one write path, and the vendor binary contains no
+  second form of it and no unknown verb.
+* That none *exists in the silicon* — **confidence: moderate.** The only
+  countervailing evidence is the 010C keyboard's direct mode, which shows the
+  family's firmware stack has the concept. But the Model O's firmware is older,
+  its report-6 channel is the bootloader, and nothing in the vendor software
+  hints at a hidden lighting verb.
+
+**One thing remains genuinely unmeasured, and it is the one that matters:**
+nobody — not gloriousctl, not OpenRGB, not this document — has actually
+established that a report-4 write costs a flash erase/program cycle *every
+time*. It is universally assumed. The firmware may well diff the incoming blob
+against what is stored and skip the flash write when nothing changed, which is a
+common pattern on these parts.
+
+#### Recommended next probe — timing discrimination, hardware-safe
+
+Uses **only** verbs and reports already in §14.5 and §4. No new report IDs, no
+new verbs, no report 6, no sweep. It writes the config blob, which we already do
+routinely.
+
+1. Read the blob (§3) and keep it as a baseline.
+2. **Time `SetFeature(report 4, 520)` writing the blob back completely
+   unchanged**, 20 times, recording each duration.
+3. **Time the same write with one lighting byte changed** (a brightness nibble),
+   alternating between two values, 20 times.
+4. Compare the two distributions.
+
+Interpretation:
+
+* If unchanged writes are consistently **much faster** than changed writes, the
+  firmware diffs and skips the flash program. That would mean a visualizer only
+  pays a flash cycle when the colour actually changes — still costly, but it
+  makes "write only on change" a genuine mitigation rather than a hope.
+* If both are the **same and slow** (order 10–50 ms, consistent with a page
+  erase + program), assume every write is a flash cycle and treat the write
+  budget as hard.
+* If both are the **same and fast** (order 1–3 ms), the write is being buffered
+  and the flash commit is deferred or conditional — the most hopeful outcome,
+  and worth following up with a replug-persistence test after a *single* write.
+
+This costs at most 40 blob writes, which is negligible against any plausible
+endurance figure, and it is the cheapest way to convert the project's central
+assumption into a measurement.
+
+#### Design recommendation for the visualizer, pending that measurement
+
+Until the timing probe says otherwise, **assume every colour update burns a
+flash cycle** and design accordingly:
+
+* Diff before writing; never re-send an identical blob.
+* Rate-limit hard (single-digit Hz at most, and only while audio is actually
+  playing), and stop writing entirely on silence.
+* Prefer the **hardware** effects (§5.1) where they suffice — they animate
+  autonomously in firmware at zero ongoing flash cost after one write. A
+  beat-synced visualizer cannot use them, but ambient modes can.
+* Say plainly in the README that the audio-reactive mode writes the mouse's
+  flash, so users can make their own call.
+
+Note for context, not as reassurance: Glorious's own software commits on every
+control change with no debouncing at all (§14.6), so the vendor evidently does
+not treat these writes as precious. That is weak evidence the part tolerates
+more than we fear — but it is not a measurement, and a UI slider is dragged a
+few dozen times a session, not a few times a second for hours.
