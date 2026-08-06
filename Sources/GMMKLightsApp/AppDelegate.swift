@@ -255,28 +255,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         paintCompensated()
     }
 
-    /// Applies a ``SwitchFriendlyPalette`` swatch as a plain solid colour.
+    /// Applies a ``SwitchFriendlyPalette`` swatch.
     ///
-    /// No per-key writes: the whole point of these colours is that both housings
-    /// render them about the same, so there is nothing to correct.
+    /// These colours are chosen so both housings render them about the same, so
+    /// ordinarily this is a plain global solid colour. If the user has tuned a
+    /// compensation profile it still rides the per-key path, because a global
+    /// write in `fixed` mode would throw the tuning away.
     @objc private func selectSwitchFriendlyColor(_ sender: NSMenuItem) {
         guard let color = sender.representedObject as? RGB else { return }
+        let profile = settings.compensationProfile
         settings.color = color
-        settings.mode = .fixed
+        settings.compensated = profile.isActive
+        settings.mode = profile.isActive ? .custom : .fixed
         settings.rainbow = false
-        settings.compensated = false
         settings.save()
         colorRow.setColor(nsColor(color), hexText: "#" + color.hexString)
         refreshEnablement()
-        controller.setSolidColor(color, brightnessPercent: settings.brightnessPercent)
+        controller.setSolidColor(color,
+                                 brightnessPercent: settings.brightnessPercent,
+                                 compensation: profile)
     }
 
     @objc private func openTuner(_ sender: NSMenuItem) {
-        tuner.onChange = { [weak self] tuning in
+        tuner.onChange = { [weak self] profile in
             guard let self else { return }
-            self.settings.markedLEDIndices = tuning.markedLEDIndices
-            self.settings.markedSwitches = tuning.markedSwitches
-            self.settings.compensationStrength = tuning.strength
+            self.settings.markedLEDIndices = profile.markedLEDIndices
+            self.settings.markedSwitches = profile.markedSwitches
+            self.settings.compensationStrength = profile.strength
+            self.settings.compensationBalance = profile.balance
             self.settings.save()
         }
         // Opening the tuner paints, which leaves the board in mode `custom`
@@ -286,17 +292,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.compensated = true
         settings.save()
         refreshEnablement()
-        tuner.present(target: settings.color,
-                      tuning: .init(markedLEDIndices: settings.markedLEDIndices,
-                                    markedSwitches: settings.markedSwitches,
-                                    strength: settings.compensationStrength))
+        tuner.present(target: settings.color, profile: settings.compensationProfile)
     }
 
     private func paintCompensated() {
         controller.paintCompensated(target: settings.color,
-                                    markedLEDIndices: settings.markedLEDIndices,
-                                    markedSwitches: settings.markedSwitches,
-                                    strength: settings.compensationStrength)
+                                    profile: settings.compensationProfile)
     }
 
     @objc private func toggleRainbow(_ sender: NSMenuItem) {
@@ -334,8 +335,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // The row can be disabled while the panel is still on screen.
         guard settings.compensated || settings.mode.usesSolidColor else { return }
         guard let rgb = self.rgb(from: sender.color) else { return }
+        let profile = settings.compensationProfile
         settings.color = rgb
-        if !settings.compensated {
+        if !profile.isActive {
             // The rainbow flag is cleared by the same transaction the colour
             // rides in, so reflect that in the persisted UI state too.
             settings.rainbow = false
@@ -343,11 +345,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.save()
         colorRow.setColor(nsColor(rgb), hexText: "#" + rgb.hexString)
         refreshEnablement()
-        if settings.compensated {
-            paintCompensated()
-        } else {
-            controller.setColor(rgb)
-        }
+        // One call either way: an active profile turns this into a per-key
+        // paint, a neutral one into the global colour write.
+        controller.setColor(rgb, compensation: profile)
     }
 
     // MARK: - Colour conversion

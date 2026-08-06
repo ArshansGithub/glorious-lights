@@ -16,8 +16,11 @@ import GMMKProtocol
 ///   because marking costs one press per key. A segmented control then says
 ///   which kind those were, and that decides which side of the marked set is
 ///   the tinted one that gets corrected. See ``SwitchCompensation``.
-/// * **Tuning.** The strength slider repaints the tinted keys, debounced, so the
-///   user drags until the board matches the colour they picked.
+/// * **Tuning.** Two sliders, both repainting the board live behind a debounce:
+///   *Colour correction* pulls the tinted keys back towards the target hue, and
+///   *Brightness balance* dims whichever set glows hotter. See
+///   ``SwitchCompensation`` for why intensity needs its own control and why it
+///   is bidirectional.
 ///
 /// Key presses are read with a **local** `NSEvent` monitor, which sees only this
 /// app's own events and needs no Accessibility or Input Monitoring grant beyond
@@ -25,7 +28,7 @@ import GMMKProtocol
 /// window is key so marking a key never also types it.
 final class SwitchCompensationWindowController: NSWindowController, NSWindowDelegate {
 
-    /// How long the strength slider must be still before the board is repainted.
+    /// How long a slider must be still before the board is repainted.
     /// A repaint is twelve packets; a drag would otherwise queue far more of
     /// them than the user can see.
     static let repaintDebounce: TimeInterval = 0.100
@@ -57,34 +60,31 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
     /// Caps Lock, which has no device-dependent bit of its own.
     private static let capsLockKeyCode: UInt16 = 0x39
 
-    /// Everything the tuner owns, reported back in one piece for persistence.
-    struct Tuning {
-        var markedLEDIndices: Set<UInt16>
-        var markedSwitches: SwitchCompensation.MarkedSwitches
-        var strength: Double
-    }
+    /// Half-width, in slider percent, of the detent at zero on the bidirectional
+    /// balance slider. Zero is the one value worth being able to hit exactly —
+    /// it is "both sets at full intensity" — and a 200-step slider will not land
+    /// on it by hand.
+    static let zeroDetentPercent = 4
 
     private let controller: KeyboardController
 
     private var target: RGB = .black
-    private var markedLEDIndices: Set<UInt16> = []
-    private var markedSwitches: SwitchCompensation.MarkedSwitches = .trueColor
-    private var strength = SwitchCompensation.defaultStrength
+    /// Everything the tuner edits, in the shape the protocol layer wants.
+    private var profile = SwitchCompensation.Profile.neutral
 
-    /// Reports the tuning back so it can be persisted.
-    var onChange: ((Tuning) -> Void)?
+    /// Reports the profile back so it can be persisted.
+    var onChange: ((SwitchCompensation.Profile) -> Void)?
 
     private let instructionLabel = NSTextField(wrappingLabelWithString: """
         Press every key whose switch is the odd one out — whichever kind of \
         housing your board has fewer of. Marked keys light up white; press one \
-        again to unmark it.
+        again to unmark it. Fn is handled inside the keyboard and never reaches \
+        the Mac, so use the button for it.
 
-        Say which kind you marked, then drag the slider until the whole board \
-        matches the colour you picked. The keys that tint the light are the ones \
-        corrected; the rest are left alone.
-
-        Fn is handled inside the keyboard and never reaches the Mac, so use the \
-        button for it.
+        Then say which kind you marked and drag until the whole board matches \
+        the colour you picked. Colour correction pulls the tinted keys back \
+        towards it; brightness balance dims whichever set glows hotter, which \
+        can be either one depending on the colour.
         """)
     private let statusLabel = NSTextField(labelWithString: "")
     private let switchKindControl = NSSegmentedControl(
@@ -92,8 +92,16 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
         trackingMode: .selectOne,
         target: nil,
         action: nil)
-    private lazy var strengthRow = SliderRowView(title: "Correction Strength",
+    private lazy var strengthRow = SliderRowView(title: "Colour correction",
                                                  range: 0...100) { "\($0)%" }
+    private lazy var balanceRow = SliderRowView(title: "Brightness balance",
+                                                range: -100...100) {
+        switch $0 {
+        case 0:     return "even"
+        case ..<0:  return "marked −\(-$0)%"
+        default:    return "unmarked −\($0)%"
+        }
+    }
 
     private var keyMonitor: Any?
     /// Modifier key codes currently held down, derived from each event's flags
@@ -137,6 +145,9 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
         strengthRow.onChange = { [weak self] percent in
             self?.strengthChanged(percent: percent)
         }
+        balanceRow.onChange = { [weak self] percent in
+            self?.balanceChanged(percent: percent)
+        }
 
         switchKindControl.target = self
         switchKindControl.action = #selector(switchKindChanged)
@@ -163,8 +174,8 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
         buttons.orientation = .horizontal
         buttons.distribution = .fill
 
-        let stack = NSStackView(views: [instructionLabel, statusLabel,
-                                        switchKindRow, strengthRow, buttons])
+        let stack = NSStackView(views: [instructionLabel, statusLabel, switchKindRow,
+                                        strengthRow, balanceRow, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
@@ -181,6 +192,7 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             instructionLabel.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32),
             strengthRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32),
+            balanceRow.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32),
             buttons.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32),
         ])
         return content
@@ -193,14 +205,13 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
     ///
     /// The paint is also what puts the board in mode `custom`, which the
     /// single-key writes during marking rely on.
-    func present(target: RGB, tuning: Tuning) {
+    func present(target: RGB, profile: SwitchCompensation.Profile) {
         self.target = target
-        markedLEDIndices = tuning.markedLEDIndices
-        markedSwitches = tuning.markedSwitches
-        strength = tuning.strength
+        self.profile = profile
 
-        switchKindControl.selectedSegment = markedSwitches == .trueColor ? 0 : 1
-        strengthRow.setValue(Int((strength * 100).rounded()))
+        switchKindControl.selectedSegment = profile.markedSwitches == .trueColor ? 0 : 1
+        strengthRow.setValue(Int((profile.strength * 100).rounded()))
+        balanceRow.setValue(Int((profile.balance * 100).rounded()))
         updateStatus()
 
         NSApp.activate(ignoringOtherApps: true)
@@ -225,7 +236,7 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
     }
 
     @objc private func clearMarks() {
-        markedLEDIndices.removeAll()
+        profile.markedLEDIndices.removeAll()
         heldModifierKeyCodes.removeAll()
         updateStatus()
         notifyChange()
@@ -235,7 +246,7 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
     /// Which kind of switch the marks identify. Flipping it swaps which half of
     /// the board is corrected, so the board is repainted at once.
     @objc private func switchKindChanged() {
-        markedSwitches = switchKindControl.selectedSegment == 1 ? .tinted : .trueColor
+        profile.markedSwitches = switchKindControl.selectedSegment == 1 ? .tinted : .trueColor
         notifyChange()
         repaintAll()
     }
@@ -328,11 +339,11 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
 
     private func toggle(ledIndex: UInt16, label: String) {
         let isMarked: Bool
-        if markedLEDIndices.contains(ledIndex) {
-            markedLEDIndices.remove(ledIndex)
+        if profile.markedLEDIndices.contains(ledIndex) {
+            profile.markedLEDIndices.remove(ledIndex)
             isMarked = false
         } else {
-            markedLEDIndices.insert(ledIndex)
+            profile.markedLEDIndices.insert(ledIndex)
             isMarked = true
         }
 
@@ -344,20 +355,33 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
         // key should show while not. A marked key stays white until the next
         // whole-board repaint, which is what makes the set visible on the
         // hardware.
-        let restored = SwitchCompensation.color(forLEDIndex: ledIndex,
-                                                target: target,
-                                                markedLEDIndices: markedLEDIndices,
-                                                markedSwitches: markedSwitches,
-                                                strength: strength)
+        let restored = profile.color(forLEDIndex: ledIndex, target: target)
         controller.paintKey(ledIndex: ledIndex,
                             color: isMarked ? Self.markedColor : restored)
     }
 
-    // MARK: - Strength
+    // MARK: - Sliders
 
     private func strengthChanged(percent: Int) {
-        strength = Double(percent) / 100.0
+        profile.strength = Double(percent) / 100.0
         notifyChange()
+        scheduleRepaint()
+    }
+
+    private func balanceChanged(percent: Int) {
+        // Snap the thumb to the centre inside the detent, so "even" is reachable
+        // by dragging rather than only by never having dragged.
+        var snapped = percent
+        if abs(snapped) <= Self.zeroDetentPercent {
+            snapped = 0
+            balanceRow.setValue(0)
+        }
+        profile.balance = Double(snapped) / 100.0
+        notifyChange()
+        scheduleRepaint()
+    }
+
+    private func scheduleRepaint() {
         pendingRepaint?.cancel()
         let item = DispatchWorkItem { [weak self] in
             self?.pendingRepaint = nil
@@ -370,20 +394,15 @@ final class SwitchCompensationWindowController: NSWindowController, NSWindowDele
     // MARK: - Painting
 
     private func repaintAll() {
-        controller.paintCompensated(target: target,
-                                    markedLEDIndices: markedLEDIndices,
-                                    markedSwitches: markedSwitches,
-                                    strength: strength)
+        controller.paintCompensated(target: target, profile: profile)
     }
 
     private func notifyChange() {
-        onChange?(Tuning(markedLEDIndices: markedLEDIndices,
-                         markedSwitches: markedSwitches,
-                         strength: strength))
+        onChange?(profile)
     }
 
     private var markedSummary: String {
-        let count = markedLEDIndices.count
+        let count = profile.markedLEDIndices.count
         return "\(count) key\(count == 1 ? "" : "s") marked"
     }
 

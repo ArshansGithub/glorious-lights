@@ -107,57 +107,169 @@ final class SwitchCompensationTests: XCTestCase {
     /// *unmarked* majority is tinted and is what gets corrected. The marked keys
     /// show the target colour untouched.
     func testMarkedTrueColorKeysAreLeftAloneAndTheRestCorrected() {
-        let marked: Set<UInt16> = [1, 89]
+        let profile = SwitchCompensation.Profile(markedLEDIndices: [1, 89],
+                                                 markedSwitches: .trueColor,
+                                                 strength: 0.5)
         let corrected = SwitchCompensation.compensate(orange, strength: 0.5)
 
         for index: UInt16 in [1, 89] {
-            XCTAssertEqual(SwitchCompensation.color(forLEDIndex: index, target: orange,
-                                                    markedLEDIndices: marked,
-                                                    markedSwitches: .trueColor,
-                                                    strength: 0.5),
+            XCTAssertEqual(profile.color(forLEDIndex: index, target: orange),
                            orange, "marked true-colour key \(index)")
         }
         for index: UInt16 in [2, 52, 126] {
-            XCTAssertEqual(SwitchCompensation.color(forLEDIndex: index, target: orange,
-                                                    markedLEDIndices: marked,
-                                                    markedSwitches: .trueColor,
-                                                    strength: 0.5),
+            XCTAssertEqual(profile.color(forLEDIndex: index, target: orange),
                            corrected, "unmarked tinted key \(index)")
         }
     }
 
     /// The other way round, for a board whose minority is the tinted switches.
     func testMarkedTintedKeysAreTheOnesCorrected() {
-        let marked: Set<UInt16> = [1, 89]
+        let profile = SwitchCompensation.Profile(markedLEDIndices: [1, 89],
+                                                 markedSwitches: .tinted,
+                                                 strength: 0.5)
         let corrected = SwitchCompensation.compensate(orange, strength: 0.5)
 
         for index: UInt16 in [1, 89] {
-            XCTAssertEqual(SwitchCompensation.color(forLEDIndex: index, target: orange,
-                                                    markedLEDIndices: marked,
-                                                    markedSwitches: .tinted,
-                                                    strength: 0.5),
+            XCTAssertEqual(profile.color(forLEDIndex: index, target: orange),
                            corrected, "marked tinted key \(index)")
         }
-        XCTAssertEqual(SwitchCompensation.color(forLEDIndex: 2, target: orange,
-                                                markedLEDIndices: marked,
-                                                markedSwitches: .tinted,
-                                                strength: 0.5),
-                       orange)
+        XCTAssertEqual(profile.color(forLEDIndex: 2, target: orange), orange)
     }
 
     /// The two settings are exact complements of each other.
     func testTheTwoSettingsAreComplements() {
         let marked: Set<UInt16> = [1, 52, 89]
+        let asTrueColor = SwitchCompensation.Profile(markedLEDIndices: marked,
+                                                     markedSwitches: .trueColor)
+        let asTinted = SwitchCompensation.Profile(markedLEDIndices: marked,
+                                                  markedSwitches: .tinted)
         for index in GMMKKeyMap.paintableLEDIndices {
-            XCTAssertNotEqual(
-                SwitchCompensation.needsCorrection(ledIndex: index,
-                                                   markedLEDIndices: marked,
-                                                   markedSwitches: .trueColor),
-                SwitchCompensation.needsCorrection(ledIndex: index,
-                                                   markedLEDIndices: marked,
-                                                   markedSwitches: .tinted),
-                "index \(index)")
+            XCTAssertNotEqual(asTrueColor.needsHueCorrection(ledIndex: index),
+                              asTinted.needsHueCorrection(ledIndex: index),
+                              "index \(index)")
         }
+    }
+
+    // MARK: - Brightness balance
+
+    func testBalanceDefaultsAndRange() {
+        XCTAssertEqual(SwitchCompensation.defaultBalance, 0)
+        XCTAssertEqual(SwitchCompensation.balanceRange, -1...1)
+        XCTAssertEqual(SwitchCompensation.maxDim, 0.7)
+    }
+
+    /// factor = 1 - 0.7·|balance|, and the magnitude is all that matters.
+    func testDimFactor() {
+        XCTAssertEqual(SwitchCompensation.dimFactor(forBalance: 0), 1.0)
+        XCTAssertEqual(SwitchCompensation.dimFactor(forBalance: 1), 0.3, accuracy: 1e-12)
+        XCTAssertEqual(SwitchCompensation.dimFactor(forBalance: -1), 0.3, accuracy: 1e-12)
+        XCTAssertEqual(SwitchCompensation.dimFactor(forBalance: 0.5), 0.65, accuracy: 1e-12)
+        XCTAssertEqual(SwitchCompensation.dimFactor(forBalance: -0.5), 0.65, accuracy: 1e-12)
+        // Out of range clamps to full dimming rather than going darker still.
+        XCTAssertEqual(SwitchCompensation.dimFactor(forBalance: 9), 0.3, accuracy: 1e-12)
+    }
+
+    /// Positive dims the unmarked set; negative dims the marked set; zero dims
+    /// neither.
+    func testWhichSetTheBalanceDims() {
+        let marked: Set<UInt16> = [1, 89]
+        let positive = SwitchCompensation.Profile(markedLEDIndices: marked, balance: 0.5)
+        let negative = SwitchCompensation.Profile(markedLEDIndices: marked, balance: -0.5)
+        let neutral = SwitchCompensation.Profile(markedLEDIndices: marked, balance: 0)
+
+        XCTAssertFalse(positive.isDimmed(ledIndex: 1))
+        XCTAssertTrue(positive.isDimmed(ledIndex: 2))
+        XCTAssertTrue(negative.isDimmed(ledIndex: 1))
+        XCTAssertFalse(negative.isDimmed(ledIndex: 2))
+        XCTAssertFalse(neutral.isDimmed(ledIndex: 1))
+        XCTAssertFalse(neutral.isDimmed(ledIndex: 2))
+    }
+
+    func testScaleRoundsAndClamps() {
+        XCTAssertEqual(SwitchCompensation.scale(RGB(red: 100, green: 10, blue: 3), by: 0.5),
+                       RGB(red: 50, green: 5, blue: 2))    // 1.5 → 2
+        XCTAssertEqual(SwitchCompensation.scale(orange, by: 1), orange)
+        XCTAssertEqual(SwitchCompensation.scale(orange, by: 0), .black)
+        XCTAssertEqual(SwitchCompensation.scale(RGB(red: 200, green: 200, blue: 200), by: 4),
+                       RGB(red: 255, green: 255, blue: 255))
+    }
+
+    // MARK: - Composing hue and intensity
+
+    /// The pipeline is hue first, then intensity — so a tinted key that is also
+    /// in the dimmed set gets the corrected colour scaled, not the raw target.
+    func testHueThenIntensity() {
+        // Marked = true-colour, balance positive → the unmarked (tinted) set is
+        // both corrected and dimmed.
+        let profile = SwitchCompensation.Profile(markedLEDIndices: [1],
+                                                 markedSwitches: .trueColor,
+                                                 strength: 0.5,
+                                                 balance: 0.5)
+        let expected = SwitchCompensation.scale(
+            SwitchCompensation.compensate(orange, strength: 0.5), by: 0.65)
+        XCTAssertEqual(profile.color(forLEDIndex: 2, target: orange), expected)
+        // The marked key is neither corrected nor dimmed.
+        XCTAssertEqual(profile.color(forLEDIndex: 1, target: orange), orange)
+    }
+
+    /// With the balance the other way the marked set is dimmed but still not
+    /// hue-corrected, so the two corrections land on different sets.
+    func testTheTwoCorrectionsCanLandOnDifferentSets() {
+        let profile = SwitchCompensation.Profile(markedLEDIndices: [1],
+                                                 markedSwitches: .trueColor,
+                                                 strength: 0.5,
+                                                 balance: -0.5)
+        XCTAssertEqual(profile.color(forLEDIndex: 1, target: orange),
+                       SwitchCompensation.scale(orange, by: 0.65))
+        XCTAssertEqual(profile.color(forLEDIndex: 2, target: orange),
+                       SwitchCompensation.compensate(orange, strength: 0.5))
+    }
+
+    /// Full balance dims to 30% and no further, in either direction.
+    func testFullBalanceDimsToThirtyPercent() {
+        let white = RGB(red: 255, green: 255, blue: 255)
+        let dimsUnmarked = SwitchCompensation.Profile(markedLEDIndices: [1], balance: 1)
+        XCTAssertEqual(dimsUnmarked.color(forLEDIndex: 2, target: white),
+                       RGB(red: 77, green: 77, blue: 77))     // 255 × 0.3 = 76.5 → 77
+        XCTAssertEqual(dimsUnmarked.color(forLEDIndex: 1, target: white), white)
+
+        let dimsMarked = SwitchCompensation.Profile(markedLEDIndices: [1], balance: -1)
+        XCTAssertEqual(dimsMarked.color(forLEDIndex: 1, target: white),
+                       RGB(red: 77, green: 77, blue: 77))
+    }
+
+    /// A near-black target cannot be dimmed below black, and no channel wraps.
+    func testNearBlackTarget() {
+        let nearBlack = RGB(red: 1, green: 0, blue: 2)
+        let profile = SwitchCompensation.Profile(markedLEDIndices: [1],
+                                                 markedSwitches: .tinted,
+                                                 strength: 1,
+                                                 balance: -1)
+        // Marked key: hue-corrected (red to full) then dimmed to 30%.
+        XCTAssertEqual(profile.color(forLEDIndex: 1, target: nearBlack),
+                       RGB(red: 77, green: 0, blue: 0))
+        // Unmarked: untouched.
+        XCTAssertEqual(profile.color(forLEDIndex: 2, target: nearBlack), nearBlack)
+
+        // Black stays black however hard it is dimmed.
+        let dimOnly = SwitchCompensation.Profile(markedLEDIndices: [1], balance: -1)
+        XCTAssertEqual(dimOnly.color(forLEDIndex: 1, target: .black), .black)
+    }
+
+    // MARK: - Is the profile worth sending per-key?
+
+    func testNeutralProfileIsInactive() {
+        XCTAssertFalse(SwitchCompensation.Profile.neutral.isActive)
+        // Marks alone do nothing without a slider.
+        XCTAssertFalse(SwitchCompensation.Profile(markedLEDIndices: [1, 2]).isActive)
+        // Sliders alone do nothing without two sets to tell apart.
+        XCTAssertFalse(SwitchCompensation.Profile(strength: 1, balance: 1).isActive)
+    }
+
+    func testEitherSliderActivatesAProfile() {
+        XCTAssertTrue(SwitchCompensation.Profile(markedLEDIndices: [1], strength: 0.1).isActive)
+        XCTAssertTrue(SwitchCompensation.Profile(markedLEDIndices: [1], balance: 0.1).isActive)
+        XCTAssertTrue(SwitchCompensation.Profile(markedLEDIndices: [1], balance: -0.1).isActive)
     }
 
     // MARK: - Whole-board colours
@@ -165,10 +277,8 @@ final class SwitchCompensationTests: XCTestCase {
     /// Nothing marked, marked-are-true-colour: the whole board is tinted, so the
     /// whole board is corrected.
     func testNothingMarkedCorrectsEverything() {
-        let colors = SwitchCompensation.uniformColors(target: orange,
-                                                      markedLEDIndices: [],
-                                                      markedSwitches: .trueColor,
-                                                      strength: 0.5)
+        let profile = SwitchCompensation.Profile(markedSwitches: .trueColor, strength: 0.5)
+        let colors = profile.uniformColors(target: orange)
         XCTAssertEqual(colors.count, GMMKKeyMap.paintableLEDIndices.count)
         XCTAssertTrue(colors.allSatisfy { $0 == SwitchCompensation.compensate(orange,
                                                                               strength: 0.5) })
@@ -176,26 +286,31 @@ final class SwitchCompensationTests: XCTestCase {
 
     /// Nothing marked, marked-are-tinted: nothing is tinted, so nothing changes.
     func testNothingMarkedAsTintedCorrectsNothing() {
-        let colors = SwitchCompensation.uniformColors(target: orange,
-                                                      markedLEDIndices: [],
-                                                      markedSwitches: .tinted,
-                                                      strength: 0.5)
-        XCTAssertTrue(colors.allSatisfy { $0 == orange })
+        let profile = SwitchCompensation.Profile(markedSwitches: .tinted, strength: 0.5)
+        XCTAssertTrue(profile.uniformColors(target: orange).allSatisfy { $0 == orange })
     }
 
     /// The array is index-ordered from ``GMMKKeyMap/minLEDIndex``, so LED `n`
-    /// sits at offset `n - 1`.
+    /// sits at offset `n - 1`, and it agrees with the per-LED function.
     func testUniformColorsAreIndexOrdered() {
         let esc = GMMKKeyMap.ansiTKL.first { $0.label == "Esc" }!
         let space = GMMKKeyMap.ansiTKL.first { $0.label == "Space" }!
-        let colors = SwitchCompensation.uniformColors(target: orange,
-                                                      markedLEDIndices: [space.ledIndex],
-                                                      markedSwitches: .trueColor,
-                                                      strength: 0.5)
+        let profile = SwitchCompensation.Profile(markedLEDIndices: [space.ledIndex],
+                                                 markedSwitches: .trueColor,
+                                                 strength: 0.5,
+                                                 balance: 0.25)
+        let colors = profile.uniformColors(target: orange)
+
         XCTAssertEqual(colors[Int(space.ledIndex - GMMKKeyMap.minLEDIndex)], orange)
         XCTAssertEqual(colors[Int(esc.ledIndex - GMMKKeyMap.minLEDIndex)],
-                       SwitchCompensation.compensate(orange, strength: 0.5))
+                       profile.color(forLEDIndex: esc.ledIndex, target: orange))
         XCTAssertEqual(colors.filter { $0 == orange }.count, 1)
+
+        for index in GMMKKeyMap.paintableLEDIndices {
+            XCTAssertEqual(colors[Int(index - GMMKKeyMap.minLEDIndex)],
+                           profile.color(forLEDIndex: index, target: orange),
+                           "index \(index)")
+        }
     }
 
     // MARK: - Red-heaviness score
@@ -292,14 +407,13 @@ final class SwitchCompensationTests: XCTestCase {
         XCTAssertEqual(packets[4][4], 0x03)     // first address = index 1 × 3
     }
 
-    /// At strength 0 the paint is uniform whatever is marked and whichever way
-    /// the toggle is set.
+    /// With both sliders at 0 the paint is uniform whatever is marked and
+    /// whichever way the toggle is set.
     func testZeroStrengthPaintsTheTargetEverywhere() {
         for markedSwitches in SwitchCompensation.MarkedSwitches.allCases {
-            XCTAssertEqual(GMMKTransaction.paintCompensated(target: orange,
-                                                            markedLEDIndices: [1, 52, 89],
-                                                            markedSwitches: markedSwitches,
-                                                            strength: 0),
+            let profile = SwitchCompensation.Profile(markedLEDIndices: [1, 52, 89],
+                                                     markedSwitches: markedSwitches)
+            XCTAssertEqual(GMMKTransaction.paintCompensated(target: orange, profile: profile),
                            GMMKTransaction.paintUniform(orange),
                            "\(markedSwitches)")
         }
@@ -309,10 +423,9 @@ final class SwitchCompensationTests: XCTestCase {
     /// target while every other LED is corrected.
     func testPaintCompensatedCorrectsTheComplementOfTheMarkedSet() {
         let corrected = SwitchCompensation.compensate(orange, strength: 1)
-        let packets = GMMKTransaction.paintCompensated(target: orange,
-                                                       markedLEDIndices: [1],
-                                                       markedSwitches: .trueColor,
-                                                       strength: 1)
+        let packets = GMMKTransaction.paintCompensated(
+            target: orange,
+            profile: .init(markedLEDIndices: [1], markedSwitches: .trueColor, strength: 1))
         // LED 1 is the first triplet of the first colour packet; LED 2 the
         // second. Data starts at payload offset 7.
         XCTAssertEqual(Array(packets[4][7..<10]), [orange.red, orange.green, orange.blue])
@@ -323,13 +436,86 @@ final class SwitchCompensationTests: XCTestCase {
     /// The same marked set with the toggle flipped swaps which LEDs move.
     func testFlippingTheToggleSwapsTheCorrectedSet() {
         let corrected = SwitchCompensation.compensate(orange, strength: 1)
-        let asTinted = GMMKTransaction.paintCompensated(target: orange,
-                                                        markedLEDIndices: [1],
-                                                        markedSwitches: .tinted,
-                                                        strength: 1)
+        let asTinted = GMMKTransaction.paintCompensated(
+            target: orange,
+            profile: .init(markedLEDIndices: [1], markedSwitches: .tinted, strength: 1))
         XCTAssertEqual(Array(asTinted[4][7..<10]),
                        [corrected.red, corrected.green, corrected.blue])
         XCTAssertEqual(Array(asTinted[4][10..<13]), [orange.red, orange.green, orange.blue])
+    }
+
+    /// A balance-only profile still needs the per-key path: the two sets get
+    /// the same hue at different intensities.
+    func testPaintCompensatedWithBalanceOnly() {
+        let packets = GMMKTransaction.paintCompensated(
+            target: orange, profile: .init(markedLEDIndices: [1], balance: 1))
+        let dimmed = SwitchCompensation.scale(orange, by: 0.3)
+        XCTAssertEqual(Array(packets[4][7..<10]), [orange.red, orange.green, orange.blue])
+        XCTAssertEqual(Array(packets[4][10..<13]), [dimmed.red, dimmed.green, dimmed.blue])
+    }
+
+    // MARK: - Routing: which transaction does a colour change produce?
+
+    /// Convenience: is this transaction a per-key paint or a config write?
+    private func isPerKeyPaint(_ packets: [[UInt8]]) -> Bool {
+        packets.contains { $0[2] == GMMKPacket.Command.writeCustomColors }
+    }
+
+    /// A neutral profile takes the global path — one config write per profile
+    /// base, no per-key packets, and the mode is left alone.
+    func testColorChangeWithNoCompensationIsGlobal() {
+        let packets = GMMKTransaction.applyColor(orange, compensation: .neutral)
+        XCTAssertEqual(packets, GMMKTransaction.setColor(orange))
+        XCTAssertFalse(isPerKeyPaint(packets))
+    }
+
+    /// Marks with both sliders at zero are still neutral: there is nothing to
+    /// express per key, so 12 packets would buy nothing.
+    func testMarksAloneDoNotForceThePerKeyPath() {
+        let packets = GMMKTransaction.applyColor(
+            orange, compensation: .init(markedLEDIndices: [1, 2, 3]))
+        XCTAssertEqual(packets, GMMKTransaction.setColor(orange))
+    }
+
+    /// An active profile takes the per-key path, in custom mode.
+    func testColorChangeWithCompensationIsPerKey() {
+        let profile = SwitchCompensation.Profile(markedLEDIndices: [1], strength: 0.5)
+        let packets = GMMKTransaction.applyColor(orange, compensation: profile)
+        XCTAssertEqual(packets, GMMKTransaction.paintCompensated(target: orange,
+                                                                 profile: profile))
+        XCTAssertTrue(isPerKeyPaint(packets))
+        XCTAssertEqual(Array(packets[1...3]),
+                       GMMKPacket.atEveryProfile { GMMKPacket.setMode(.custom, profileBase: $0) })
+    }
+
+    /// The balance slider alone is enough to route per-key, even with no hue
+    /// correction at all.
+    func testBalanceAloneRoutesPerKey() {
+        let profile = SwitchCompensation.Profile(markedLEDIndices: [1], balance: -0.4)
+        XCTAssertTrue(isPerKeyPaint(GMMKTransaction.applyColor(orange, compensation: profile)))
+    }
+
+    /// A palette swatch with no compensation switches to `fixed` and writes
+    /// brightness — the whole solid-colour transaction.
+    func testSolidColorWithNoCompensationIsGlobal() {
+        let packets = GMMKTransaction.applySolidColor(orange, brightness: 3,
+                                                      compensation: .neutral)
+        XCTAssertEqual(packets, GMMKTransaction.solidColor(orange, brightness: 3))
+        XCTAssertFalse(isPerKeyPaint(packets))
+    }
+
+    /// With compensation on, the same swatch becomes a per-key paint instead —
+    /// `fixed` mode would show one flat colour and lose the correction.
+    func testSolidColorWithCompensationIsPerKey() {
+        let profile = SwitchCompensation.Profile(markedLEDIndices: [1], strength: 0.5)
+        let packets = GMMKTransaction.applySolidColor(orange, brightness: 3,
+                                                      compensation: profile)
+        XCTAssertEqual(packets, GMMKTransaction.paintCompensated(target: orange,
+                                                                 profile: profile))
+        XCTAssertTrue(isPerKeyPaint(packets))
+        // Brightness is deliberately not re-sent on this path.
+        XCTAssertFalse(packets.contains { $0[2] == GMMKPacket.Command.writeConfig
+                                          && $0[4] == UInt8(GMMKPacket.ConfigOffset.brightness) })
     }
 
     /// A single-key paint is one bracketed `0x11` write and nothing else — no

@@ -83,8 +83,14 @@ final class KeyboardController {
     /// Sends the colour with rainbow explicitly off in the same transaction —
     /// with the flag set the effect ignores the colour entirely, so a colour
     /// write on its own reads to the user as "nothing happened".
-    func setColor(_ color: RGB, throttleKey: String? = "color") {
-        send(GMMKTransaction.setColor(color), throttleKey: throttleKey)
+    ///
+    /// With an active compensation profile the colour goes out as a per-key
+    /// paint instead, because the two housings need different bytes to look like
+    /// the same colour. See ``GMMKTransaction/applyColor(_:compensation:)``.
+    func setColor(_ color: RGB,
+                  compensation profile: SwitchCompensation.Profile = .neutral,
+                  throttleKey: String? = "color") {
+        send(GMMKTransaction.applyColor(color, compensation: profile), throttleKey: throttleKey)
     }
 
     func setRainbow(_ on: Bool) {
@@ -92,31 +98,32 @@ final class KeyboardController {
     }
 
     /// Sets a solid colour in mode `fixed` in one transaction — mode,
-    /// brightness, rainbow off and the colour together.
+    /// brightness, rainbow off and the colour together — or, with an active
+    /// compensation profile, as a per-key paint carrying the same colour.
     ///
-    /// Brightness rides along because ``GMMKTransaction/solidColor(_:brightness:)``
-    /// writes it; passing the current UI value keeps it where the user left it
-    /// instead of jumping to full.
-    func setSolidColor(_ color: RGB, brightnessPercent: Int) {
-        send(GMMKTransaction.solidColor(color,
-                                        brightness: Brightness.level(fromPercent: brightnessPercent)))
+    /// Brightness rides along on the global path because
+    /// ``GMMKTransaction/solidColor(_:brightness:)`` writes it; passing the
+    /// current UI value keeps it where the user left it instead of jumping to
+    /// full.
+    func setSolidColor(_ color: RGB,
+                       brightnessPercent: Int,
+                       compensation profile: SwitchCompensation.Profile) {
+        send(GMMKTransaction.applySolidColor(
+            color,
+            brightness: Brightness.level(fromPercent: brightnessPercent),
+            compensation: profile))
     }
 
     /// Switches to mode `custom` and paints every LED the target colour, with
-    /// the tinted keys corrected back towards it — see ``SwitchCompensation``,
-    /// including how `markedSwitches` decides which keys those are.
+    /// the tinted keys hue-corrected and one set intensity-scaled — see
+    /// ``SwitchCompensation/Profile``.
     ///
     /// Twelve packets rather than the usual five, so it gets its own throttle
-    /// key: a strength drag must not be able to cancel a pending colour write.
+    /// key: a slider drag must not be able to cancel a pending colour write.
     func paintCompensated(target: RGB,
-                          markedLEDIndices: Set<UInt16>,
-                          markedSwitches: SwitchCompensation.MarkedSwitches,
-                          strength: Double,
+                          profile: SwitchCompensation.Profile,
                           throttleKey: String? = "paint") {
-        send(GMMKTransaction.paintCompensated(target: target,
-                                              markedLEDIndices: markedLEDIndices,
-                                              markedSwitches: markedSwitches,
-                                              strength: strength),
+        send(GMMKTransaction.paintCompensated(target: target, profile: profile),
              throttleKey: throttleKey)
     }
 

@@ -21,6 +21,7 @@ struct Settings {
         static let markedLEDIndices = "compensation.markedLEDIndices"
         static let markedSwitches = "compensation.markedSwitches"
         static let compensationStrength = "compensation.strength"
+        static let compensationBalance = "compensation.balance"
         /// What ``markedLEDIndices`` was called when the marked set could only
         /// mean "the Lynx-switch keys". Read once, for migration.
         static let legacyLynxLEDIndices = "compensation.lynxLEDIndices"
@@ -48,6 +49,17 @@ struct Settings {
     var markedSwitches: SwitchCompensation.MarkedSwitches = .trueColor
     /// How hard to correct the tinted keys, `0`…`1`.
     var compensationStrength: Double = SwitchCompensation.defaultStrength
+    /// Intensity balance between the two sets, `-1`…`1`. Positive dims the
+    /// unmarked set, negative the marked one.
+    var compensationBalance: Double = SwitchCompensation.defaultBalance
+
+    /// The four compensation fields as the protocol layer wants them.
+    var compensationProfile: SwitchCompensation.Profile {
+        SwitchCompensation.Profile(markedLEDIndices: markedLEDIndices,
+                                   markedSwitches: markedSwitches,
+                                   strength: compensationStrength,
+                                   balance: compensationBalance)
+    }
 
     private let defaults: UserDefaults
 
@@ -97,6 +109,12 @@ struct Settings {
             compensationStrength = min(max(abs(stored), SwitchCompensation.strengthRange.lowerBound),
                                        SwitchCompensation.strengthRange.upperBound)
         }
+        // Absent before the balance slider existed, which is the same as
+        // neutral — so no migration beyond the default is needed.
+        if let stored = defaults.object(forKey: Key.compensationBalance) as? Double {
+            compensationBalance = min(max(stored, SwitchCompensation.balanceRange.lowerBound),
+                                      SwitchCompensation.balanceRange.upperBound)
+        }
     }
 
     /// Writes the whole struct back. Cheap enough to call on every change.
@@ -110,5 +128,6 @@ struct Settings {
         defaults.set(markedLEDIndices.sorted().map(Int.init), forKey: Key.markedLEDIndices)
         defaults.set(markedSwitches.rawValue, forKey: Key.markedSwitches)
         defaults.set(compensationStrength, forKey: Key.compensationStrength)
+        defaults.set(compensationBalance, forKey: Key.compensationBalance)
     }
 }

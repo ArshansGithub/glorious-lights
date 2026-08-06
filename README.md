@@ -49,12 +49,17 @@ swift build -c release
   *Tune Switch Compensation…* has you press whichever kind you have fewer of —
   each lights white as you go — say which kind that was, then drag one slider
   until the board reads as the colour you actually picked. The tinted keys are
-  the ones corrected, whether they're the set you marked or the rest.
-  *Uniform Color (Compensated)* then paints per-key with that correction. It
-  can only do so much — a cyan housing filters red out subtractively, and on a
-  warm color red is already maxed — so the palette above is the better answer
-  for most colors. Fn is marked with a button, since the keyboard handles that
-  key itself and the Mac never sees it.
+  the ones corrected, whether they're the set you marked or the rest. A second
+  slider balances *brightness* between the two sets, because matching the hue
+  doesn't match the glow — on green/blue colors the cyan housings diffuse more
+  light and read brighter, on reds they read dimmer, so the slider goes both
+  ways. Fn is marked with a button, since the keyboard handles that key itself
+  and the Mac never sees it.
+  Once a profile is tuned, every color change — the picker and the swatches
+  above alike — goes out as a per-key paint carrying the correction. Hue
+  correction alone can only do so much (a cyan housing filters red out
+  subtractively, and on a warm color red is already maxed), so the palette is
+  still the better answer for most colors.
 - **CLI:** `swift run -c release gmmk-cli help`
 
 ```sh

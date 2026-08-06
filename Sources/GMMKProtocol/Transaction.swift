@@ -124,20 +124,44 @@ public enum GMMKTransaction {
                                    count: GMMKKeyMap.paintableLEDIndices.count))
     }
 
-    /// Paints every LED the target colour, with the keys whose housing tints the
-    /// light corrected back towards it — see ``SwitchCompensation``, including
-    /// how `markedSwitches` decides which keys those are.
-    public static func paintCompensated(
-        target: RGB,
-        markedLEDIndices: Set<UInt16>,
-        markedSwitches: SwitchCompensation.MarkedSwitches,
-        strength: Double
-    ) -> [[UInt8]] {
+    /// Paints every LED the target colour, hue-corrected on the keys whose
+    /// housing tints the light and intensity-scaled on whichever set the
+    /// balance dims — see ``SwitchCompensation/Profile``.
+    public static func paintCompensated(target: RGB,
+                                        profile: SwitchCompensation.Profile) -> [[UInt8]] {
         customColors(startKeyIndex: GMMKKeyMap.minLEDIndex,
-                     colors: SwitchCompensation.uniformColors(target: target,
-                                                              markedLEDIndices: markedLEDIndices,
-                                                              markedSwitches: markedSwitches,
-                                                              strength: strength))
+                     colors: profile.uniformColors(target: target))
+    }
+
+    // MARK: - Colour routing
+
+    /// The transaction a plain colour change should produce.
+    ///
+    /// With an active profile the two housings need different bytes, so the
+    /// colour can only be expressed as a per-key paint in mode `custom`. With a
+    /// neutral one every key wants the same bytes, and the global config write
+    /// is both shorter and the mode the user is more likely to want — so the
+    /// routing is on ``SwitchCompensation/Profile/isActive`` and nothing else.
+    public static func applyColor(_ color: RGB,
+                                  compensation profile: SwitchCompensation.Profile) -> [[UInt8]] {
+        profile.isActive ? paintCompensated(target: color, profile: profile) : setColor(color)
+    }
+
+    /// The transaction a solid-colour change should produce — a palette swatch,
+    /// say, where the intent includes "and switch to a plain lit mode".
+    ///
+    /// - Note: the compensated branch writes colours only. Brightness is a
+    ///   global, live-applying field that the brightness control owns, and
+    ///   re-sending it here would make picking a colour also undo a brightness
+    ///   change the user made a moment earlier.
+    public static func applySolidColor(
+        _ color: RGB,
+        brightness: UInt8 = Brightness.max,
+        compensation profile: SwitchCompensation.Profile
+    ) -> [[UInt8]] {
+        profile.isActive
+            ? paintCompensated(target: color, profile: profile)
+            : solidColor(color, brightness: brightness)
     }
 
     /// Paints a single LED, without touching the effect mode.
