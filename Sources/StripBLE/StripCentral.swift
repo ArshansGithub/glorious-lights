@@ -59,6 +59,13 @@ public final class StripCentral: NSObject {
     /// bring-up this is free evidence: a controller that answers at all is a
     /// controller that recognised something.
     public var onNotification: ((StripUUID, [UInt8]) -> Void)?
+    /// Fires once service and characteristic discovery has finished, with the
+    /// finished GATT dump.
+    ///
+    /// This is what makes the class usable from the app: the CLI can afford to
+    /// pump the run loop until ``isDiscoveryComplete`` goes true, and a menu-bar
+    /// app cannot block its main thread at all, so it needs to be told.
+    public var onServicesDiscovered: ((StripDeviceReport) -> Void)?
 
     public override init() {
         super.init()
@@ -278,12 +285,14 @@ extension StripCentral: CBPeripheralDelegate {
                                       characteristics: chars)
         }
         let scan = discovered[peripheral.identifier]
-        report = StripDeviceReport(identifier: peripheral.identifier,
-                                   name: peripheral.name,
-                                   advertisedName: scan?.advertisedName,
-                                   rssi: scan?.rssi,
-                                   advertisedServiceUUIDs: scan?.advertisedServiceUUIDs ?? [],
-                                   services: services)
+        let built = StripDeviceReport(identifier: peripheral.identifier,
+                                      name: peripheral.name,
+                                      advertisedName: scan?.advertisedName,
+                                      rssi: scan?.rssi,
+                                      advertisedServiceUUIDs: scan?.advertisedServiceUUIDs ?? [],
+                                      services: services)
+        report = built
         isDiscoveryComplete = true
+        onServicesDiscovered?(built)
     }
 }

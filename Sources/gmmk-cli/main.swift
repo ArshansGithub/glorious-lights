@@ -54,6 +54,13 @@ let usage = """
                             A different device with a different protocol —
                             feature reports, no checksum, no START/END. Run
                             `gmmk-cli mouse` for its subcommands.
+      strip <subcommand>    Control a Bluetooth LE LED strip. A third device on a
+                            third transport, and the only one whose protocol is
+                            not known in advance: cheap controllers ship under
+                            dozens of names across several incompatible wire
+                            formats. Start with `gmmk-cli strip scan`, which
+                            ranks each device against the known families. Run
+                            `gmmk-cli strip` for its subcommands.
 
       Each of these opens with a 0x03 "hello" read — without a recent one the
       firmware stores writes but never applies them — and then sends one
@@ -270,6 +277,9 @@ case "rainbow":
 
 case "mouse":
     runMouseCommand(rest)
+
+case "strip":
+    runStripCommand(rest)
 
 case "read":
     // Bring-up/debug: read from the keyboard and print the reply.

@@ -115,7 +115,11 @@ public enum StripBLEError: Error, CustomStringConvertible {
 
     /// Maps a CoreBluetooth state onto the error it means, or `nil` when the
     /// state is usable or still settling.
-    static func forState(_ state: CBManagerState) -> StripBLEError? {
+    ///
+    /// Public because the app needs it too: it cannot use the blocking
+    /// ``StripCentral/waitForPoweredOn(timeout:)`` and so has to translate a
+    /// state it observes into the same message the CLI would print.
+    public static func forState(_ state: CBManagerState) -> StripBLEError? {
         switch state {
         case .poweredOn: return nil
         case .unauthorized: return .unauthorized
