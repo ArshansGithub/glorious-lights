@@ -3,15 +3,18 @@ import GMMKProtocol
 
 /// How the board interprets the music.
 ///
-/// Identities are unchanged from the first design; what changed is that each
-/// mode is now a *gesture schedule plus an envelope field* over one common
-/// foundation, with an explicit lifecycle and no re-triggering mid-gesture.
+/// Identities are unchanged from the first design; what changed in r2 is that
+/// every mode now rides the same three timescales. Each one **rides the SECTION
+/// bed, swells with the PHRASE, punctuates with TRANSIENTS, and takes its colour
+/// from the spatial hue field.** No mode paints a single global hue and no mode
+/// owns a bed of its own — what a mode still owns is `shape(x,t)`, *where* the
+/// bed sits on the board, and its gestures.
 public enum VisualizerMode: String, CaseIterable, Sendable {
     /// The whole board breathes with the beat.
     case pulse
     /// Each beat launches a band of light travelling across the board.
     case wave
-    /// Onsets fire rings expanding from the centre.
+    /// Onsets fire rings from the register that made them.
     case ripple
     /// Bars, grouped into musical registers.
     case spectrum
@@ -32,7 +35,7 @@ public enum VisualizerMode: String, CaseIterable, Sendable {
         switch self {
         case .pulse:    return "The board breathes with the beat"
         case .wave:     return "Light travels across on every beat"
-        case .ripple:   return "Drum hits fire rings from the centre"
+        case .ripple:   return "Drum hits fire rings from their own register"
         case .spectrum: return "Bars by musical register"
         case .vu:       return "Loudness fills out from the middle"
         }
@@ -49,13 +52,18 @@ public enum VisualizerMode: String, CaseIterable, Sendable {
         case .vu:       return 3      // the body, plus a kick and a snare accent
         }
     }
+
+    /// Whether this mode schedules gestures on the beat grid, and so whether
+    /// §2.3.3's schedule-to-land applies to it — and, correspondingly, whether
+    /// M8 is a claim about it.
+    public var isBeatScheduled: Bool { self == .pulse || self == .wave }
 }
 
 /// Turns one interpolated ``AnalysisState`` plus the onsets that have arrived
 /// into a float canvas.
 ///
-/// Owns the gesture population and the beat schedule; owns no timing of its own.
-/// Every call is `f(t)` for the caller's `t`.
+/// Owns the gesture population, the beat schedule and the colour field; owns no
+/// timing of its own. Every call is `f(t)` for the caller's `t`.
 public final class ModeRenderer {
 
     public var mode: VisualizerMode {
@@ -66,28 +74,43 @@ public final class ModeRenderer {
         }
     }
     public var themeColor: RGB
-    /// Paint in the desk look's colour instead of the brightness ramp.
+    /// Seat the desk look's colour into the field as its base hue instead of
+    /// letting the hue drift.
+    ///
+    /// Note what this does **not** do: it does not collapse the board to one
+    /// colour. P11 forbids any display element taking its hue from a single
+    /// board-wide number, and a theme is a preference about *where* the palette
+    /// sits, not a licence to delete the field.
     public var useThemeColor: Bool
     /// Display frame interval, for the ballistic clamps and the motion blur.
     public var frameInterval: Double
 
+    /// `L̂` — the measured end-to-end latency the beat schedule lands against
+    /// (§8.2-R). Written by the engine every frame from a live measurement;
+    /// there is deliberately no constant here any more.
+    public var latency: Double = 0
+
     private var gestures: GestureList
+    private var colourField = ColourField()
+    private var schedule = BeatSchedule()
+
+    /// What the beat schedule actually did, for §10.5's open measurement gaps.
+    public var beatTelemetry: (launches: Int, confirmations: Int, misses: Int,
+                               credit: Double) {
+        (schedule.launches, schedule.confirmations, schedule.misses,
+         schedule.predictionCredit)
+    }
     /// Beats counted since the session started, for bar-level phrasing.
     private var beatCount: Double = 0
     private var lastPhase: Double = 0
-    private var lastBeatTime: Double = -.infinity
     private var waveDirection: Double = 1
-    private var rippleSide: [OnsetKind: Double] = [.snare: 1, .hat: 1]
+    private var lastStructureChanges = 0
     /// The timestamp of the previous `render` call, so the beat window can be
     /// the time that actually elapsed rather than the nominal frame interval.
     private var lastRenderTime: Double?
     /// Measured elapsed time since the previous frame, seeded with the nominal
     /// interval for the first one.
     private var renderGap: Double = 1.0 / 30
-    /// Measured analysis-to-photon latency used to schedule beat-locked gestures
-    /// early (§8.2). Conservative: a wrong prediction that is early by a frame
-    /// is far less visible than one that is late.
-    public var predictionLead: Double = 0.040
 
     public init(mode: VisualizerMode = .pulse,
                 themeColor: RGB = RGB(red: 0x00, green: 0xCC, blue: 0xAA),
@@ -104,101 +127,228 @@ public final class ModeRenderer {
         gestures.removeAll()
         beatCount = 0
         lastPhase = 0
-        lastBeatTime = -.infinity
         waveDirection = 1
-        bedEnvelope.reset()
+        lastStructureChanges = 0
+        colourField.reset()
+        schedule.reset()
         lastRenderTime = nil
         renderGap = frameInterval
     }
 
     private var columnCount: Int { LinearCanvas.columnCount }
 
+    /// What a mode contributes, in the vocabulary §11.4 composes in.
+    ///
+    /// A mode no longer decides how bright the board is. It decides *where* —
+    /// `shape` for the resting bed, `accent` for its own fast field, `fill` for
+    /// how much of a column that fast field occupies, `peak` for the marker row.
+    /// The levels come from `bed + swell + headroom`, identically for all five.
+    private struct Field {
+        var shape: [Double]
+        var accent: [Double]
+        var fill: [Double]
+        var peak: [Double]
+
+        init(columns: Int) {
+            shape = [Double](repeating: 1, count: columns)
+            accent = [Double](repeating: 0, count: columns)
+            fill = [Double](repeating: 1, count: columns)
+            peak = [Double](repeating: 0, count: columns)
+        }
+    }
+
     /// Schedules gestures from this frame's events, then paints.
     public func render(state: AnalysisState, onsets: [OnsetEvent],
                        time: Double) -> LinearCanvas {
         // The window a beat has to fall inside is the gap since the *previous*
-        // frame, not one nominal frame interval. P6 drops frames under
-        // transport backpressure, so two `render` calls can be two or more
-        // frame intervals apart — and a beat whose due-window fell entirely in
-        // the gap was simply never triggered. Pulse and wave lost beats exactly
-        // when the transport was struggling.
-        renderGap = lastRenderTime.map { max(time - $0, 0) } ?? frameInterval
+        // frame, not one nominal frame interval. P6 drops frames under transport
+        // backpressure, so two `render` calls can be two or more frame intervals
+        // apart.
+        let previousFrame = lastRenderTime ?? (time - frameInterval)
+        renderGap = max(time - previousFrame, 0)
         lastRenderTime = time
-        trackBeats(state: state, time: time)
-        schedule(state: state, onsets: onsets, time: time)
+
+        trackBeats(state: state)
+        schedule(state: state, onsets: onsets, previousFrame: previousFrame, time: time)
         gestures.prune(at: time)
 
-        var canvas = LinearCanvas()
+        var field = Field(columns: columnCount)
+        var deposits = [(column: Int, weight: Double, hue: Double)]()
         switch mode {
-        case .pulse:    paintPulse(state, time: time, into: &canvas)
-        case .wave:     paintWave(state, time: time, into: &canvas)
-        case .ripple:   paintRipple(state, time: time, into: &canvas)
-        case .spectrum: paintSpectrum(state, time: time, into: &canvas)
-        case .vu:       paintVU(state, time: time, into: &canvas)
+        case .pulse:    buildPulse(state, time: time, into: &field, deposits: &deposits)
+        case .wave:     buildWave(state, time: time, into: &field, deposits: &deposits)
+        case .ripple:   buildRipple(state, time: time, into: &field, deposits: &deposits)
+        case .spectrum: buildSpectrum(state, time: time, into: &field, deposits: &deposits)
+        case .vu:       buildVU(state, time: time, into: &field, deposits: &deposits)
         }
+
+        var canvas = LinearCanvas()
+        compose(field, state: state, into: &canvas)
+        for deposit in deposits {
+            colourField.deposit(column: deposit.column, weight: deposit.weight,
+                                hue: deposit.hue)
+        }
+        // The field advances *after* the frame it described has been composed,
+        // so a deposit is visible from the next frame onward — which is what
+        // makes it a trail rather than a tint on the gesture's own pixels.
+        let structureChanged = state.structureChanges > lastStructureChanges
+        lastStructureChanges = state.structureChanges
+        colourField.advance(brightness: state.brightness, spread: state.spread,
+                            phrase: state.phrase, section: state.section,
+                            structureChanged: structureChanged,
+                            now: time, dt: renderGap)
         canvas.blur(sigma: 1.0)
         return canvas
     }
 
-    // MARK: - Beat tracking
+    /// §11.4 and §12, applied identically to every mode.
+    private func compose(_ field: Field, state: AnalysisState,
+                         into canvas: inout LinearCanvas) {
+        let composition = state.composition
+        let base = useThemeColor
+            ? hueOfRGB(Double(themeColor.red) / 255, Double(themeColor.green) / 255,
+                       Double(themeColor.blue) / 255)
+            : nil
+        for column in 0..<columnCount {
+            let bedPart = composition.resting * clamp(field.shape[column], 0, 1)
+            let accentPart = Composition.accentScale * composition.accentGain
+                * clamp(field.accent[column], 0, 1) * composition.headroom
+            let total = clamp(bedPart + accentPart, 0, 1) * (1 - composition.silenceRamp)
+            guard total > 0 else { continue }
+            let scale = total / max(bedPart + accentPart, 1e-12)
+            let colour = hsvToRGB(hue: colourField.hue(column: column, base: base),
+                                  saturation: colourField.saturation(column: column),
+                                  value: 1)
+            // The bed covers the **peak row** as well as the level rows. A
+            // function-row key that is dark except when a gesture passes toggles
+            // once per gesture, and M1 is a per-key metric whose p95 is decided
+            // by exactly those keys. "The board is never at zero" is a claim
+            // about the board, and the function row is part of it.
+            canvas.addColumn(column, colour, level: bedPart * scale,
+                             peak: bedPart * scale)
+            let fill = clamp(field.fill[column], 0, 1)
+            if fill >= 1 {
+                // A gesture that covers the whole column lights it evenly; only
+                // a *bar* has a bottom-weighted ramp, and applying that ramp to
+                // the other four modes would dim the bottom of the board for no
+                // reason a mode asked for.
+                canvas.addColumn(column, colour, level: accentPart * scale)
+            } else {
+                canvas.fillColumn(column, height: fill, colour: colour,
+                                  level: accentPart * scale)
+            }
+            let peak = clamp(field.peak[column], 0, 1) * total
+            if peak > 0 { canvas.add(column: column, row: LinearCanvas.peakRow, colour, level: peak) }
+        }
+    }
+
+    // MARK: - Beat tracking and scheduling
 
     /// Follows the published phase and notices when it wraps, which is a beat.
-    private func trackBeats(state: AnalysisState, time: Double) {
+    private func trackBeats(state: AnalysisState) {
         guard state.tempo.bpm > 0 else { return }
         let phase = state.tempo.phase
         if phase < lastPhase { beatCount += 1 }
         lastPhase = phase
     }
 
-    /// Whether a beat is due within the prediction lead — the mechanism that
-    /// makes beat-locked gestures land with zero visible latency.
-    private func beatIsDue(state: AnalysisState, time: Double) -> Bool {
-        guard state.tempo.confidence >= TempoEstimate.usableConfidence,
-              state.tempo.bpm > 0 else { return false }
-        let period = state.tempo.beatPeriod
-        let untilBeat = (1 - state.tempo.phase) * period
-        let lead = state.tempo.confidence >= TempoEstimate.predictiveConfidence
-            ? predictionLead : 0
-        guard untilBeat <= lead + max(renderGap, frameInterval) else { return false }
-        guard time - lastBeatTime >= period * 0.5 else { return false }
-        lastBeatTime = time
-        return true
-    }
+    private func schedule(state: AnalysisState, onsets: [OnsetEvent],
+                          previousFrame: Double, time: Double) {
+        // Onsets are offered to the schedule **before** the schedule is
+        // advanced, because advancing is what closes a beat's confirmation
+        // window. A kick is detected about 40 ms after it happened and reaches
+        // the renderer on the next frame, so on a 33 ms grid its delivery lands
+        // 40–75 ms after the beat — close enough to the ±90 ms window that
+        // resolving first turned roughly one beat in six on `edm-128` into a
+        // miss, which the credit rule then punished twice over. Nothing about a
+        // beat's *launch* is affected: a launch happens 50–80 ms before its beat
+        // and its confirmation arrives after, so the two never contend for the
+        // same frame.
+        var consumed = Set<Int>()
+        if mode.isBeatScheduled {
+            for (index, onset) in onsets.enumerated() {
+                // Every arbitrated onset confirms the grid; only the ones this
+                // mode paints carry an amplitude and can be absorbed.
+                let painted: Bool = mode == .pulse ? onset.kind != .hat : onset.kind == .kick
+                let amplitude: Double? = !painted ? nil
+                    : (mode == .pulse
+                        ? pulseAmplitude(state, confidence: onset.confidence)
+                            * (onset.kind == .kick ? 1.0 : 0.85)
+                        : clamp(state.bassCurrentRelative / 2.0, 0.4, 1.0)
+                            * (0.5 + 0.5 * onset.confidence))
+                if schedule.offer(onset: onset, amplitude: amplitude) == .absorbed,
+                   let amplitude {
+                    gestures.absorb(kind: mode == .pulse ? .pulse : .wave,
+                                    amplitude: amplitude)
+                    consumed.insert(index)
+                }
+            }
 
-    // MARK: - Scheduling
+            let envelope = mode == .pulse ? pulseEnvelope(state) : waveEnvelope()
+            let kind: Gesture.Kind = mode == .pulse ? .pulse : .wave
+            let carry = gestures.gestures.last { $0.kind == kind }?
+                .integratedLevel(at: time, frameInterval: frameInterval) ?? 0
+            if let launch = schedule.advance(
+                state: state, latency: latency, envelope: envelope,
+                frameInterval: frameInterval, carry: carry,
+                previousFrame: previousFrame, now: time, grace: renderGap) {
+                switch mode {
+                case .pulse:
+                    // §12.4: a beat-driven pulse is brightest at the **centroid
+                    // column**, which moves with the music. A predicted gesture
+                    // has no band of its own, and pinning it to the kick
+                    // register would park the board's bright spot on one column
+                    // for every beat of every four-to-the-floor track — the
+                    // exact failure §12.4 exists to remove, just three columns
+                    // to the left of where r1 put it.
+                    triggerPulse(state: state, at: launch.startTime,
+                                 amplitude: launch.amplitude,
+                                 origin: colourField.centroidColumn, onsetKind: nil)
+                case .wave:
+                    triggerWave(state: state, at: launch.startTime,
+                                amplitude: launch.amplitude)
+                default: break
+                }
+            }
+        }
 
-    private func schedule(state: AnalysisState, onsets: [OnsetEvent], time: Double) {
         switch mode {
         case .pulse:
-            // Kicks and snares, not hats. The design names the kick, and the
-            // kick is what the board should breathe with — but the arbiter has
-            // already reduced each physical hit to one event, so a backbeat that
-            // arrives as a snare is the same beat, and dropping it leaves the
-            // board flat on every bar whose kick the detector happened to lose.
-            // Hats stay out: they subdivide, and a board breathing at the
-            // sixteenth is not breathing.
-            for onset in onsets where onset.kind != .hat {
+            // Kicks and snares, not hats. The arbiter has already reduced each
+            // physical hit to one event, so a backbeat that arrives as a snare
+            // is the same beat and dropping it leaves the board flat on every
+            // bar whose kick the detector happened to lose. Hats stay out: they
+            // subdivide, and a board breathing at the sixteenth is not
+            // breathing.
+            for (index, onset) in onsets.enumerated()
+            where onset.kind != .hat && !consumed.contains(index) {
                 let weight = onset.kind == .kick ? 1.0 : 0.85
                 triggerPulse(state: state, at: onset.time,
                              amplitude: pulseAmplitude(state, confidence: onset.confidence)
-                                 * weight)
-            }
-            if beatIsDue(state: state, time: time) {
-                triggerPulse(state: state, at: time,
-                             amplitude: pulseAmplitude(state, confidence: state.tempo.confidence))
+                                 * weight,
+                             origin: ColourField.originColumn(band: onset.band),
+                             onsetKind: onset.kind)
             }
 
         case .wave:
-            let launch: [(Double, Double)]
-            if state.tempo.gridWeight > 0.5 {
-                launch = beatIsDue(state: state, time: time)
-                    ? [(time, clamp(state.bassCurrentRelative / 2.0, 0.4, 1.0))] : []
-            } else {
-                launch = onsets.filter { $0.kind == .kick }
-                    .map { ($0.time, clamp(state.bassCurrentRelative / 2.0, 0.4, 1.0)
-                            * (0.5 + 0.5 * $0.confidence)) }
+            // Any kick the beat schedule did not consume launches a wave
+            // reactively — including on a *confident* grid.
+            //
+            // r1 gated this on `gridWeight <= 0.5`, i.e. "if the grid is good,
+            // waves come only from the grid". With §2.3.4's credit rule that
+            // became a hole: a grid can be confident (the tempo is right) while
+            // credit is below the launch threshold (the last beats were not
+            // confirmed), and in that window the mode produced nothing at all.
+            // Measured on `click-90-ramp`, 40 % of beats had no wave. There is
+            // no double-fire risk: a beat that *was* predicted absorbs its own
+            // confirming onset above, and §9.2's half-beat minimum age catches
+            // the rest.
+            for (index, onset) in onsets.enumerated()
+            where onset.kind == .kick && !consumed.contains(index) {
+                triggerWave(state: state, at: onset.time,
+                            amplitude: clamp(state.bassCurrentRelative / 2.0, 0.4, 1.0)
+                                * (0.5 + 0.5 * onset.confidence))
             }
-            for (start, amplitude) in launch { triggerWave(state: state, at: start, amplitude: amplitude) }
 
         case .ripple:
             for onset in onsets { triggerRing(state: state, onset: onset) }
@@ -207,12 +357,12 @@ public final class ModeRenderer {
             break   // envelope-driven; no gestures at all
 
         case .vu:
-            // The VU body is an envelope; only the kick accent is a gesture, and
-            // it is capped at one.
+            // The VU body is an envelope; only the accents are gestures.
             for onset in onsets where onset.kind != .hat {
                 let envelope = onset.kind.accentEnvelope(frameInterval: frameInterval)
                 gestures.trigger(Gesture(kind: .pulse, startTime: onset.time,
                                          amplitude: clamp(0.4 + 0.6 * onset.confidence, 0, 1),
+                                         origin: ColourField.originColumn(band: onset.band),
                                          onsetKind: onset.kind, envelope: envelope),
                                  at: onset.time)
             }
@@ -223,24 +373,33 @@ public final class ModeRenderer {
         clamp(state.bassCurrentRelative / 2.0, 0.35, 1.0) * (0.5 + 0.5 * clamp(confidence, 0, 1))
     }
 
-    private func triggerPulse(state: AnalysisState, at time: Double, amplitude: Double) {
-        // Release is musical: 0.35 of a beat, clamped so it is never faster than
-        // the display can render and never so slow it smears two beats together.
+    /// 35 ms rather than the accent's 15 ms. Pulse is the one gesture that
+    /// changes every key at once, so its attack *is* the board's frame-to-frame
+    /// difference; at 15 ms the whole display steps in a single frame and M2's
+    /// smoothness ceiling is exceeded by 40 %.
+    private func pulseEnvelope(_ state: AnalysisState) -> AHR {
         let release = clamp(0.35 * state.tempo.beatPeriod, 0.24, 0.8)
-        // 35 ms rather than the accent's 15 ms. Pulse is the one gesture that
-        // changes every key at once, so its attack *is* the board's
-        // frame-to-frame difference; at 15 ms the whole display steps in a
-        // single frame and the smoothness ceiling is exceeded by 40 %. Still
-        // barely more than one frame, so it still reads as instant — and it
-        // deliberately does **not** scale with `dt_f`: `AHR.clamped` already
-        // floors the hold at two frames, so a longer attack at 15 fps pushes the
-        // end of the hold past a backbeat and the following kick is absorbed
-        // into it (P5) instead of showing. M2 is what makes the per-frame step
-        // acceptable at every rate, and M2's bounds are per frame.
-        let envelope = AHR.clamped(attack: 0.035, hold: 0.100, release: release,
-                                   frameInterval: frameInterval)
+        return .clamped(attack: 0.035, hold: 0.100, release: release,
+                        frameInterval: frameInterval)
+    }
+
+    private func waveEnvelope() -> AHR {
+        .clamped(attack: 0.015, hold: 0.100, release: 0.320, frameInterval: frameInterval)
+    }
+
+    /// The outgoing gesture's level at `time`, so a replacement inherits the
+    /// tail it would otherwise discard (``Gesture/carry``).
+    private func carry(_ kind: Gesture.Kind, at time: Double) -> Double {
+        gestures.gestures.last { $0.kind == kind }?.level(at: time) ?? 0
+    }
+
+    private func triggerPulse(state: AnalysisState, at time: Double, amplitude: Double,
+                              origin: Double, onsetKind: OnsetKind?) {
         gestures.trigger(Gesture(kind: .pulse, startTime: time, amplitude: amplitude,
-                                 envelope: envelope),
+                                 origin: origin,
+                                 onsetKind: onsetKind,
+                                 carry: min(carry(.pulse, at: time), amplitude * 0.9),
+                                 envelope: pulseEnvelope(state)),
                          at: time)
     }
 
@@ -253,28 +412,28 @@ public final class ModeRenderer {
         // random rather than as a sweep.
         let direction: Double = Int(beatCount / 4) % 2 == 0 ? 1 : -1
         waveDirection = direction
-        let envelope = AHR.clamped(attack: 0.015, hold: 0.100, release: 0.320,
-                                   frameInterval: frameInterval)
+        // The wave starts **at the edge column**, not three columns outside it.
+        // r1 launched it off-board so it could slide in, which puts the board's
+        // response to a beat about 60 ms after the gesture's own envelope —
+        // a spatial transit delay §2.3.3 has no way to know about, and it showed
+        // up as a uniform +25 ms of M8 bias in wave and in no other mode. With
+        // σ = 2.8 and §6.2's blur the difference is not visible; the sweep still
+        // reads as entering from the side.
         gestures.trigger(Gesture(kind: .wave, startTime: time, amplitude: amplitude,
-                                 origin: direction > 0 ? -3 : Double(columnCount) + 2,
+                                 origin: direction > 0 ? 0 : Double(columnCount - 1),
                                  direction: direction, speed: speed, width: 2.8,
-                                 envelope: envelope),
+                                 envelope: waveEnvelope()),
                          at: time, minimumAge: period * 0.5)
     }
 
+    /// §12.4: origins come from the register that fired, never from the centre.
+    ///
+    /// r1's "kick = centre, snare = ±4, hat = ±7" scheme put **every kick** — the
+    /// most frequent event on almost any material — at exactly the centre column.
+    /// That one line is the largest single contributor to "the colour is
+    /// concentrated in the centre".
     private func triggerRing(state: AnalysisState, onset: OnsetEvent) {
-        let centre = Double(columnCount - 1) / 2
-        let origin: Double
-        switch onset.kind {
-        case .kick:
-            origin = centre
-        case .snare:
-            origin = centre + 4 * (rippleSide[.snare] ?? 1)
-            rippleSide[.snare] = -(rippleSide[.snare] ?? 1)
-        case .hat:
-            origin = centre + 7 * (rippleSide[.hat] ?? 1)
-            rippleSide[.hat] = -(rippleSide[.hat] ?? 1)
-        }
+        let origin = ColourField.originColumn(band: onset.band)
         let baseSpeed: Double
         switch onset.kind {
         case .kick:  baseSpeed = 9
@@ -294,155 +453,91 @@ public final class ModeRenderer {
                          at: onset.time)
     }
 
-    // MARK: - Painting
+    // MARK: - The five fields
 
-    /// One gesture, one colour: the theme colour, or the brightness ramp, with a
-    /// per-kind hue offset bounded to ±0.08 so the board never turns into
-    /// rainbow vomit.
-    private func colour(for state: AnalysisState, kind: OnsetKind? = nil)
-        -> (r: Double, g: Double, b: Double) {
-        var base = Self.hue(forBrightness: Float(state.brightness),
-                            themeColor: themeColor, useTheme: useThemeColor)
-        if let kind {
-            let offset: Double
-            switch kind {
-            case .kick:  offset = -0.08     // warm
-            case .snare: offset = 0
-            case .hat:   offset = 0.08      // cool
-            }
-            base = Self.shiftHue(base, by: offset)
+    /// How far the resting bed tilts toward the centroid column (§12.4). r1's
+    /// fixed 12 % falloff from column 8 is deleted: this crest *moves*.
+    private static let bedTilt: Double = 0.25
+    /// The pulse gesture's own crest. Wide enough that the whole board still
+    /// breathes, narrow enough that where the register lives is legible — which
+    /// is the entire point of §12.4.
+    private static let pulseCrestSigma: Double = 3.0
+    private static let pulsePedestal: Double = 0.40
+
+    private func bedShape(_ state: AnalysisState) -> [Double] {
+        let centre = colourField.centroidColumn
+        let width = Double(max(columnCount - 1, 1))
+        return (0..<columnCount).map { column in
+            1 - Self.bedTilt * abs(Double(column) - centre) / width
         }
-        return base
     }
 
-    /// A mode's resting wash: the level the board sits at when nothing is
-    /// happening.
-    ///
-    /// Every mode specifies one ("the board is never dark", "the breath, not
-    /// black"), and its whole purpose is that keys stay lit between gestures.
-    ///
-    /// It used to be `max(designed, KeyHold.riseThreshold * 1.5)`. That is
-    /// circular: it derives the model's own resting level from the interlock's
-    /// Schmitt threshold, and lands it 50 % above that threshold in every
-    /// column of every mode, so no key was ever off and M1 and M4 — the two
-    /// metrics that are the direct numerical statement of the user's complaint
-    /// — could not fail. §6.3 names exactly this: the verification ceiling sits
-    /// below what the interlock structurally guarantees so that the metric
-    /// measures the *model*, and a model handed the interlock's constant is not
-    /// being measured at all. The floors are now the ones §9 specifies, and
-    /// nothing here knows what the interlock's thresholds are.
-    private static let pulseFloorShare: Double = 0.18       // §9.1
-    private static let waveBedShare: Double = 0.15          // §9.2
-    /// §9.3 gives ripple no bed of its own; a ring is a shell over a board
-    /// that is otherwise showing the common resting glow, and this is the same
-    /// "never dark" wash the other gesture modes get, scaled to the overall
-    /// relative level rather than to a threshold.
-    private static let rippleBedShare: Double = 0.12
-
-    /// The resting wash is an *envelope*, not a point sample.
-    ///
-    /// `AVERAGE_RELATIVE` is a ratio, and a ratio is only well-conditioned for a
-    /// band that has something in it: on a 110 Hz tone the mid bands hold
-    /// nothing but leakage and their relative value swings over the whole range
-    /// hop to hop, so a bed read straight off it took the board from lit to
-    /// dark and back with no change in the music at all. Passing it through
-    /// the same AHR every other level in the system uses makes the wash obey P4
-    /// like everything else: it can rise as fast as the music does and cannot
-    /// fall faster than the display can render.
-    private var bedEnvelope = AHR(attack: 0.050, hold: 0, release: 0.600)
-
-    /// Folds this frame's designed wash into the bed envelope and returns it.
-    private func wash(_ designed: Double, at time: Double) -> Double {
-        bedEnvelope.update(target: designed, now: time, dt: renderGap)
-    }
-
-    private func paintPulse(_ state: AnalysisState, time: Double, into canvas: inout LinearCanvas) {
-        let gesture = gestures.gestures.first { $0.kind == .pulse }
-        let hit = gesture?.integratedLevel(at: time, frameInterval: frameInterval) ?? 0
-        // The "breath": between beats the board sits at a live, level-following
-        // glow rather than decaying to black. This is the direct fix for "the
-        // lights don't properly stay on".
-        // The breath follows the body of the music as well as its relative
-        // level: on sustained material — a string swell, a held chord — the
-        // relative value sits at 1.0 by construction and only the body envelope
-        // has anything to say about how much is going on.
-        let floor = wash(clamp(Self.pulseFloorShare * state.overallAverageRelative
-                                   + 0.25 * state.body, 0, 0.45),
-                         at: time)
-        // The hit rides *on top of* the breath rather than replacing it. Taking
-        // the maximum means a quiet passage's gestures are swallowed by the same
-        // floor that is meant to keep the board alive — on a crescendo the
-        // floor rises with the music and the hits disappear into it exactly as
-        // the music gets more interesting. Capped below full so a board-wide
-        // gesture always has somewhere left to go.
-        let level = clamp(floor + hit * 0.85 * (1 - floor), 0, 1)
-        guard level > 0 else { return }
-        let colour = colour(for: state)
-        let centre = Double(columnCount - 1) / 2
+    private func buildPulse(_ state: AnalysisState, time: Double, into field: inout Field,
+                            deposits: inout [(column: Int, weight: Double, hue: Double)]) {
+        field.shape = bedShape(state)
+        guard let gesture = gestures.gestures.first(where: { $0.kind == .pulse }) else { return }
+        let level = gesture.integratedLevel(at: time, frameInterval: frameInterval)
+        guard level > 0.001 else { return }
+        let hue = ColourField.depositHue(for: gesture.onsetKind)
+        let sigma = Self.pulseCrestSigma
         for column in 0..<columnCount {
-            // Falls off ~12 % from centre to edge, so the board has shape rather
-            // than being a flat flash.
-            let shape = 1 - 0.12 * abs(Double(column) - centre) / centre
-            canvas.addColumn(column, colour, level: level * shape,
-                             peak: level * shape * 0.85)
+            let distance = Double(column) - gesture.origin
+            let crest = Self.pulsePedestal + (1 - Self.pulsePedestal)
+                * exp(-(distance * distance) / (2 * sigma * sigma))
+            field.accent[column] = level * crest
+            field.peak[column] = 0.55 * level * crest
+            deposits.append((column, level * crest * renderGap / ColourField.depositTime, hue))
         }
     }
 
-    private func paintWave(_ state: AnalysisState, time: Double, into canvas: inout LinearCanvas) {
-        let colour = colour(for: state)
-        let bed = wash(clamp(Self.waveBedShare * state.midAverageRelative, 0, 0.35),
-                       at: time)
-        // The wash covers the peak row as well. A function-row key that is
-        // dark except when a gesture passes toggles once per gesture, and M1
-        // is a per-key metric — its p95 is decided by exactly these keys.
-        for column in 0..<columnCount {
-            canvas.addColumn(column, colour, level: bed, peak: bed)
-        }
-
+    private func buildWave(_ state: AnalysisState, time: Double, into field: inout Field,
+                           deposits: inout [(column: Int, weight: Double, hue: Double)]) {
+        field.shape = bedShape(state)
         for gesture in gestures.gestures where gesture.kind == .wave {
             let level = gesture.integratedLevel(at: time, frameInterval: frameInterval)
             guard level > 0.001 else { continue }
             let position = gesture.position(at: time)
             let width = gesture.effectiveWidth(frameInterval: frameInterval)
+            let hue = ColourField.depositHue(for: gesture.onsetKind)
             for column in 0..<columnCount {
                 let distance = Double(column) - position
                 let falloff = exp(-(distance * distance) / (2 * width * width))
                 guard falloff > 0.01 else { continue }
-                canvas.addColumn(column, colour, level: level * falloff,
-                                 peak: level * falloff * smoothstep(0.4, 0.7, falloff))
+                field.accent[column] += level * falloff
+                field.peak[column] = max(field.peak[column],
+                                         level * falloff * smoothstep(0.4, 0.7, falloff))
+                deposits.append((column, level * falloff * renderGap / ColourField.depositTime,
+                                 hue))
             }
         }
     }
 
-    private func paintRipple(_ state: AnalysisState, time: Double, into canvas: inout LinearCanvas) {
-        let bedColour = colour(for: state)
-        let bed = wash(clamp(Self.rippleBedShare * state.overallAverageRelative, 0, 0.30),
-                       at: time)
-        for column in 0..<columnCount {
-            canvas.addColumn(column, bedColour, level: bed, peak: bed)
-        }
-
+    private func buildRipple(_ state: AnalysisState, time: Double, into field: inout Field,
+                             deposits: inout [(column: Int, weight: Double, hue: Double)]) {
+        field.shape = bedShape(state)
         for gesture in gestures.gestures where gesture.kind == .ring {
             let level = gesture.integratedLevel(at: time, frameInterval: frameInterval)
             guard level > 0.001 else { continue }
             let radius = gesture.speed * max(0, time - gesture.startTime)
             let width = gesture.effectiveWidth(frameInterval: frameInterval)
-            let colour = colour(for: state, kind: gesture.onsetKind)
+            let hue = ColourField.depositHue(for: gesture.onsetKind)
             for column in 0..<columnCount {
                 // A shell: both arms of the ring, so the shape is symmetric
                 // about its origin.
                 let distance = abs(abs(Double(column) - gesture.origin) - radius)
                 let falloff = exp(-(distance * distance) / (2 * width * width))
                 guard falloff > 0.01 else { continue }
-                canvas.addColumn(column, colour, level: level * falloff,
-                                 peak: level * falloff * smoothstep(0.5, 0.8, falloff))
+                field.accent[column] += level * falloff
+                field.peak[column] = max(field.peak[column],
+                                         level * falloff * smoothstep(0.5, 0.8, falloff))
+                deposits.append((column, level * falloff * renderGap / ColourField.depositTime,
+                                 hue))
             }
         }
     }
 
-    private func paintSpectrum(_ state: AnalysisState, time: Double,
-                               into canvas: inout LinearCanvas) {
-        let colour = colour(for: state)
+    private func buildSpectrum(_ state: AnalysisState, time: Double, into field: inout Field,
+                               deposits: inout [(column: Int, weight: Double, hue: Double)]) {
         let perRegister = Double(columnCount) / Double(AnalysisState.registerCount)
         for register in 0..<AnalysisState.registerCount {
             let start = Int((Double(register) * perRegister).rounded())
@@ -452,133 +547,66 @@ public final class ModeRenderer {
             guard start < end else { continue }
             let height = clamp(state.register(register), 0, 1)
             let peak = clamp(state.registerPeak(register), 0, 1)
-            // §9.4's floor is per register and lives in the analyser
-            // (`0.05 + 0.95·…`), so the bars themselves never blink a section
-            // out. The rows above a bar are not lit by a wash.
-            let bed = 0.0
+            // The register's own hue offset is its position in the register
+            // order, so a bar deposits the colour of the register it belongs to.
+            let hue = ColourField.depositLimit * (Double(register)
+                / Double(AnalysisState.registerCount - 1) - 0.5)
             for column in start..<end {
-                canvas.addColumn(column, colour, level: bed, peak: bed)
-                canvas.fillColumn(column, height: height, colour: colour)
+                field.accent[column] = height
+                field.fill[column] = height
                 // The peak marker's brightness is a smoothstep of how high the
                 // marker sits, not a boolean — a hard-thresholded function-row
                 // key flipping on and off is a directly observable flicker
                 // source.
-                canvas.add(column: column, row: LinearCanvas.peakRow, colour,
-                           level: smoothstep(0.15, 0.45, peak) * peak)
+                field.peak[column] = smoothstep(0.15, 0.45, peak) * peak
+                deposits.append((column, height * renderGap / ColourField.depositTime, hue))
             }
         }
     }
 
-    private func paintVU(_ state: AnalysisState, time: Double, into canvas: inout LinearCanvas) {
-        let colour = colour(for: state)
+    /// §9.5's identity is deliberately preserved — VU stays a centre-out meter —
+    /// but §12.4 makes it **asymmetric**: the left arm is driven by the low
+    /// registers and the right by the high, so the meter is symmetric only when
+    /// the spectrum is, and its brightness centre of mass moves whenever the
+    /// material is tilted.
+    private func buildVU(_ state: AnalysisState, time: Double, into field: inout Field,
+                         deposits: inout [(column: Int, weight: Double, hue: Double)]) {
         let centre = Double(columnCount - 1) / 2
         let level = clamp(state.vu, 0, 1)
-        let accent = gestures.gestures.filter { $0.onsetKind == .kick }
+        var low = 0.0, high = 0.0
+        for band in 0..<4 { low += state.norm(band) * state.gate(band) }
+        for band in 4..<AnalysisState.bandCount { high += state.norm(band) * state.gate(band) }
+        low /= 4
+        high /= Double(AnalysisState.bandCount - 4)
+
+        let accents = gestures.gestures.filter { $0.kind == .pulse }
+        let kick = accents.filter { $0.onsetKind == .kick }
             .map { $0.integratedLevel(at: time, frameInterval: frameInterval) }.max() ?? 0
-        let snareAccent = gestures.gestures.filter { $0.onsetKind == .snare }
+        let snare = accents.filter { $0.onsetKind == .snare }
             .map { $0.integratedLevel(at: time, frameInterval: frameInterval) }.max() ?? 0
 
-        // The meter *swings* on a kick rather than only brightening: a needle
-        // moving out is the gesture people read a VU by, and confining the
-        // accent to three columns of an already-lit centre changes almost
-        // nothing on a board this small.
-        let reach = clamp(level + 0.6 * accent, 0, 1) * 8.5
-
-        // §9.5 gives the columns the meter has not reached no wash: an unlit
-        // column of a meter is the meter reading what it reads.
-        let bed = 0.0
+        let reachLow = clamp(0.25 + 0.75 * low + 0.6 * kick, 0, 1) * centre
+        let reachHigh = clamp(0.25 + 0.75 * high + 0.6 * snare, 0, 1) * centre
         for column in 0..<columnCount {
-            let distance = abs(Double(column) - centre)
+            let distance = Double(column) - centre
+            let reach = distance <= 0 ? reachLow : reachHigh
             // Smoothstep over ±1 column instead of a `distance <= reach` cliff.
-            let edge = smoothstep(reach + 1, reach - 1, distance)
-            // Every column keeps the wash, including the ones the meter has not
-            // reached: a meter whose unlit columns are black turns its own
-            // swing into a per-key on→off→on cycle at the beat rate.
-            // The accent lifts the whole lit body as well as the inner columns:
-            // a meter jumps, it does not only glow in the middle.
-            // The body deliberately leaves headroom for the accent. A meter
-            // whose steady state is already near full has nowhere to jump to,
-            // and the jump is the part that reads as musical.
-            var value = bed + (0.10 + 0.55 * level) * edge + 0.45 * accent * edge
-            // A kick brightens the inner three columns; a snare tips the
-            // outermost lit column. Two accents, per §9.5.
-            if distance <= 1.5 { value += accent * 0.7 }
-            if abs(distance - reach) < 1.2 { value += snareAccent * 0.5 }
-            canvas.addColumn(column, colour, level: clamp(value, 0, 1),
-                             // PPM marker: fast attack, slow decay, continuous,
-                             // over the same wash the body sits on.
-                             peak: smoothstep(reach + 0.5, reach - 0.5, distance)
-                                 * smoothstep(0.05, 0.25, level))
-        }
-    }
-
-    // MARK: - Colour
-
-    /// The shared colour ramp: warm for bass-heavy passages through to a bright
-    /// blue-white for treble-rich ones — the synaesthetic mapping people already
-    /// expect.
-    public static func hue(forBrightness brightness: Float, themeColor: RGB,
-                           useTheme: Bool) -> (r: Double, g: Double, b: Double) {
-        if useTheme {
-            return (Double(themeColor.red) / 255,
-                    Double(themeColor.green) / 255,
-                    Double(themeColor.blue) / 255)
-        }
-        let stops: [(Double, (Double, Double, Double))] = [
-            (0.00, (1.00, 0.05, 0.02)),
-            (0.18, (1.00, 0.35, 0.00)),
-            (0.36, (1.00, 0.80, 0.05)),
-            (0.54, (0.35, 1.00, 0.15)),
-            (0.72, (0.00, 0.95, 0.75)),
-            (0.88, (0.10, 0.65, 1.00)),
-            (1.00, (0.65, 0.80, 1.00)),
-        ]
-        let position = Double(min(max(brightness, 0), 1))
-        for index in 1..<stops.count where position <= stops[index].0 {
-            let (lowPosition, low) = stops[index - 1]
-            let (highPosition, high) = stops[index]
-            let span = highPosition - lowPosition
-            let t = span > 0 ? (position - lowPosition) / span : 0
-            return (low.0 + (high.0 - low.0) * t,
-                    low.1 + (high.1 - low.1) * t,
-                    low.2 + (high.2 - low.2) * t)
-        }
-        return stops.last!.1
-    }
-
-    /// Rotates a colour's hue by a fraction of the wheel, keeping saturation and
-    /// value. Used only for the ±0.08 per-drum variation.
-    static func shiftHue(_ colour: (r: Double, g: Double, b: Double), by offset: Double)
-        -> (r: Double, g: Double, b: Double) {
-        let maximum = max(colour.r, max(colour.g, colour.b))
-        let minimum = min(colour.r, min(colour.g, colour.b))
-        let delta = maximum - minimum
-        guard delta > 1e-6, maximum > 1e-6 else { return colour }
-        var hue: Double
-        if maximum == colour.r {
-            hue = ((colour.g - colour.b) / delta).truncatingRemainder(dividingBy: 6)
-        } else if maximum == colour.g {
-            hue = (colour.b - colour.r) / delta + 2
-        } else {
-            hue = (colour.r - colour.g) / delta + 4
-        }
-        hue = (hue / 6 + offset).truncatingRemainder(dividingBy: 1)
-        if hue < 0 { hue += 1 }
-
-        let saturation = delta / maximum
-        let sector = hue * 6
-        let index = Int(sector) % 6
-        let f = sector - Double(Int(sector))
-        let p = maximum * (1 - saturation)
-        let q = maximum * (1 - saturation * f)
-        let t = maximum * (1 - saturation * (1 - f))
-        switch index {
-        case 0:  return (maximum, t, p)
-        case 1:  return (q, maximum, p)
-        case 2:  return (p, maximum, t)
-        case 3:  return (p, q, maximum)
-        case 4:  return (t, p, maximum)
-        default: return (maximum, p, q)
+            let edge = smoothstep(reach + 1, reach - 1, abs(distance))
+            // The meter's arms are the mode's geometry, and the bed keeps the
+            // columns the meter has not reached alive — a meter whose unlit
+            // columns are black turns its own swing into a per-key on→off→on
+            // cycle at the beat rate.
+            field.shape[column] = 0.45 + 0.55 * edge
+            var value = (0.10 + 0.55 * level) * edge
+            if abs(distance) <= 1.5 { value += kick * 0.5 }
+            if abs(abs(distance) - reach) < 1.2 { value += snare * 0.5 }
+            field.accent[column] = clamp(value, 0, 1)
+            field.peak[column] = smoothstep(reach + 0.5, reach - 0.5, abs(distance))
+                * smoothstep(0.05, 0.25, level)
+            let hue = distance <= 0
+                ? ColourField.depositHue(for: .kick) : ColourField.depositHue(for: .hat)
+            deposits.append((column, field.accent[column] * edge * renderGap
+                             / ColourField.depositTime, hue))
         }
     }
 }

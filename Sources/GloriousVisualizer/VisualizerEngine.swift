@@ -34,6 +34,28 @@ public final class VisualizerEngine {
     private var interlock = KeyInterlock()
     private var history: [AnalysisState] = []
     private var lastFrameTime: Double?
+    private var latency: LatencyEstimate
+
+    /// The §8.3 user offset, ±100 ms, signed. Fixed capture latency differs per
+    /// machine and per output device; it should be dialled out, not designed
+    /// around.
+    public var userOffset: Double {
+        get { latency.userOffset }
+        set { latency.userOffset = clamp(newValue, -0.100, 0.100) }
+    }
+
+    /// One delivered frame's measured `t_END_echoed − t_scheduled` (§8.2-R).
+    ///
+    /// Called from the transport thread on hardware and from the harness in
+    /// `viz-sim`. Nothing else feeds `L̂`: P10 requires the compensating latency
+    /// to be measured live, and a design that compensates a mean it never
+    /// measured is indistinguishable from one that got lucky.
+    public func reportDelivery(lag: Double) {
+        latency.record(deliveryLag: lag, dt: frameInterval)
+    }
+
+    /// What the scheduler is currently compensating, in seconds.
+    public var measuredLatency: Double { latency.value }
 
     /// How far past the newest analysis state the renderer may extrapolate
     /// before the frame is counted as stale (§6.1).
@@ -48,6 +70,7 @@ public final class VisualizerEngine {
                 useThemeColor: Bool = false) {
         let interval = 1 / max(frameRate, 1)
         self.frameInterval = interval
+        self.latency = LatencyEstimate(frameInterval: interval)
         self.analyzer = MusicAnalyzer(sampleRate: sampleRate, frameInterval: interval)
         self.renderer = ModeRenderer(mode: mode, themeColor: themeColor,
                                      useThemeColor: useThemeColor, frameInterval: interval)
@@ -90,6 +113,7 @@ public final class VisualizerEngine {
         let dt = lastFrameTime.map { max(time - $0, 0) } ?? frameInterval
         lastFrameTime = time
         telemetry.record(interval: dt, expected: frameInterval)
+        renderer.latency = latency.advance(dt: dt)
 
         let taken = bus.take()
         for state in taken.states {
@@ -240,6 +264,7 @@ public final class VisualizerEngine {
         bus.reset()
         renderer.reset()
         interlock.reset()
+        latency.reset()
         history.removeAll()
         lastFrameTime = nil
         telemetry = Telemetry()
@@ -281,21 +306,32 @@ public final class VisualizerEngine {
 /// time, a skipped frame loses nothing structurally — the next delivered frame
 /// shows the gesture where it genuinely is.
 public final class FrameSlot: @unchecked Sendable {
+
+    /// A composed frame and the timestamp it was composed **for**.
+    ///
+    /// The scheduled time travels with the frame because the transport is the
+    /// only place that can measure `t_END_echoed − t_scheduled`, and that
+    /// difference is the one term of `L̂` nothing else can supply (§8.2-R).
+    public struct Frame: Sendable {
+        public var colors: [RGB]
+        public var scheduledFor: Double
+    }
+
     private let lock = NSLock()
-    private var frame: [RGB]?
+    private var frame: Frame?
     private var dropped = 0
     private var delivered = 0
 
     public init() {}
 
-    public func put(_ colors: [RGB]) {
+    public func put(_ colors: [RGB], scheduledFor time: Double) {
         lock.lock()
         if frame != nil { dropped += 1 }
-        frame = colors
+        frame = Frame(colors: colors, scheduledFor: time)
         lock.unlock()
     }
 
-    public func take() -> [RGB]? {
+    public func take() -> Frame? {
         lock.lock()
         defer {
             if frame != nil { delivered += 1 }

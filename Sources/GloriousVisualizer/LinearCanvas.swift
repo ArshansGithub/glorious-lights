@@ -56,16 +56,22 @@ public struct LinearCanvas: Sendable {
     /// every bar a pure on/off, which on a two-row column meant a level crossing
     /// 0.5 toggled half the column — a large fraction of the visible per-frame
     /// toggling on quiet material.
+    /// - Parameter level: the fill's own brightness. §11.4 composes the level
+    ///   and a mode supplies only the geometry, so the two are separate
+    ///   arguments: `height` is how much of the column the mode's fast field
+    ///   occupies and `level` is how bright that field is allowed to be.
     public mutating func fillColumn(_ column: Int, height: Double,
                                     colour: (r: Double, g: Double, b: Double),
+                                    level: Double = 1,
                                     ramp: (Int) -> Double = { row in
                                         0.35 + 0.65 * Double(row) / Double(LinearCanvas.rowCount - 1)
                                     }) {
+        guard level > 0 else { return }
         let h = clamp(height, 0, 1) * Double(Self.rowCount)
         for row in 0..<Self.rowCount {
             let coverage = clamp(h - Double(row), 0, 1)
             guard coverage > 0 else { break }
-            add(column: column, row: row, colour, level: coverage * ramp(row))
+            add(column: column, row: row, colour, level: level * coverage * ramp(row))
         }
     }
 
