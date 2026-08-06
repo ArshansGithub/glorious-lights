@@ -39,11 +39,50 @@ Along the way we discovered several things nobody had documented (see
 
 ## Install
 
+**Homebrew:**
+
 ```sh
-git clone <this repo>
+brew tap ArshansGithub/tap
+brew install --cask glorious-lights
+```
+
+**Or download** `Glorious-Lights-1.0.0.zip` from the
+[latest release](https://github.com/ArshansGithub/glorious-lights/releases/latest),
+unzip it, and drag *Glorious Lights.app* to `/Applications`.
+
+### First launch
+
+Two prompts, both one-time, both unavoidable:
+
+1. **Gatekeeper.** The app is signed ad-hoc rather than with a paid Apple
+   Developer ID, so macOS will refuse a plain double-click and say it "cannot be
+   opened because the developer cannot be verified". **Right-click (or
+   Control-click) the app → Open → Open.** After that it launches normally
+   forever. Homebrew installs are quarantined the same way, so the same dance
+   applies. If you would rather not, build from source below — a locally built
+   binary is not quarantined.
+2. **Input Monitoring.** macOS gates opening *any* HID interface of a
+   keyboard-class device behind Input Monitoring, so the app asks for it on
+   first run (System Settings → Privacy & Security → Input Monitoring). Grant it
+   and relaunch. Without it the menu says the keyboard was found but is not
+   usable.
+
+The app has no Dock icon: it lives in the menu bar.
+
+### Build from source
+
+```sh
+git clone https://github.com/ArshansGithub/glorious-lights.git
 cd glorious-lights
 swift build -c release
+Scripts/make-app.sh          # assembles build/Glorious Lights.app
 ```
+
+`Scripts/make-app.sh` builds the release binary, renders the icon
+(`Scripts/make-icon.swift`, drawn from primitives — no SF Symbols, whose licence
+does not permit use in app icons), writes `Info.plist` with the version from the
+`VERSION` file, and ad-hoc signs the result. Pass `--zip` to also produce the
+release archive and print its SHA-256.
 
 - **Menu-bar app:** `swift run -c release GMMKLightsApp` — effect picker,
   brightness/speed sliders, color picker, hot-plug aware.
@@ -96,10 +135,6 @@ gmmk-cli speed 4             # 1–5
 gmmk-cli direction l         # l / r
 gmmk-cli paint ffaa00        # custom mode: paint every per-key LED
 ```
-
-On first use macOS will ask for **Input Monitoring** permission
-(System Settings → Privacy & Security → Input Monitoring) — that's the gate for
-opening any HID interface of a keyboard-class device. Grant it and relaunch.
 
 ## The mouse
 
