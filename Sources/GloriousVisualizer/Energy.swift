@@ -95,6 +95,24 @@ public struct EnergyModel: Sendable {
     /// Where the soft knee starts.
     public static let knee: Double = 0.5
 
+    /// The widest the reference range may be, in decibels.
+    ///
+    /// A p05 tracker falls nineteen times faster than it rises — that asymmetry
+    /// is what makes it a 5th percentile — so a single stretch of digital
+    /// silence drops the floor to the numerical guard and it then climbs back at
+    /// 0.03 dB/s, which is seventeen minutes to recover thirty decibels. Every
+    /// level above it is then 200 dB above the floor and `E` reads exactly 1.000
+    /// at every hop: measured on two real tracks, `E` min = max = 1.000 across a
+    /// sixty-second excerpt, so `Φ` and `Σ` carried no dynamics at all and the
+    /// bed the whole of §11 exists to produce was a constant. This is the same
+    /// defect §3.3 names in the old `NoiseFloorTracker` — "drops *instantly* to
+    /// any new minimum and takes 12 s to recover" — arriving in a new place.
+    ///
+    /// Forty decibels is wider than the programme range of any master and
+    /// narrower than the distance to digital silence, and it is a *ratio*
+    /// between two observed quantities, so nothing here becomes absolute (P1).
+    public static let maximumRange: Double = 40.0
+
     /// Maps the normalised log level onto `0…1` with a **soft knee** instead of
     /// a hard clamp at the top.
     ///
@@ -158,12 +176,25 @@ public struct EnergyModel: Sendable {
         // multiplicative steps, so tracking the percentiles of `rms` *is*
         // tracking the percentiles of `Λ` — one Double per tracker instead of a
         // 64-bucket histogram, converging to the same estimand.
-        if gateOpen { low.update(rms, dt: dt); high.update(rms, dt: dt) }
+        // Digital silence is not an observation of the material's level, and it
+        // must not seed the reference. `QuantileTracker` seeds on its first
+        // sample, and a file or a stream that begins with a few silent hops
+        // seeded **both** percentiles at the numerical guard — from which p05
+        // climbs at 0.003 nats per second and p95 at 0.06, so after twenty
+        // seconds of a real track the reference was still 120 dB below the
+        // music and `E` read exactly 1.000 at every hop. Measured on two real
+        // masters; the synthetic battery never saw it because its generators
+        // start on the first sample. `1e-6` is a numerical guard far below any
+        // converter's own noise floor and is never used as a decision threshold
+        // (P1c) — the *decision* about whether anything is playing is the master
+        // gate, which is the other half of this condition.
+        if gateOpen, rms > 1e-6 { low.update(rms, dt: dt); high.update(rms, dt: dt) }
         let lambda = 20 * log10(max(rms, 1e-7))
         let lowDB = 20 * log10(max(low.value, 1e-7))
         let highDB = 20 * log10(max(high.value, 1e-7))
-        let span = max(highDB - lowDB, Self.dynamicRangeFloor)
-        energy = hasOpened ? Self.compress((lambda - lowDB) / span) : 0
+        let lowBounded = max(lowDB, highDB - Self.maximumRange)
+        let span = max(highDB - lowBounded, Self.dynamicRangeFloor)
+        energy = hasOpened ? Self.compress((lambda - lowBounded) / span) : 0
 
         phraseEnvelope.update(target: energy, now: now, dt: dt)
         updateSection(dt: dt)
