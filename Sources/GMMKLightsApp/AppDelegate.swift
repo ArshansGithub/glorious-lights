@@ -53,6 +53,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pendingMouseColor: DispatchWorkItem?
     /// Kept across openings so the tuner reopens with its state intact.
     private lazy var tuner = SwitchCompensationWindowController(controller: controller)
+    private lazy var ledPicker = MouseLEDWindowController(controller: mouseController,
+                                                          colors: settings.mouseLEDColors)
 
     private lazy var brightnessRow = SliderRowView(title: "Brightness",
                                                    range: 0...100) { "\($0)%" }
@@ -171,6 +173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         mouseSection.install(in: menu)
         mouseSection.onLookChanged = { [weak self] in self?.syncFromMouse() }
+        mouseSection.onOpenPerLEDPicker = { [weak self] in self?.openLEDPicker() }
 
         menu.addItem(syncSeparator)
         syncItem.action = #selector(toggleSync(_:))
@@ -370,6 +373,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                  compensation: profile)
         rememberKeyboardLook()
         syncToMouse()
+    }
+
+    /// Opens the per-LED picker.
+    ///
+    /// The colour wells in that window drive the *shared* `NSColorPanel`, the
+    /// same one this delegate points at the keyboard or the mouse's single
+    /// colour. Letting go of it first keeps ``dismissColorPanel()`` — which
+    /// fires whenever the colour row becomes irrelevant — from yanking the
+    /// panel out from under an active well.
+    private func openLEDPicker() {
+        dismissColorPanel()
+        ledPicker.onChange = { [weak self] colors in
+            guard let self else { return }
+            self.settings.mouseLEDColors = colors
+            self.settings.save()
+        }
+        ledPicker.present(colors: settings.mouseLEDColors)
     }
 
     @objc private func openTuner(_ sender: NSMenuItem) {

@@ -115,6 +115,12 @@ release archive and print its SHA-256.
   firmware version, RGB effect, color, brightness, speed, DPI stages, polling
   rate and debounce. It reads the mouse's settings on connect and never writes
   anything until you pick something.
+- **Per-LED mouse colors:** *Per-LED Colors…* drives the mouse's six LEDs
+  individually — a mode present in the firmware that Glorious's own software
+  doesn't expose and neither OpenRGB nor libratbag implements. Both side strips
+  carry all six in index order front to back and are mirrored, so a color lights
+  the same position on each side, and the scroll wheel follows LED 1. There's a
+  "copy LED 1 to all" button for getting back to one flat color.
 - **One desk, one look:** *Desk Themes* applies a curated look to every device
   that's plugged in, translating it into each one's own vocabulary. Two groups:
   *Easy on the switches* (Mint Uniform, Seafoam Wave, Ocean, Ember, Ice,

@@ -1,5 +1,6 @@
 import Foundation
 import GMMKProtocol
+import GloriousMouseProtocol
 import GloriousSync
 
 /// Last-used UI state, persisted in `UserDefaults`.
@@ -28,6 +29,7 @@ struct Settings {
         static let lookColorHex = "sync.look.colorHex"
         static let lookBrightness = "sync.look.brightness"
         static let lookSpeed = "sync.look.speed"
+        static let mouseLEDColors = "mouse.ledColors"
         /// What ``markedLEDIndices`` was called when the marked set could only
         /// mean "the Lynx-switch keys". Read once, for migration.
         static let legacyLynxLEDIndices = "compensation.lynxLEDIndices"
@@ -70,6 +72,18 @@ struct Settings {
                                                                          blue: 0xAA),
                             brightness: 1.0,
                             speed: 0.5)
+
+    /// The six per-LED mouse colours, in LED index order (``MouseLED``).
+    ///
+    /// Stored here rather than read back from the mouse because the mouse only
+    /// holds them while it is in the constant effect: switch it to rainbow and
+    /// the six colours are still in its blob, but switch it to anything that
+    /// overwrites `0x56`-`0x67` and they are gone. Keeping them means the
+    /// picker reopens where the user left it.
+    var mouseLEDColors: [MouseRGB] = Array(repeating: MouseRGB(red: 0x00,
+                                                               green: 0xE5,
+                                                               blue: 0xFF),
+                                           count: MouseLED.count)
 
     /// The four compensation fields as the protocol layer wants them.
     var compensationProfile: SwitchCompensation.Profile {
@@ -152,6 +166,14 @@ struct Settings {
         if let stored = defaults.object(forKey: Key.lookSpeed) as? Double {
             deskLook.speed = min(max(stored, 0), 1)
         }
+        if let stored = defaults.array(forKey: Key.mouseLEDColors) as? [String] {
+            // A malformed entry falls back to the default for that LED rather
+            // than discarding the whole set.
+            let parsed = stored.enumerated().map { offset, hex in
+                MouseRGB(hex: hex) ?? mouseLEDColors[min(offset, MouseLED.count - 1)]
+            }
+            mouseLEDColors = MouseLED.padded(parsed)
+        }
     }
 
     /// Writes the whole struct back. Cheap enough to call on every change.
@@ -171,5 +193,6 @@ struct Settings {
         defaults.set(deskLook.color.hexString, forKey: Key.lookColorHex)
         defaults.set(deskLook.brightness, forKey: Key.lookBrightness)
         defaults.set(deskLook.speed, forKey: Key.lookSpeed)
+        defaults.set(mouseLEDColors.map(\.hexString), forKey: Key.mouseLEDColors)
     }
 }

@@ -21,6 +21,8 @@ final class MouseMenuSection: NSObject {
     private let controller: MouseController
     /// Asks the delegate to open the shared colour panel targeted at the mouse.
     private let presentColorPanel: () -> Void
+    /// Asks the delegate to open the per-LED picker.
+    var onOpenPerLEDPicker: (() -> Void)?
 
     /// Fires after a user action in this section that changes how the mouse
     /// looks, once the write has landed and the blob has been re-read.
@@ -37,6 +39,7 @@ final class MouseMenuSection: NSObject {
     private let effectItem = NSMenuItem(title: "Effect", action: nil, keyEquivalent: "")
     private let effectMenu = NSMenu()
     private let colorItem = NSMenuItem(title: "Color…", action: nil, keyEquivalent: "")
+    private let perLEDItem = NSMenuItem(title: "Per-LED Colors…", action: nil, keyEquivalent: "")
     private let brightnessItem = NSMenuItem(title: "Brightness", action: nil, keyEquivalent: "")
     private let brightnessMenu = NSMenu()
     private let speedItem = NSMenuItem(title: "Speed", action: nil, keyEquivalent: "")
@@ -51,7 +54,7 @@ final class MouseMenuSection: NSObject {
     private let debounceMenu = NSMenu()
 
     private var allItems: [NSMenuItem] {
-        [separator, headerItem, effectItem, colorItem, brightnessItem,
+        [separator, headerItem, effectItem, colorItem, perLEDItem, brightnessItem,
          speedItem, dpiItem, pollingItem, debounceItem]
     }
 
@@ -81,6 +84,11 @@ final class MouseMenuSection: NSObject {
 
         colorItem.action = #selector(openColorPanel)
         colorItem.target = self
+
+        perLEDItem.action = #selector(openPerLEDPicker)
+        perLEDItem.target = self
+        perLEDItem.toolTip = "Colour the six LEDs individually. Both side strips "
+            + "are mirrored, and the scroll wheel follows LED 1."
 
         // Brightness 0 is off and 1–4 are low → high (doc §5.3). Zero is offered
         // because it is the documented way to darken a mouse whose effect you
@@ -164,12 +172,12 @@ final class MouseMenuSection: NSObject {
         guard let config = controller.config else {
             // Connected but unreadable: say so in the header and offer nothing
             // that would write a blob nobody has seen.
-            [effectItem, colorItem, brightnessItem, speedItem,
+            [effectItem, colorItem, perLEDItem, brightnessItem, speedItem,
              dpiItem, pollingItem].forEach { $0.isEnabled = false }
             refreshDebounce()
             return
         }
-        [effectItem, brightnessItem, speedItem, dpiItem, pollingItem]
+        [effectItem, perLEDItem, brightnessItem, speedItem, dpiItem, pollingItem]
             .forEach { $0.isEnabled = true }
 
         let effect = config.effect
@@ -202,6 +210,10 @@ final class MouseMenuSection: NSObject {
             entry.state = (entry.representedObject as? Int) == parameter.map { Int($0.speed) }
                 ? .on : .off
         }
+
+        // The per-LED picker switches the mouse into the constant effect, so
+        // it is always available — but say when it is already the live one.
+        perLEDItem.state = effect == .constant ? .on : .off
 
         refreshDPI(config)
 
@@ -284,6 +296,10 @@ final class MouseMenuSection: NSObject {
 
     @objc private func openColorPanel() {
         presentColorPanel()
+    }
+
+    @objc private func openPerLEDPicker() {
+        onOpenPerLEDPicker?()
     }
 
     @objc private func selectBrightness(_ sender: NSMenuItem) {

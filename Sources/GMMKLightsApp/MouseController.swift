@@ -199,6 +199,32 @@ final class MouseController {
         }
     }
 
+    /// Paints the six LEDs individually via effect `constant` — the per-LED
+    /// mode described in ``MouseLED``.
+    ///
+    /// Brightness is forced to full: the constant effect has its own mode byte,
+    /// and a user who has just chosen six colours wants to see them rather than
+    /// inherit whatever dimming the previous effect was using.
+    func setPerLEDColors(_ colors: [MouseRGB]) {
+        let padded = MouseLED.padded(colors)
+        modifyConfig { blob in
+            blob.effect = .constant
+            try blob.setColors(padded, for: .constant)
+            let current = blob.modeParameter(for: .constant)
+            try blob.setModeParameter(
+                MouseModeParameter(speed: current?.speed ?? 0,
+                                   brightness: MouseModeParameter.maxBrightness),
+                for: .constant)
+        }
+    }
+
+    /// The six colours the mouse is currently showing, or `nil` when it is not
+    /// in the per-LED mode.
+    var perLEDColors: [MouseRGB]? {
+        guard let config, config.effect == .constant else { return nil }
+        return config.colors(for: .constant)
+    }
+
     func setPollingRate(_ rate: MousePollingRate) {
         modifyConfig { $0.pollingRate = rate }
     }

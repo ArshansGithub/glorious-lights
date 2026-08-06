@@ -127,6 +127,124 @@ final class MouseMutationTests: XCTestCase {
         XCTAssertEqual(after.bytes[MouseConfigBlob.Offset.singleColor + 2], 0x88)  // G
     }
 
+    // MARK: - Per-LED constant mode
+
+    /// The six colours land at `0x56`–`0x67`, three bytes each in **R, B, G**
+    /// order, and nothing else in the blob moves except the effect byte and the
+    /// constant effect's own mode byte.
+    func testPerLEDColorsWriteEighteenBytesInRBGOrder() throws {
+        let before = makeBlob()
+        var after = before
+        let colors = [
+            MouseRGB(red: 0xFF, green: 0x00, blue: 0x00),   // red
+            MouseRGB(red: 0x00, green: 0xFF, blue: 0x00),   // green
+            MouseRGB(red: 0x00, green: 0x00, blue: 0xFF),   // blue
+            MouseRGB(red: 0xFF, green: 0xFF, blue: 0x00),   // yellow
+            MouseRGB(red: 0xFF, green: 0x00, blue: 0xFF),   // magenta
+            MouseRGB(red: 0x00, green: 0xFF, blue: 0xFF),   // cyan
+        ]
+        after.effect = .constant
+        try after.setColors(colors, for: .constant)
+
+        let base = MouseConfigBlob.Offset.constantColors
+        // Nothing outside the effect byte and the 18-byte array moved. This is
+        // a containment check rather than an equality one because several of
+        // these colours have zero channels, and a byte written 0 over a 0 is
+        // not observable — the exact bytes are pinned below instead.
+        let allowed = Set([MouseConfigBlob.Offset.effect] + Array(base..<(base + 18)))
+        XCTAssertTrue(Set(changedOffsets(before, after)).isSubset(of: allowed),
+                      "a byte outside the constant colour array changed")
+
+        // All 18 bytes, spelled out in R,B,G — the order that swaps green and
+        // blue if it is got wrong.
+        XCTAssertEqual(Array(after.bytes[base..<(base + 18)]), [
+            0xFF, 0x00, 0x00,   // red
+            0x00, 0x00, 0xFF,   // green
+            0x00, 0xFF, 0x00,   // blue
+            0xFF, 0x00, 0xFF,   // yellow
+            0xFF, 0xFF, 0x00,   // magenta
+            0x00, 0xFF, 0xFF,   // cyan
+        ])
+        XCTAssertEqual(after.colors(for: .constant), colors)
+    }
+
+    /// The array is exactly six long — one per addressable LED — and ends
+    /// before the unknown region at `0x68`.
+    func testConstantColorArrayIsSixLEDsAndStopsBeforeUnknown3() {
+        XCTAssertEqual(MouseLED.count, 6)
+        XCTAssertEqual(MouseRGBEffect.constant.colorArray?.count, MouseLED.count)
+        let array = MouseRGBEffect.constant.colorArray!
+        XCTAssertEqual(array.offset, 0x56)
+        XCTAssertEqual(array.offset + array.count * 3, MouseConfigBlob.Offset.unknown3)
+    }
+
+    /// Each LED is independent: writing one colour must not disturb its
+    /// neighbours, which is the whole premise of the mode.
+    func testEachLEDIsIndependent() throws {
+        var blob = makeBlob()
+        let base = MouseConfigBlob.Offset.constantColors
+        try blob.setColors(Array(repeating: .black, count: 6), for: .constant)
+        let before = blob
+
+        var six = [MouseRGB](repeating: .black, count: 6)
+        six[3] = MouseRGB(red: 0x12, green: 0x34, blue: 0x56)
+        try blob.setColors(six, for: .constant)
+
+        XCTAssertEqual(changedOffsets(before, blob),
+                       [base + 9, base + 10, base + 11])
+        XCTAssertEqual(blob.colors(for: .constant)?[3],
+                       MouseRGB(red: 0x12, green: 0x34, blue: 0x56))
+        XCTAssertTrue(blob.colors(for: .constant)?.enumerated()
+            .allSatisfy { $0.offset == 3 || $0.element == .black } ?? false)
+    }
+
+    /// Fewer than six colours repeat the last rather than going black — one
+    /// colour means "this colour", not "this colour and five off".
+    func testShortColorListsArePaddedByRepeatingTheLast() {
+        let one = MouseLED.padded([MouseRGB(red: 1, green: 2, blue: 3)])
+        XCTAssertEqual(one.count, 6)
+        XCTAssertTrue(one.allSatisfy { $0 == MouseRGB(red: 1, green: 2, blue: 3) })
+
+        let two = MouseLED.padded([MouseRGB(red: 1, green: 1, blue: 1),
+                                   MouseRGB(red: 2, green: 2, blue: 2)])
+        XCTAssertEqual(two.count, 6)
+        XCTAssertEqual(two[0], MouseRGB(red: 1, green: 1, blue: 1))
+        XCTAssertTrue(two.dropFirst().allSatisfy { $0 == MouseRGB(red: 2, green: 2, blue: 2) })
+
+        // No colours at all is the only case that yields black.
+        XCTAssertEqual(MouseLED.padded([]), Array(repeating: MouseRGB.black, count: 6))
+        // Too many are trimmed rather than overflowing the array.
+        XCTAssertEqual(MouseLED.padded(Array(repeating: MouseRGB.black, count: 9)).count, 6)
+    }
+
+    /// A per-LED apply is a normal blob write: unknown regions intact, sensor
+    /// untouched, and the write marker stamped from the observed size.
+    func testPerLEDApplyIsAWellFormedWrite() throws {
+        var blob = makeBlob()
+        blob.effect = .constant
+        try blob.setColors(MouseLED.padded([MouseRGB(hex: "00e5ff")!]), for: .constant)
+        try blob.setModeParameter(MouseModeParameter(speed: 0, brightness: 4), for: .constant)
+
+        let prepared = blob.preparedForWrite(profile: .one, configSize: 131)
+        XCTAssertEqual(prepared.bytes[MouseConfigBlob.Offset.configWrite], 0x7B)
+        XCTAssertEqual(prepared.bytes[MouseConfigBlob.Offset.effect], 0x06)
+        XCTAssertEqual(prepared.bytes[MouseConfigBlob.Offset.constantMode], 0x40)
+        XCTAssertEqual(prepared.bytes[MouseConfigBlob.Offset.sensor], 0x06)
+        XCTAssertEqual(prepared.bytes[MouseConfigBlob.Offset.unknown3 + 5], 0xA3)
+        XCTAssertEqual(prepared.bytes[MouseConfigBlob.Offset.unknown4], 0xA4)
+        // The lift-off byte sits just past the colour arrays and must not move.
+        XCTAssertEqual(prepared.bytes[MouseConfigBlob.Offset.liftOffDistance], 0x01)
+    }
+
+    /// Labels name the two positions a user cannot infer from an index.
+    func testLEDLabelsNameTheWheelAndTheBack() {
+        XCTAssertEqual(MouseLED.label(forIndex: 1), "LED 1 (front + wheel)")
+        XCTAssertEqual(MouseLED.label(forIndex: 6), "LED 6 (back)")
+        XCTAssertEqual(MouseLED.label(forIndex: 3), "LED 3")
+        XCTAssertEqual(MouseLED.labels.count, 6)
+        XCTAssertEqual(Set(MouseLED.labels).count, 6)
+    }
+
     // MARK: - polling
 
     /// The rate is the low nibble of 0x0A; the flag nibble above it is unknown
