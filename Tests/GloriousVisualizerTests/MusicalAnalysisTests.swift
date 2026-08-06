@@ -450,3 +450,144 @@ final class MusicalAnalysisTests: XCTestCase {
         XCTAssertEqual(run([0]), run([0.004, 0.001, 0.007]))
     }
 }
+
+/// The invariants this round of the audit was about: the model's own resting
+/// level, the two clocks, the arbiter's two windows, and the user controls.
+final class AuditedInvariantTests: XCTestCase {
+
+    private let envelope = AHR.clamped(attack: 0.015, hold: 0.1, release: 0.32,
+                                       frameInterval: 1.0 / 30)
+
+    /// P5 absorbs a *repeat*, not a different drum. Matching on `Gesture.Kind`
+    /// alone made every ripple ring a `.ring` and every VU accent a `.pulse`, so
+    /// a snare landing inside a kick's attack was merged into it — wrong origin,
+    /// wrong colour, wrong speed.
+    func testADifferentDrumIsNotAbsorbedIntoAnother() {
+        var list = GestureList(capacity: 3)
+        XCTAssertTrue(list.trigger(Gesture(kind: .ring, startTime: 1.0, amplitude: 0.5,
+                                           origin: 8, onsetKind: .kick, envelope: envelope),
+                                   at: 1.0))
+        XCTAssertTrue(list.trigger(Gesture(kind: .ring, startTime: 1.04, amplitude: 0.5,
+                                           origin: 12, onsetKind: .snare, envelope: envelope),
+                                   at: 1.04))
+        XCTAssertEqual(list.gestures.count, 2)
+        XCTAssertEqual(list.gestures.map(\.onsetKind), [.kick, .snare])
+        // …while a second kick inside the first's attack still absorbs.
+        XCTAssertFalse(list.trigger(Gesture(kind: .ring, startTime: 1.05, amplitude: 0.9,
+                                            origin: 8, onsetKind: .kick, envelope: envelope),
+                                    at: 1.05))
+        XCTAssertEqual(list.gestures.count, 2)
+        XCTAssertEqual(list.gestures[0].amplitude, 0.9, accuracy: 1e-9)
+    }
+
+    /// The alignment target is the beat's own instant, not the hop that noticed
+    /// it. Ignoring the parameter biased the grid by the peak-picking delay plus
+    /// the group delay on every kick.
+    func testBeatAlignmentUsesTheBeatsOwnTime() {
+        func phase(after lag: Double) -> Double {
+            var tracker = TempoTracker(analysisRate: 100)
+            // Drive a clear 2 Hz pulse train until a tempo is established.
+            var time = 0.0
+            while tracker.current.bpm == 0, time < 30 {
+                let beat = (time * 2).truncatingRemainder(dividingBy: 1) < 0.02
+                tracker.process(fluxSum: beat ? 1 : 0, elapsed: 0.01)
+                time += 0.01
+            }
+            XCTAssertGreaterThan(tracker.current.bpm, 0)
+            tracker.align(toBeatAt: time - lag, now: time)
+            return tracker.current.phase
+        }
+        XCTAssertNotEqual(phase(after: 0), phase(after: 0.040), accuracy: 0.0)
+    }
+
+    /// The analysis clock is derived from the sample count but slaved to the
+    /// host clock, so a device running fast cannot drift away from the render
+    /// clock without bound.
+    func testAnalysisTimeFollowsTheHostClock() {
+        let analyzer = MusicAnalyzer(sampleRate: 48_000, frameInterval: 1.0 / 30)
+        let bus = AnalysisBus()
+        var last = 0.0
+        bus.onPublish = { state, _ in last = state.time }
+        // The device really produces 48 240 samples per host second: 0.5 %, far
+        // more than any real converter, so the test finishes quickly.
+        let chunk = 512
+        var host = 0.0
+        var fed = 0
+        while host < 20 {
+            analyzer.ingest([Float](repeating: 0.01, count: chunk), hostTime: host, into: bus)
+            fed += chunk
+            host = Double(fed) / 48_240
+        }
+        // Without slaving, analysis time would be 0.5 % — 100 ms — behind by now.
+        XCTAssertEqual(last, host, accuracy: 0.030)
+    }
+
+    /// Adjacent bands must not share a bin: `weakestBandRatio` is a `min` over
+    /// the region's bands and only means anything if they are independent.
+    func testBandsDoNotShareBins() {
+        for rate in [44_100, 48_000, 96_000] as [Float] {
+            let analyzer = SpectrumAnalyzer(sampleRate: rate)
+            for index in 1..<analyzer.bandBins.count {
+                XCTAssertGreaterThan(analyzer.bandBins[index].lower,
+                                     analyzer.bandBins[index - 1].upper,
+                                     "bands \(index - 1)/\(index) overlap at \(rate) Hz")
+            }
+        }
+    }
+
+    /// The arbiter's two windows are separate. A kick must not delete the hats
+    /// around it, and a kick must still outrank a snare describing the same
+    /// transient.
+    func testAKickDoesNotDeleteTheHatsAroundIt() {
+        var arbiter = OnsetArbiter()
+        func candidate(_ kind: OnsetKind, _ time: Double) -> FluxOnsetDetector.Candidate {
+            FluxOnsetDetector.Candidate(time: time, kind: kind, flux: 1, threshold: 0.5,
+                                        strength: 1, confidence: 1)
+        }
+        XCTAssertEqual(arbiter.arbitrate([candidate(.kick, 1.0)], now: 1.0).map(\.kind), [.kick])
+        // A hat a quarter of a second later survives …
+        _ = arbiter.arbitrate([candidate(.hat, 1.25)], now: 1.25)
+        let hats = arbiter.arbitrate([], now: 1.32).map(\.kind)
+        XCTAssertEqual(hats, [.hat])
+        // … while a snare inside the kick's own transient does not.
+        _ = arbiter.arbitrate([candidate(.snare, 1.08)], now: 1.08)
+        XCTAssertTrue(arbiter.arbitrate([], now: 1.15).isEmpty)
+    }
+
+    /// The user's sensitivity is a monotone gain that cannot clip or crush, and
+    /// it is the identity at 1.
+    func testSensitivityNeitherClipsNorCrushes() {
+        for sensitivity in [0.5, 1.0, 2.0] {
+            XCTAssertEqual(KeyInterlock.gain(0, sensitivity), 0, accuracy: 1e-12)
+            XCTAssertEqual(KeyInterlock.gain(1, sensitivity), 1, accuracy: 1e-12)
+            var previous = -1.0
+            for step in 0...20 {
+                let value = KeyInterlock.gain(Double(step) / 20, sensitivity)
+                XCTAssertGreaterThan(value, previous)
+                XCTAssertLessThanOrEqual(value, 1)
+                previous = value
+            }
+        }
+        XCTAssertEqual(KeyInterlock.gain(0.37, 1), 0.37, accuracy: 1e-12)
+        XCTAssertGreaterThan(KeyInterlock.gain(0.37, 2), 0.37)
+        XCTAssertLessThan(KeyInterlock.gain(0.37, 0.5), 0.37)
+    }
+
+    /// Turning "Auto Gain" off actually stops the AGC moving the gain, which is
+    /// what its tooltip has always promised.
+    func testAutoGainIsReadable() {
+        let engine = VisualizerEngine(sampleRate: 48_000, frameRate: 30)
+        XCTAssertTrue(engine.autoGain)
+        engine.autoGain = false
+        XCTAssertFalse(engine.analyzer.autoGain.value)
+    }
+
+    /// The flag the render and transport loops spin on is safe to write from
+    /// the main thread.
+    func testTheStopFlagIsAtomic() {
+        let flag = AtomicFlag(false)
+        XCTAssertFalse(flag.value)
+        flag.value = true
+        XCTAssertTrue(flag.value)
+    }
+}

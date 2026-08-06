@@ -174,6 +174,39 @@ let sampleRate = 48_000.0
 /// display wakes late, not that 8 ms is the true distribution.
 let batteryJitter = 0.008
 
+/// One column of the battery matrix.
+///
+/// The matrix used to be one axis — jitter — at one frame rate and one
+/// sensitivity, which meant three user-reachable settings and the design's own
+/// headline backpressure principle were CI-gated by nothing:
+///
+/// * **sensitivity** ships eight steps from the menu and every metric was
+///   measured at exactly one of them,
+/// * **frame rate** is configurable over `{15, 20, 24, 30}` and §1.1 claims the
+///   design is correct at all four; only 30 was ever run,
+/// * **`--stall`** existed as a flag and the battery never passed it, so P6 —
+///   "transport backpressure drops frames, never distorts timing" — had no gate
+///   at all.
+struct BatteryArm {
+    var name: String
+    var fps: Double
+    var jitter: Double = 0
+    var sensitivity: Double = 1
+    var stall: (length: Double, rate: Double)?
+    /// See ``Metrics/checks(for:frameInterval:perOnsetMode:assertLatency:assertLiveliness:)``.
+    var assertLatency = true
+    var assertLiveliness = true
+}
+
+let batteryArms: [BatteryArm] = [
+    BatteryArm(name: "", fps: fps),
+    BatteryArm(name: "/jitter", fps: fps, jitter: batteryJitter),
+    BatteryArm(name: "/stall", fps: fps, stall: (0.200, 0.5), assertLatency: false),
+    BatteryArm(name: "/15fps", fps: 15),
+    BatteryArm(name: "/quiet", fps: fps, sensitivity: 0.5, assertLiveliness: false),
+    BatteryArm(name: "/loud", fps: fps, sensitivity: 2.0, assertLiveliness: false),
+]
+
 if battery {
     var rows: [(String, [Metrics.Check])] = []
     var failures = 0
@@ -181,16 +214,17 @@ if battery {
     let start = Date()
 
     print("viz-sim --battery — \(Signal.battery.count) signals × "
-          + "\(VisualizerMode.allCases.count) modes × 2 jitter arms, "
-          + "\(Int(duration)) s each at \(Int(fps)) fps")
+          + "\(VisualizerMode.allCases.count) modes × \(batteryArms.count) arms, "
+          + "\(Int(duration)) s each")
     print("")
 
     for signal in Signal.battery {
         for mode in VisualizerMode.allCases {
-            for jitter in [0.0, batteryJitter] {
+            for arm in batteryArms {
                 var run = SimRun(signal: signal, mode: mode, sampleRate: sampleRate,
-                                 frameRate: fps, duration: duration, jitter: jitter)
-                run.sensitivity = sensitivity
+                                 frameRate: arm.fps, duration: duration, jitter: arm.jitter)
+                run.stall = arm.stall
+                run.sensitivity = arm.sensitivity
                 let result: SimRun.Result
                 do {
                     result = try run.run()
@@ -199,9 +233,10 @@ if battery {
                 }
                 let metrics = Metrics.measure(result, signal: signal)
                 let checks = metrics.checks(for: signal, frameInterval: result.frameInterval,
-                                            perOnsetMode: mode == .pulse || mode == .ripple)
-                let label = "\(signal.name)/\(mode.rawValue)"
-                    + (jitter > 0 ? "/jitter" : "")
+                                            perOnsetMode: mode == .pulse || mode == .ripple,
+                                            assertLatency: arm.assertLatency,
+                                            assertLiveliness: arm.assertLiveliness)
+                let label = "\(signal.name)/\(mode.rawValue)" + arm.name
                 rows.append((label, checks))
                 checksRun += checks.count
                 failures += checks.filter { !$0.passed }.count

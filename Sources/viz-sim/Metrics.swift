@@ -14,6 +14,10 @@ struct Metrics {
 
     /// A key is **on** when its gamma-decoded lightness is at least this. The
     /// same value in every metric, so the metrics are mutually consistent.
+    ///
+    /// Mapped through the user sensitivity curve: sensitivity is an output gain
+    /// applied *after* the per-key interlock, so it changes how bright the board
+    /// is without changing which keys the model is holding lit.
     static let onLevel: Double = 0.10
 
     // M1
@@ -47,6 +51,7 @@ struct Metrics {
     var tickMax: Double = 0
     var staleFraction: Double = 0
     var droppedFrames = 0
+    var deliveredFraction: Double = 1
 
     /// LED offsets grouped by display register, the same six groups the
     /// spectrum mode paints into.
@@ -73,6 +78,10 @@ struct Metrics {
         guard frames.count > 1, let ledCount = frames.first?.count else { return metrics }
         let dt = result.frameInterval
         let duration = Double(frames.count) * dt
+        // The on-threshold follows the user gain through the same curve the
+        // display does, so a uniformly dimmed board is not reported as a dark
+        // one and a brightened one is not reported as permanently lit.
+        let onLevel = KeyInterlock.gain(Self.onLevel, result.sensitivity)
 
         // ---- M1 flicker: complete on→off→on cycles per key-second.
         var flicker = [Double](repeating: 0, count: ledCount)
@@ -132,7 +141,12 @@ struct Metrics {
             // design), so it is the only event whose absence from the display
             // is unambiguously a latency failure.
             for event in result.events where event.kind == .kick && event.time >= 1.0 {
-                let eventFrame = Int(event.time / dt)
+                // The first frame **at or after** the event, per §10.2.
+                // `Int(t/dt)` is the frame at or *before* it, which granted the
+                // pipeline up to a free frame and admitted negative latencies —
+                // which is the whole explanation for a reported median of
+                // −0.41, not §8.2's predictive scheduling.
+                let eventFrame = Int((event.time / dt).rounded(.up))
                 guard eventFrame > 2 * baselineFrames,
                       eventFrame + 6 < frames.count else { continue }
                 // The rise is measured per LED and only its **positive** part is
@@ -147,28 +161,20 @@ struct Metrics {
                     for led in 0..<ledCount { baseline[led] += frames[index][led] }
                 }
                 for led in 0..<ledCount { baseline[led] /= Double(baselineFrames) }
-                // …and it is measured over the best-responding *region*, not
-                // over the whole board. On a seventeen-column display a
-                // register occupies three columns, so a spectrum bar going from
-                // 60 % to full — an unmistakable response — can only move a
-                // board-wide mean by about 0.03. Requiring 0.05 board-wide is
-                // then a statement about geometry rather than about
-                // responsiveness. The regions are the display's own register
-                // groups, so a board-wide mode is measured board-wide.
+                // …and over the whole board, as §10.2 specifies. Taking the
+                // maximum over six register groups instead meant a response in
+                // one register of six satisfied the metric, which is a weaker
+                // claim than the one the document makes and than the one the
+                // user's complaint is about.
                 func rise(_ frame: Int) -> Double {
-                    var best = 0.0
-                    for region in Self.regions {
-                        var total = 0.0
-                        for led in region { total += max(0, frames[frame][led] - baseline[led]) }
-                        best = max(best, total / Double(region.count))
-                    }
-                    return best
+                    var total = 0.0
+                    for led in 0..<ledCount { total += max(0, frames[frame][led] - baseline[led]) }
+                    return total / Double(ledCount)
                 }
                 var found = false
                 for offset in 0...6 {
                     if rise(eventFrame + offset) >= 0.05 {
-                        latencies.append(Double(offset)
-                                         + (Double(eventFrame) * dt - event.time) / dt)
+                        latencies.append((Double(eventFrame + offset) * dt - event.time) / dt)
                         found = true
                         break
                     }
@@ -237,6 +243,7 @@ struct Metrics {
             metrics.tickMax = ticks.max() ?? 0
         }
         metrics.droppedFrames = result.droppedFrames
+        metrics.deliveredFraction = 1 - Double(result.droppedFrames) / Double(frames.count)
         metrics.staleFraction = Double(result.staleFrames) / Double(max(frames.count, 1))
         return metrics
     }
@@ -261,8 +268,20 @@ struct Metrics {
     ///   three to a two-frame response *per kick* would contradict the same
     ///   document that defines them, so M3 is measured where it means something
     ///   and the other three are bounded by M1, M2 and M4.
+    /// - Parameters:
+    ///   - assertLatency: whether M3 means anything on this arm. A deliberately
+    ///     injected transport stall *is* latency — the design's own worst-case
+    ///     end-to-end stall is 250 ms and M3's window is 200 ms — so holding a
+    ///     stalled arm to a two-frame response would be asserting that the stall
+    ///     did not happen.
+    ///   - assertLiveliness: whether M2's *lower* bound means anything on this
+    ///     arm. The user's sensitivity is a monotone output gain, so it scales
+    ///     the frame-to-frame difference by construction; "is the board inert"
+    ///     is a question about the model and is asked at unity gain.
     func checks(for signal: Signal, frameInterval dt: Double,
-                perOnsetMode: Bool = true) -> [Check] {
+                perOnsetMode: Bool = true,
+                assertLatency: Bool = true,
+                assertLiveliness: Bool = true) -> [Check] {
         var checks: [Check] = []
         func add(_ name: String, _ value: Double, _ bound: String, _ passed: Bool,
                  format: String = "%.3f") {
@@ -280,15 +299,34 @@ struct Metrics {
 
         // M2 — bounded both ways. Too high is strobing; too low means the board
         // is inert, which is the other way to fail the user's complaint.
-        if signal.carriesLivelinessBound {
-            add("M2 Δframe mean", deltaMean, "0.010 … 0.075",
-                deltaMean >= 0.010 && deltaMean <= 0.075)
-        } else {
-            add("M2 Δframe mean", deltaMean, "≤ 0.075", deltaMean <= 0.075)
+        //
+        // The bounds are per *frame*, and §10.3 states them for the 30 fps
+        // target, so they scale with the frame interval: the same motion seen
+        // at 15 fps is twice the change from one frame to the next, and a fixed
+        // number would be a claim about the frame rate rather than about the
+        // picture. §1.1 requires every clamp to be expressed in terms of `dt_f`
+        // and this is one of them.
+        // Only the *upper* bounds scale: they are about how much the picture may
+        // step in one frame, and the same motion at half the frame rate is twice
+        // the step. The lower bound is about the board not being dead, which is
+        // a statement about the display rather than about a frame, so it stays
+        // where §10.3 puts it at every rate.
+        let rate = dt * 30
+        func scaled(_ bound: Double) -> Double { bound * rate }
+        func format(_ low: Double, _ high: Double) -> String {
+            String(format: "%.3f … %.3f", low, high)
         }
-        add("M2 Δframe p95", deltaP95, "≤ 0.22", deltaP95 <= 0.22)
+        if signal.carriesLivelinessBound, assertLiveliness {
+            add("M2 Δframe mean", deltaMean, format(0.010, scaled(0.075)),
+                deltaMean >= 0.010 && deltaMean <= scaled(0.075))
+        } else {
+            add("M2 Δframe mean", deltaMean, String(format: "≤ %.3f", scaled(0.075)),
+                deltaMean <= scaled(0.075))
+        }
+        add("M2 Δframe p95", deltaP95, String(format: "≤ %.3f", scaled(0.22)),
+            deltaP95 <= scaled(0.22))
 
-        if signal.isRhythmic, hasLatency, perOnsetMode {
+        if signal.isRhythmic, hasLatency, perOnsetMode, assertLatency {
             add("M3 latency median", latencyMedian, "≤ 2.0 fr", latencyMedian <= 2.0, format: "%.2f")
             add("M3 latency p90", latencyP90, "≤ 3.5 fr", latencyP90 <= 3.5, format: "%.2f")
             add("M3 miss rate", missRate, "≤ 5 %", missRate <= 0.05)
@@ -321,10 +359,15 @@ struct Metrics {
 
         if case .nearSilence = signal {
             add("M6 board brightness", boardMeanBrightness, "≤ 0.03", boardMeanBrightness <= 0.03)
-        } else if averageRelativeMin > 0, signal.hasSteadyState {
+        } else if signal.hasSteadyState {
+            // Reported even when no band registered as present. Skipping
+            // silently meant the universality gate could disappear from a run
+            // without anything saying so.
             checks.append(Check(name: "M6 AVERAGE_REL range",
-                                value: String(format: "%.2f–%.2f", averageRelativeMin,
-                                              averageRelativeMax),
+                                value: averageRelativeMin > 0
+                                    ? String(format: "%.2f–%.2f", averageRelativeMin,
+                                             averageRelativeMax)
+                                    : "no band",
                                 bound: "0.85 … 1.20",
                                 passed: averageRelativeMin >= 0.85
                                     && averageRelativeMax <= 1.20))
@@ -332,6 +375,9 @@ struct Metrics {
 
         add("M7 tick p95", tickP95, "≤ \(String(format: "%.3f", dt * 1.15))",
             tickP95 <= dt * 1.15 + 1e-6)
+        add("M7 tick max", tickMax, "≤ \(String(format: "%.3f", dt * 2))",
+            tickMax <= dt * 2 + 1e-6)
+        add("M7 delivered", deliveredFraction, "≥ 80 %", deliveredFraction >= 0.80)
         add("M7 stale frames", staleFraction, "≤ 1 %", staleFraction <= 0.01)
         return checks
     }

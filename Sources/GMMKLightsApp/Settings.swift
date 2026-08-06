@@ -103,6 +103,10 @@ struct Settings {
     /// normalisation, so 1.0 is "what the normaliser thinks is right" rather
     /// than any absolute level.
     var visualizerSensitivity: Double = 1.0
+    /// The sensitivity steps the menu offers, and the range a stored value is
+    /// clamped into. Bounded by what `viz-sim --battery` gates: outside it the
+    /// design's own flicker, hold and smoothness bounds do not hold.
+    static let visualizerSensitivityRange: [Double] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
     /// Whether the visualizer normalises to recent peaks.
     var visualizerAutoGain: Bool = true
     /// Whether a source has ever been chosen, so the first launch can pick the
@@ -206,7 +210,8 @@ struct Settings {
             // against full-scale audio — so a stored value from before the
             // normalisation rework is clamped into the new, narrower range
             // rather than carried over as-is.
-            visualizerSensitivity = min(max(stored, 0.25), 4)
+            visualizerSensitivity = min(max(stored, Self.visualizerSensitivityRange.first!),
+                                        Self.visualizerSensitivityRange.last!)
         }
         if let stored = defaults.object(forKey: Key.visualizerAutoGain) as? Bool {
             visualizerAutoGain = stored

@@ -51,6 +51,8 @@ struct SimRun {
         var tempoConfidence: [Double] = []
         var bpm: [Double] = []
         var frameInterval: Double = 1.0 / 30
+        /// The user sensitivity this run used, which the on-threshold follows.
+        var sensitivity: Double = 1
     }
 
     func run() throws -> Result {
@@ -62,6 +64,7 @@ struct SimRun {
         var result = Result()
         result.events = track.events
         result.frameInterval = engine.frameInterval
+        result.sensitivity = sensitivity
 
         // M6 and M5 are measured on the control signals at the analysis rate,
         // not on the pixels: "does this need a per-genre constant" is a question
@@ -105,11 +108,19 @@ struct SimRun {
             scheduled = Double(frame) * dt
             var wake = scheduled
             if jitter > 0 { wake += abs(random.nextGaussian()) * jitter }
+            // A transport stall is **not** a render-clock stall (P6). The frame
+            // is still composed on its own grid slot and at its own timestamp;
+            // what a stalled transport costs is *delivery* — the board goes on
+            // showing the last frame that made it out. Adding the stall to the
+            // display wake-up instead modelled the render thread blocking on
+            // USB, which is precisely the architecture the redesign removed, and
+            // it made the M7 tick bound report the injected stall as a clock
+            // failure.
+            var stalled = false
             if let stall, stall.rate > 0 {
                 let period = 1 / stall.rate
-                if (scheduled + dt).truncatingRemainder(dividingBy: period) < dt {
-                    wake += stall.length
-                }
+                let phase = scheduled.truncatingRemainder(dividingBy: period)
+                stalled = phase < stall.length
             }
 
             // Audio arrives on its own clock, in small buffers, up to the moment
@@ -123,15 +134,18 @@ struct SimRun {
             }
 
             let colors = engine.renderFrame(at: scheduled)
+            result.tickIntervals.append(scheduled - lastComposed)
+            lastComposed = scheduled
+            // What the *board* shows: the newly composed frame, or the last one
+            // that was delivered if the transport is mid-stall.
+            let shown = stalled ? (lastColors ?? colors) : colors
+            if stalled { result.droppedFrames += 1 } else { lastColors = colors }
             result.frameTimes.append(scheduled)
-            result.levels.append(colors.map { colour in
+            result.levels.append(shown.map { colour in
                 max(KeyInterlock.decode(colour.red),
                     max(KeyInterlock.decode(colour.green), KeyInterlock.decode(colour.blue)))
             })
-            result.colors.append(colors)
-            result.tickIntervals.append(scheduled - lastComposed)
-            lastComposed = scheduled
-            lastColors = colors
+            result.colors.append(shown)
 
             // Catch up by whole intervals: a late wake-up skips the frames whose
             // slots have already passed rather than sliding the clock.

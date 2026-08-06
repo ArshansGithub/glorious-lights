@@ -58,11 +58,26 @@ public struct FluxOnsetDetector: Sendable {
     /// …and must also be this multiple of the median, which is the test that
     /// survives when MAD collapses.
     public static let medianRatio: Double = 1.6
-    /// The band must actually be louder than its own long-term average.
-    public static let snrRatio: Double = 1.25
+    /// The band must actually be louder than its own long-term average — by the
+    /// same margin ``BandGate/openAt`` calls "this band is doing something",
+    /// rather than by a number of its own. The two tests ask the same question
+    /// about the same quantity and disagreeing about the answer is how a voiced
+    /// syllable, whose region creeps over its average across a 60 ms attack,
+    /// used to clear a bar the gate would not have opened for.
+    public static let snrRatio: Double = 1.30
     /// …and no band inside the region may be sitting at its own average, which
-    /// is what a tone entering one edge of the region looks like.
-    public static let weakestBandRatio: Double = 1.00
+    /// is what a tone entering one edge of the region looks like. Per kind,
+    /// because the regions are not alike: the two bands of the kick region are
+    /// 20–120 Hz and a real kick fills both, so "not below its own average" is
+    /// the whole test, while the snare region is 250 Hz–1 kHz, which is where
+    /// the human voice lives — the one material §10.1 asks it to reject — and a
+    /// formant sweeping through one of its two bands must not read as a hit.
+    public static func weakestBandRatio(for kind: OnsetKind) -> Double {
+        switch kind {
+        case .kick, .hat: return 1.00
+        case .snare:      return 1.15
+        }
+    }
 
     public let kind: OnsetKind
     /// Median/MAD span in hops, derived from the analysis rate.
@@ -119,7 +134,8 @@ public struct FluxOnsetDetector: Sendable {
         var released: Candidate?
         if var waiting = deferred {
             deferred = nil
-            if currentRelative > Self.snrRatio, weakestBand > Self.weakestBandRatio, gate > 0.5,
+            if currentRelative > Self.snrRatio,
+               weakestBand > Self.weakestBandRatio(for: kind), gate > 0.5,
                waiting.time - lastFire > kind.refractorySeconds {
                 waiting.deferredByAHop = true
                 released = waiting
@@ -138,10 +154,10 @@ public struct FluxOnsetDetector: Sendable {
         let mad = deviations[deviations.count / 2]
         let threshold = median + Self.deltaMAD * mad
 
-        // The gate test is evaluated over the whole three-hop window rather than
-        // on the candidate hop alone, for the same reason the level test below
-        // is allowed a hop of grace.
-        let gateLevel = recent.map(\.gate).max() ?? 0
+        // The gate test is allowed the hop of grace the level test below is
+        // allowed, and for the same reason — but not the hop *before* the
+        // candidate, which describes the region before the transient.
+        let gateLevel = max(recent[1].gate, recent[2].gate)
         // No `threshold > 0` guard. After a genuine silence — a two-second gap
         // in a ballad, the half second between cuts — the flux history is all
         // zeros, so the median and the MAD are both zero and a positivity guard
@@ -179,9 +195,15 @@ public struct FluxOnsetDetector: Sendable {
         // fundamental sits at 85–180 Hz, on the upper band of the kick region
         // and nowhere near its lower one, so on the region's mean alone every
         // voiced syllable reads as a kick.
-        let relative = recent.map(\.relative).max() ?? 0
-        let weakest = recent.map(\.weakest).max() ?? 0
-        if relative > Self.snrRatio, weakest > Self.weakestBandRatio { return found }
+        // Over the candidate hop and the one *after* it, never the one before.
+        // The level lags the flux, so looking forward is the whole point of the
+        // deferral below; looking backward is looking at the state the region
+        // was in before the transient, which is evidence of nothing and quietly
+        // turned the region test into "did any of the last three hops look
+        // right".
+        let relative = max(recent[1].relative, recent[2].relative)
+        let weakest = max(recent[1].weakest, recent[2].weakest)
+        if relative > Self.snrRatio, weakest > Self.weakestBandRatio(for: kind) { return found }
         deferred = found
         return released
     }
@@ -259,7 +281,7 @@ public struct OnsetArbiter: Sendable {
             claimed.append((candidate.time, candidate.kind.arbiterWeight))
         }
         pending += candidates.filter { $0.kind.arbiterWeight < Self.topWeight }
-        claimed.removeAll { now - $0.time > Self.crossKindBlock * 2 }
+        claimed.removeAll { now - $0.time > Self.samePrecedenceBlock * 2 }
 
         var remaining: [FluxOnsetDetector.Candidate] = []
         var decided: [FluxOnsetDetector.Candidate] = []
@@ -273,15 +295,12 @@ public struct OnsetArbiter: Sendable {
         pending = remaining
 
         // Anything an equal-or-higher-precedence event already claimed is
-        // suppressed. The window is the *refractory*, not the 25 ms arbitration
-        // window: a hit's energy smears across the spectrum over the whole
-        // length of its transient, so a snare detector firing 60 ms into a kick
-        // is describing the same physical event — the phantom-snare failure the
-        // audit measured at 2 per second. It is also what bounds the accepted
-        // trigger rate: nothing can be accepted within 200 ms of an event of its
-        // own precedence or higher, so the board cannot be asked to show more
-        // than five things a second, which is the ceiling above which detail is
-        // invisible anyway.
+        // suppressed, over the two windows below: a hit's energy smears across
+        // the spectrum over the length of its transient, so a snare detector
+        // firing inside a kick is describing the same physical event — the
+        // phantom-snare failure the audit measured at 2 per second — while two
+        // events of the same kind are paced by how long a gesture takes to be
+        // seen.
         decided.removeAll { isBlocked($0) }
         decided.sort { $0.time < $1.time }
         var group: [FluxOnsetDetector.Candidate] = []
@@ -304,19 +323,40 @@ public struct OnsetArbiter: Sendable {
 
     private func isBlocked(_ candidate: FluxOnsetDetector.Candidate) -> Bool {
         claimed.contains { claim in
-            claim.weight >= candidate.kind.arbiterWeight
-                && abs(claim.time - candidate.time) < Self.crossKindBlock
+            guard claim.weight >= candidate.kind.arbiterWeight else { return false }
+            let window = claim.weight > candidate.kind.arbiterWeight
+                ? candidate.kind.shadowSeconds
+                : Self.samePrecedenceBlock
+            return abs(claim.time - candidate.time) < window
         }
     }
 
-    /// How long an accepted event blocks events of its own precedence or lower.
+    /// How long an accepted event suppresses candidates of its **own**
+    /// precedence: two events of the same kind have to read as two on a
+    /// keyboard, and a gesture needs its attack, its hold and some of its
+    /// release to be seen at all.
     ///
-    /// 330 ms rather than the refractory's 120: it is about the shortest gap at
-    /// which two accepted events still read as two on a keyboard — a gesture
-    /// needs its attack, its hold and some of its release to be seen at all —
-    /// and it bounds the accepted trigger rate at 3 Hz, inside the 0.5–5 Hz band
-    /// the design calls the target.
-    public static let crossKindBlock: Double = 0.330
+    /// This and ``OnsetKind/shadowSeconds`` used to be one constant at 330 ms,
+    /// which made the arbiter a global rate limiter rather than a cross-band
+    /// exclusion: on `edm-128`, against a ground truth of ~2.1 kicks, ~4.3 hats
+    /// and ~1.1 snares per second, the accepted rate was 2.03 Hz and almost
+    /// every hat was discarded outright — the opposite of §1.2's reason for
+    /// having an onset ring at all, and invisible to M5 because 3 Hz sits
+    /// inside its 0.5–5 Hz band.
+
+    /// …and how long it suppresses candidates of its **own** precedence: two
+    /// events of the same kind have to read as two on a keyboard, and a gesture
+    /// needs its attack, its hold and some of its release to be seen at all.
+    ///
+    /// These were one constant at 330 ms, and that made the arbiter a global
+    /// rate limiter rather than a cross-band exclusion: on `edm-128`, against a
+    /// ground truth of ~2.1 kicks, ~4.3 hats and ~1.1 snares per second, the
+    /// accepted rate was 2.03 Hz and almost every hat and snare was discarded
+    /// outright — the opposite of §1.2's reason for having an onset ring at
+    /// all, and invisible to M5 because 3 Hz sits inside its 0.5–5 Hz band. A
+    /// kick no longer deletes the hats around it; it only outranks anything
+    /// describing the same transient.
+    public static let samePrecedenceBlock: Double = 0.330
 
     /// The highest precedence any kind carries.
     private static var topWeight: Double {

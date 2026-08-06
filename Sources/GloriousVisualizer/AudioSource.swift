@@ -70,3 +70,23 @@ public func preferredAudioSource(
     if systemAudio == .undetermined { return .systemAudio }
     return .microphone
 }
+
+/// A `Bool` that is safe to write on one thread and read on another.
+///
+/// The visualizer has three threads reading each other's flags — the render and
+/// transport loops both spin on a stop flag written from the main thread, and
+/// the analysis stage reads a settings flag written from the render thread. A
+/// plain `Bool` there is a data race in the formal sense and, more concretely,
+/// nothing stops the optimiser hoisting the load out of the loop that tests it,
+/// which turns "ask the thread to stop" into "hang".
+public final class AtomicFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Bool
+
+    public init(_ value: Bool) { storage = value }
+
+    public var value: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return storage }
+        set { lock.lock(); storage = newValue; lock.unlock() }
+    }
+}

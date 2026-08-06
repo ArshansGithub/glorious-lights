@@ -480,11 +480,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         submenu.addItem(sourceItem)
 
         // Centred on 1.0, which is where the pipeline's own normalisation puts
-        // a typical loud passage at full height. The steps are geometric
-        // because the difference between 1x and 1.5x matters far more than
-        // between 3x and 4x.
-        for multiplier in [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0] {
-            let item = NSMenuItem(title: String(format: "%.1f×", multiplier),
+        // a typical loud passage at full height, and bounded by the range the
+        // battery actually gates. Every one of the design's flicker, hold,
+        // smoothness and responsiveness bounds used to be verified at exactly
+        // one point of this axis; the eight steps it offered ran from a setting
+        // where the board went dark between gestures to one where it saturated,
+        // and both broke bounds §10.3 states unconditionally. What ships is what
+        // `viz-sim --battery` runs.
+        for multiplier in Settings.visualizerSensitivityRange {
+            let item = NSMenuItem(title: String(format: "%.2f×", multiplier),
                                   action: #selector(selectVisualizerSensitivity(_:)),
                                   keyEquivalent: "")
             item.target = self
@@ -530,7 +534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 + "added in macOS 14.2. Switch the source to Microphone."
         case .granted, .undetermined:
             visualizerItem.title = "Audio Visualizer"
-            visualizerItem.toolTip = visualizer.lastError
+            visualizerItem.toolTip = visualizer.lastError ?? visualizer.lastTiming
         }
         // Still clickable when denied: the click is what opens System Settings.
         visualizerItem.isEnabled = (controller.isConnected && authorization != .unavailable)

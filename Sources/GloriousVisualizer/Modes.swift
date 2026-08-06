@@ -78,6 +78,12 @@ public final class ModeRenderer {
     private var lastBeatTime: Double = -.infinity
     private var waveDirection: Double = 1
     private var rippleSide: [OnsetKind: Double] = [.snare: 1, .hat: 1]
+    /// The timestamp of the previous `render` call, so the beat window can be
+    /// the time that actually elapsed rather than the nominal frame interval.
+    private var lastRenderTime: Double?
+    /// Measured elapsed time since the previous frame, seeded with the nominal
+    /// interval for the first one.
+    private var renderGap: Double = 1.0 / 30
     /// Measured analysis-to-photon latency used to schedule beat-locked gestures
     /// early (§8.2). Conservative: a wrong prediction that is early by a frame
     /// is far less visible than one that is late.
@@ -100,6 +106,9 @@ public final class ModeRenderer {
         lastPhase = 0
         lastBeatTime = -.infinity
         waveDirection = 1
+        bedEnvelope.reset()
+        lastRenderTime = nil
+        renderGap = frameInterval
     }
 
     private var columnCount: Int { LinearCanvas.columnCount }
@@ -107,6 +116,14 @@ public final class ModeRenderer {
     /// Schedules gestures from this frame's events, then paints.
     public func render(state: AnalysisState, onsets: [OnsetEvent],
                        time: Double) -> LinearCanvas {
+        // The window a beat has to fall inside is the gap since the *previous*
+        // frame, not one nominal frame interval. P6 drops frames under
+        // transport backpressure, so two `render` calls can be two or more
+        // frame intervals apart — and a beat whose due-window fell entirely in
+        // the gap was simply never triggered. Pulse and wave lost beats exactly
+        // when the transport was struggling.
+        renderGap = lastRenderTime.map { max(time - $0, 0) } ?? frameInterval
+        lastRenderTime = time
         trackBeats(state: state, time: time)
         schedule(state: state, onsets: onsets, time: time)
         gestures.prune(at: time)
@@ -142,7 +159,7 @@ public final class ModeRenderer {
         let untilBeat = (1 - state.tempo.phase) * period
         let lead = state.tempo.confidence >= TempoEstimate.predictiveConfidence
             ? predictionLead : 0
-        guard untilBeat <= lead + frameInterval else { return false }
+        guard untilBeat <= lead + max(renderGap, frameInterval) else { return false }
         guard time - lastBeatTime >= period * 0.5 else { return false }
         lastBeatTime = time
         return true
@@ -214,7 +231,12 @@ public final class ModeRenderer {
         // changes every key at once, so its attack *is* the board's
         // frame-to-frame difference; at 15 ms the whole display steps in a
         // single frame and the smoothness ceiling is exceeded by 40 %. Still
-        // barely more than one frame, so it still reads as instant.
+        // barely more than one frame, so it still reads as instant — and it
+        // deliberately does **not** scale with `dt_f`: `AHR.clamped` already
+        // floors the hold at two frames, so a longer attack at 15 fps pushes the
+        // end of the hold past a backbeat and the following kick is absorbed
+        // into it (P5) instead of showing. M2 is what makes the per-frame step
+        // acceptable at every rate, and M2's bounds are per frame.
         let envelope = AHR.clamped(attack: 0.035, hold: 0.100, release: release,
                                    frameInterval: frameInterval)
         gestures.trigger(Gesture(kind: .pulse, startTime: time, amplitude: amplitude,
@@ -297,19 +319,41 @@ public final class ModeRenderer {
     /// happening.
     ///
     /// Every mode specifies one ("the board is never dark", "the breath, not
-    /// black"), and its whole purpose is that keys stay lit between gestures. A
-    /// wash below the interlock's own rise threshold does the opposite — the
-    /// board goes dark between gestures and every gesture becomes an on→off→on
-    /// cycle for every key it touches, which is the flicker the user reported.
-    /// So the wash is defined as *clearing that threshold*, and faded out only
-    /// by genuine silence.
-    private func wash(_ designed: Double) -> Double {
-        // 1.5× the rise threshold, not 1.15×: what reaches a key is the wash
-        // *after* the peak row's 0.85 weighting, the centre-to-edge shaping and
-        // the spatial blur, and a wash that only just clears the threshold in
-        // the canvas arrives at some keys just under it — where they chatter
-        // across it once per gesture.
-        max(designed, KeyHold.riseThreshold * 1.5)
+    /// black"), and its whole purpose is that keys stay lit between gestures.
+    ///
+    /// It used to be `max(designed, KeyHold.riseThreshold * 1.5)`. That is
+    /// circular: it derives the model's own resting level from the interlock's
+    /// Schmitt threshold, and lands it 50 % above that threshold in every
+    /// column of every mode, so no key was ever off and M1 and M4 — the two
+    /// metrics that are the direct numerical statement of the user's complaint
+    /// — could not fail. §6.3 names exactly this: the verification ceiling sits
+    /// below what the interlock structurally guarantees so that the metric
+    /// measures the *model*, and a model handed the interlock's constant is not
+    /// being measured at all. The floors are now the ones §9 specifies, and
+    /// nothing here knows what the interlock's thresholds are.
+    private static let pulseFloorShare: Double = 0.18       // §9.1
+    private static let waveBedShare: Double = 0.15          // §9.2
+    /// §9.3 gives ripple no bed of its own; a ring is a shell over a board
+    /// that is otherwise showing the common resting glow, and this is the same
+    /// "never dark" wash the other gesture modes get, scaled to the overall
+    /// relative level rather than to a threshold.
+    private static let rippleBedShare: Double = 0.12
+
+    /// The resting wash is an *envelope*, not a point sample.
+    ///
+    /// `AVERAGE_RELATIVE` is a ratio, and a ratio is only well-conditioned for a
+    /// band that has something in it: on a 110 Hz tone the mid bands hold
+    /// nothing but leakage and their relative value swings over the whole range
+    /// hop to hop, so a bed read straight off it took the board from lit to
+    /// dark and back with no change in the music at all. Passing it through
+    /// the same AHR every other level in the system uses makes the wash obey P4
+    /// like everything else: it can rise as fast as the music does and cannot
+    /// fall faster than the display can render.
+    private var bedEnvelope = AHR(attack: 0.050, hold: 0, release: 0.600)
+
+    /// Folds this frame's designed wash into the bed envelope and returns it.
+    private func wash(_ designed: Double, at time: Double) -> Double {
+        bedEnvelope.update(target: designed, now: time, dt: renderGap)
     }
 
     private func paintPulse(_ state: AnalysisState, time: Double, into canvas: inout LinearCanvas) {
@@ -322,8 +366,9 @@ public final class ModeRenderer {
         // level: on sustained material — a string swell, a held chord — the
         // relative value sits at 1.0 by construction and only the body envelope
         // has anything to say about how much is going on.
-        let floor = wash(clamp(0.18 * state.overallAverageRelative + 0.25 * state.body,
-                               0, 0.45))
+        let floor = wash(clamp(Self.pulseFloorShare * state.overallAverageRelative
+                                   + 0.25 * state.body, 0, 0.45),
+                         at: time)
         // The hit rides *on top of* the breath rather than replacing it. Taking
         // the maximum means a quiet passage's gestures are swallowed by the same
         // floor that is meant to keep the board alive — on a crescendo the
@@ -345,7 +390,8 @@ public final class ModeRenderer {
 
     private func paintWave(_ state: AnalysisState, time: Double, into canvas: inout LinearCanvas) {
         let colour = colour(for: state)
-        let bed = wash(clamp(0.15 * state.midAverageRelative, 0, 0.35))
+        let bed = wash(clamp(Self.waveBedShare * state.midAverageRelative, 0, 0.35),
+                       at: time)
         // The wash covers the peak row as well. A function-row key that is
         // dark except when a gesture passes toggles once per gesture, and M1
         // is a per-key metric — its p95 is decided by exactly these keys.
@@ -370,7 +416,8 @@ public final class ModeRenderer {
 
     private func paintRipple(_ state: AnalysisState, time: Double, into canvas: inout LinearCanvas) {
         let bedColour = colour(for: state)
-        let bed = wash(clamp(0.12 * state.overallAverageRelative, 0, 0.30))
+        let bed = wash(clamp(Self.rippleBedShare * state.overallAverageRelative, 0, 0.30),
+                       at: time)
         for column in 0..<columnCount {
             canvas.addColumn(column, bedColour, level: bed, peak: bed)
         }
@@ -405,7 +452,10 @@ public final class ModeRenderer {
             guard start < end else { continue }
             let height = clamp(state.register(register), 0, 1)
             let peak = clamp(state.registerPeak(register), 0, 1)
-            let bed = wash(0)
+            // §9.4's floor is per register and lives in the analyser
+            // (`0.05 + 0.95·…`), so the bars themselves never blink a section
+            // out. The rows above a bar are not lit by a wash.
+            let bed = 0.0
             for column in start..<end {
                 canvas.addColumn(column, colour, level: bed, peak: bed)
                 canvas.fillColumn(column, height: height, colour: colour)
@@ -434,7 +484,9 @@ public final class ModeRenderer {
         // nothing on a board this small.
         let reach = clamp(level + 0.6 * accent, 0, 1) * 8.5
 
-        let bed = wash(0)
+        // §9.5 gives the columns the meter has not reached no wash: an unlit
+        // column of a meter is the meter reading what it reads.
+        let bed = 0.0
         for column in 0..<columnCount {
             let distance = abs(Double(column) - centre)
             // Smoothstep over ±1 column instead of a `distance <= reach` cliff.
@@ -455,9 +507,8 @@ public final class ModeRenderer {
             canvas.addColumn(column, colour, level: clamp(value, 0, 1),
                              // PPM marker: fast attack, slow decay, continuous,
                              // over the same wash the body sits on.
-                             peak: max(wash(0),
-                                       smoothstep(reach + 0.5, reach - 0.5, distance)
-                                           * smoothstep(0.05, 0.25, level)))
+                             peak: smoothstep(reach + 0.5, reach - 0.5, distance)
+                                 * smoothstep(0.05, 0.25, level))
         }
     }
 

@@ -33,6 +33,16 @@ public final class MusicAnalyzer {
     /// be expressed in frames.
     public var frameInterval: Double
 
+    /// Whether the percentile AGC of §3.3 may move the gain at all.
+    ///
+    /// The menu has always offered this and nothing read it: the normalisation
+    /// ran regardless, so "Auto Gain" was a tick that changed nothing while its
+    /// tooltip promised to "normalise to the loudest sound heard recently".
+    /// With it off the gain is pinned at unity and the board simply shows how
+    /// loud the material actually is. Written from the render thread, read here
+    /// on the analysis thread, hence the flag rather than a `Bool`.
+    public let autoGain = AtomicFlag(true)
+
     private let analyzer: SpectrumAnalyzer
     private var whitening: AdaptiveWhitening
     private var followers: [RelativeFollower]
@@ -60,9 +70,12 @@ public final class MusicAnalyzer {
 
     private var pending: [Float] = []
     private var samplesConsumed = 0
+    /// Every sample handed in, including the ones still waiting for a whole hop.
+    private var samplesReceived = 0
     private var startTime: Double = 0
     private var hasStarted = false
     private var lastHopTime: Double = 0
+    private var lastOnsetTime: Double = -.infinity
 
     /// The AGC's gain is clamped to this ratio (§3.3). It is the one place the
     /// design's otherwise fully relative levelling meets an absolute, and it is
@@ -84,12 +97,49 @@ public final class MusicAnalyzer {
     public static let silenceLevel: Double = 0.02
 
     /// How far above its own median the broadband flux must have gone in the
-    /// last second for *any* onset to be accepted. Measured separation: 1.17 on
-    /// stationary noise, 1.57 on the quietest musical case in the battery.
-    public static let livelinessRatio: Double = 1.5
+    /// last second before any onset is accepted at all, and how far above it
+    /// before onsets are accepted at full confidence.
+    ///
+    /// Measured separation: 1.12–1.17 on stationary noise, 1.57 on the quietest
+    /// musical case in the battery. A single hard threshold at 1.5 sat at 96 %
+    /// of the quietest passing case and was an all-or-nothing switch on the
+    /// entire onset path, so material 4 % less lively than a synthetic ballad
+    /// produced *zero* onsets rather than dimmer ones — which is the failure
+    /// §2.2 names when it says the transition from "hit" to "no hit" must be
+    /// continuous. The floor is now placed on the stationary side of the gap
+    /// instead, with 11 % of headroom above the noisiest stationary case and
+    /// 21 % below the quietest musical one, and everything between the floor
+    /// and full simply drives dimmer gestures.
+    public static let livelinessFloor: Double = 1.30
+    public static let livelinessFull: Double = 1.55
 
-    /// Registers fall at 110 ms per row; six rows is a 0.66 s full fall.
-    public static let gravityPerRow: Double = 0.110
+    /// Fraction of the sample-count-versus-host-clock error corrected per
+    /// buffer. Slow enough that callback jitter is averaged away, fast enough
+    /// that a real rate offset never accumulates: 2 % of a 256-sample buffer is
+    /// a time constant of about a quarter of a second.
+    public static let clockSlew: Double = 0.02
+    /// An error this large is not drift — it is a dropout or a device change —
+    /// and is corrected in one step. Also, being smaller than the shortest
+    /// buffer's own advance divided by ``clockSlew``, it keeps analysis
+    /// timestamps monotonic under the slow correction.
+    public static let resyncThreshold: Double = 0.250
+
+    /// How long the beat grid keeps full confidence after the last accepted
+    /// onset, and how long before it is abandoned entirely. A tempo is a claim
+    /// about recurring events; four seconds without one is two bars at any
+    /// tempo the tracker will report.
+    public static let gridGroundedSeconds: Double = 2.0
+    public static let gridAbandonSeconds: Double = 4.0
+
+    /// Registers fall under gravity at this rate per row. §6.4 gives the window
+    /// — "faster than ~60 ms/row and the marker becomes flicker; slower than
+    /// ~150 ms/row and it looks stuck" — and the slow end of it is where the
+    /// bars belong. A bar's rows are thresholds it crosses, so the fall rate
+    /// *is* the rate at which its top row can toggle: at 110 ms/row a busy
+    /// polyrhythm produced 1.97 on→off→on cycles per key-second against M1's
+    /// ceiling of 1.5, and there is nothing else in a pure envelope mode to slow
+    /// it down.
+    public static let gravityPerRow: Double = 0.150
 
     public init(sampleRate: Double, frameInterval: Double) {
         self.sampleRate = sampleRate
@@ -119,8 +169,14 @@ public final class MusicAnalyzer {
                                      frameInterval: frameInterval)
         self.masterEnvelope = .clamped(attack: 0.300, hold: 0, release: 1.200,
                                        frameInterval: frameInterval)
+        // The peak-hold is the §6.3 minimum visible on-time, which P1 allows as
+        // a perceptual constant. A bar's rows are thresholds the bar crosses, so
+        // a register that falls back the moment it stops rising turns a busy
+        // passage into a row toggling at the hit rate — measured on
+        // `polyrhythm`, 1.97 on→off→on cycles per key-second against a ceiling
+        // of 1.5, with nothing else in the mode to slow it down.
         self.registerLevels = Array(repeating: GravityPeak(fallSeconds: Self.gravityPerRow * 6,
-                                                          hold: 0.100),
+                                                          hold: KeyHold.minimumOn),
                                     count: AnalysisState.registerCount)
         self.registerPeaks = Array(repeating: GravityPeak(fallSeconds: Self.gravityPerRow * 6,
                                                           hold: 0.100),
@@ -140,6 +196,33 @@ public final class MusicAnalyzer {
             hasStarted = true
             startTime = hostTime - Double(samples.count) / sampleRate
             lastHopTime = startTime
+            samplesReceived = 0
+        }
+        samplesReceived += samples.count
+        // **The analysis clock is slaved to the host clock, slowly.**
+        //
+        // Timestamps are derived from the sample count so they are exact even
+        // when the capture callback jitters — but they are derived against the
+        // device's *nominal* rate. A device producing 48 000 ± 50 ppm advances
+        // analysis time at 1 ± 50 ppm host-seconds per host-second, which is
+        // linear, unbounded drift against the render clock: after about seven
+        // minutes the 20 ms extrapolation limit is exceeded and either every
+        // frame is counted stale or the interpolator runs off the end of its
+        // history. A dropout or a device change adds a permanent step with no
+        // resync path at all.
+        //
+        // So the sample count still sets the *fine* structure — that is what
+        // makes it immune to callback jitter — and the host clock sets the
+        // slow term. A small error is corrected at 2 % per buffer, far slower
+        // than any callback jitter and far faster than any real clock drift; a
+        // large one is a dropout or a device change and is resynced outright.
+        let expectedEnd = startTime + Double(samplesReceived) / sampleRate
+        let error = hostTime - expectedEnd
+        if abs(error) > Self.resyncThreshold {
+            startTime += error
+            lastHopTime += error
+        } else {
+            startTime += error * Self.clockSlew
         }
         pending += samples
 
@@ -244,8 +327,10 @@ public final class MusicAnalyzer {
 
         // Percentile AGC with the gain clamp of §3.3.
         if !frozen { loudnessReference.update(rms, dt: dt) }
-        let gain = clamp(1 / max(loudnessReference.value, QuantileTracker.floor),
-                         Self.minimumGain, Self.maximumGain)
+        let gain = autoGain.value
+            ? clamp(1 / max(loudnessReference.value, QuantileTracker.floor),
+                    Self.minimumGain, Self.maximumGain)
+            : 1
         // Master brightness answers "is there material playing", not "how loud
         // is it this instant". The dynamics are already carried by the relative
         // values every mode composes from, so making the master a level as well
@@ -300,11 +385,12 @@ public final class MusicAnalyzer {
         // still converging — which is exactly when a spurious "event" is most
         // likely and least meaningful.
         let lively = liveliness.count >= Int(analysisRate)
-            && (liveliness.max() ?? 0) > Self.livelinessRatio
+            ? smoothstep(Self.livelinessFloor, Self.livelinessFull, liveliness.max() ?? 0)
+            : 0
 
         // Onsets: candidates per kind, then winner-take-all across kinds.
         var candidates: [FluxOnsetDetector.Candidate] = []
-        for kind in OnsetKind.allCases where lively {
+        for kind in OnsetKind.allCases where lively > 0 {
             guard var detector = detectors[kind] else { continue }
             let lower = analyzer.bandBins[kind.bands.lowerBound].lower
             let upper = analyzer.bandBins[kind.bands.upperBound].upper
@@ -329,11 +415,17 @@ public final class MusicAnalyzer {
         var events: [OnsetEvent] = []
         for winner in arbiter.arbitrate(candidates, now: time) {
             detectors[winner.kind]?.accept(at: winner.time)
+            // Liveliness scales the gesture rather than gating it, so material
+            // sitting near the stationary boundary fades in instead of
+            // appearing all at once.
             events.append(OnsetEvent(time: winner.time - groupDelay,
                                      kind: winner.kind,
                                      strength: winner.strength,
-                                     confidence: winner.confidence))
-            if winner.kind == .kick { tempoTracker.align(toBeatAt: winner.time) }
+                                     confidence: winner.confidence * lively))
+            if winner.kind == .kick {
+                // The transient, not the hop that noticed it.
+                tempoTracker.align(toBeatAt: winner.time - groupDelay, now: time)
+            }
         }
 
         // Accent envelopes, driven at the analysis rate so a 15 ms attack means
@@ -350,6 +442,19 @@ public final class MusicAnalyzer {
 
         state.tempo = tempoTracker.process(fluxSum: Float(max(0, totalFlux - medianFlux)),
                                            elapsed: dt)
+        // The grid is only as believable as the signal is lively. Autocorrelating
+        // the residual of a *stationary* signal still finds a peak — a 110 Hz
+        // sine reported 114.8 BPM at confidence 0.46, comfortably over
+        // `usableConfidence`, so wave launched a sweep every beat of a tempo that
+        // does not exist and a stationary signal produced a moving board. The
+        // same liveliness measure that decides whether an onset is real decides
+        // how much of the grid to believe, and for exactly the same reason.
+        // …and only as believable as the events under it. A grid with nothing
+        // beating on it has been fitted to noise.
+        if !events.isEmpty { lastOnsetTime = time }
+        let grounded = smoothstep(Self.gridAbandonSeconds, Self.gridGroundedSeconds,
+                                  time - lastOnsetTime)
+        state.tempo.confidence *= lively * grounded
 
         // Registers: instant rise, gravity fall, and a separate peak marker.
         for index in 0..<AnalysisState.registerCount {
@@ -396,6 +501,7 @@ public final class MusicAnalyzer {
             accents[kind]?.reset()
         }
         arbiter.reset()
+        lastOnsetTime = -.infinity
         tempoTracker = TempoTracker(analysisRate: analysisRate)
         overallFollower.reset()
         loudnessReference.reset()
@@ -412,6 +518,7 @@ public final class MusicAnalyzer {
         liveliness.removeAll()
         pending.removeAll()
         samplesConsumed = 0
+        samplesReceived = 0
         hasStarted = false
     }
 }

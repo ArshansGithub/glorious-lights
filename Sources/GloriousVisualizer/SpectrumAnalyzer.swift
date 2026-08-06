@@ -50,12 +50,26 @@ public final class SpectrumAnalyzer {
 
         let binWidth = sampleRate / Float(Self.windowSize)
         let binCount = Self.windowSize / 2
-        self.bandBins = (0..<(Self.bandEdges.count - 1)).map { index in
+        // **Disjoint.** Flooring both edges made band *n*'s `upper` equal band
+        // *n+1*'s `lower`, so at 48 kHz bin 2 was half of the two-bin kick band
+        // and a quarter of the band above it. `weakestBandRatio` — the test that
+        // stops a voiced syllable reading as a kick — is a `min` over the
+        // region's bands, and it only means anything if those bands are
+        // independent observations of different parts of the spectrum. Each band
+        // now starts one bin past the end of the one below it, unless that would
+        // empty it: at a high capture rate the bottom edges collapse into a
+        // single bin, and a band with no bins at all is worse than a shared one.
+        var bins: [(lower: Int, upper: Int)] = []
+        var previousUpper = 0
+        for index in 0..<(Self.bandEdges.count - 1) {
             // Bin 0 is DC; never let a band include it.
-            let lower = max(1, min(Int(Self.bandEdges[index] / binWidth), binCount - 1))
-            let upper = max(lower, min(Int(Self.bandEdges[index + 1] / binWidth), binCount - 1))
-            return (lower, upper)
+            let edge = max(1, min(Int(Self.bandEdges[index] / binWidth), binCount - 1))
+            let upper = max(edge, min(Int(Self.bandEdges[index + 1] / binWidth), binCount - 1))
+            let lower = min(max(edge, previousUpper + 1), upper)
+            bins.append((lower, upper))
+            previousUpper = upper
         }
+        self.bandBins = bins
     }
 
     deinit { vDSP_destroy_fftsetup(fftSetup) }

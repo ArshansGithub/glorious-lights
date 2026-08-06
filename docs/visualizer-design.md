@@ -926,8 +926,21 @@ unless stated.
 | `dnb-174` | double-time breakbeat, 174 BPM | gesture durations must stretch, not overlap |
 | `polyrhythm` | 3-against-4, ambiguous tempo | low-confidence cross-fade; must not free-run a wrong grid |
 
-Plus one **orthogonal axis** applied to every case: `--jitter <ms>` on the render
-interval, driven from the distribution measured on real hardware (§7.5).
+Plus the **orthogonal axes** applied to every case, one battery arm each. The
+matrix was one axis at one frame rate and one sensitivity, which left three
+user-reachable settings and the headline backpressure principle gated by
+nothing:
+
+| arm | what it varies | why |
+|---|---|---|
+| — | nothing | the reference |
+| `/jitter` | 8 ms Gaussian on the display wake-up | §7.5 |
+| `/stall` | 200 ms transport stall at 0.5 Hz | **P6**: the render clock must not move and the bounds must still hold on what the board shows. M3 is not asserted here — a 200 ms stall *is* latency |
+| `/15fps` | `dt_f = 1/15` | §1.1 claims the design is correct at 15 fps; only 30 was ever run |
+| `/quiet`, `/loud` | sensitivity 0.5 and 2.0 | the menu's own range. M2's *lower* bound is not asserted here: a monotone output gain scales the frame-to-frame difference by construction, so "is the board inert" is asked at unity gain |
+
+`--jitter <ms>` on the render
+interval is driven from the distribution measured on real hardware (§7.5).
 `viz-sim` is temporally deterministic today — fixed `frameInterval`, audio fed in
 exact lockstep with the display — so the aliasing class of bug **cannot occur in
 the simulator at all**. That is why it survived. Required additions to viz-sim:
@@ -971,7 +984,12 @@ metric, so the metrics are mutually consistent).
 > Mean over frames of the mean over LEDs of `|L_k(f) − L_k(f−1)|`, where `L` is
 > the linear 0…1 level. Report mean and p95 over frames.
 
-* **Bound: `0.010 ≤ mean(Δframe) ≤ 0.075`** and **`p95(Δframe) ≤ 0.22`**.
+* **Bound: `0.010 ≤ mean(Δframe) ≤ 0.075 · (30 · dt_f)`** and
+  **`p95(Δframe) ≤ 0.22 · (30 · dt_f)`**. The *upper* bounds are per frame — the
+  same motion at half the frame rate is twice the step from one frame to the
+  next — so they scale with `dt_f` like every other clamp (§1.1). The lower bound
+  is about the board not being dead, which is a statement about the display
+  rather than about a frame, and does not scale.
 * Bounded *both* ways deliberately. Too high is strobing. Too low means the board
   is inert — a smoothing filter can trivially satisfy an upper bound alone by
   making the visualiser dead, which is the other way to fail the user's
@@ -1072,9 +1090,12 @@ metric, so the metrics are mutually consistent).
 | M5 trigger rate | 0.5 … 5.0 Hz | musical cases |
 | M6 AVERAGE_RELATIVE mean | 0.85 … 1.20 | all with signal |
 | M7 tick p95 | ≤ 1.15 · dt_f | hardware + sim |
+| M7 tick max | ≤ 2 · dt_f | hardware + sim |
+| M7 delivered frames | ≥ 80 % of render rate | hardware + sim |
+| M7 stale frames | ≤ 1 % | hardware + sim |
 
-`viz-sim --battery` runs the full matrix (11 signals × 5 modes × {no jitter,
-measured jitter}) and prints a pass/fail table. It is a CI gate: a change that
+`viz-sim --battery` runs the full matrix (14 signals × 5 modes × 6 arms) and
+prints a pass/fail table. It is a CI gate: a change that
 regresses any bound is rejected regardless of how it looks on any one track.
 
 ### 10.4 What the metrics do NOT cover
@@ -1088,8 +1109,10 @@ watching `animation.mp4` and the hardware.
 ### 10.5 Open measurement gaps to close first
 
 1. **Frame-interval distribution on real hardware** — p50/p95/max of the render
-   tick and of the per-packet echo round trip. Nothing records it today, so §7
-   and the 30 fps target are currently unfalsifiable claims.
+   tick and of the per-packet echo round trip. The counters exist and are now
+   read: `VisualizerController` summarises the render telemetry and the frame
+   slot's delivered/dropped counts at the end of every run and shows them on the
+   menu item. The echo round trip itself is still unrecorded.
 2. **Clap-test end-to-end latency** with a 240 fps camera, to set the §8.3
    default offset.
 3. **The discriminating experiment, before any code changes**: ask whether
@@ -1122,8 +1145,13 @@ Time constants in seconds. Nothing here was derived from a song.
 | gate ramp-out τ | 400 ms | 3.4 |
 | flux median span | 11 hops (~117 ms) | 2.2 |
 | flux threshold | med + 3.0·MAD, and > 1.6·med | 2.2 |
-| onset SNR test | CURRENT_REL > 1.25 | 2.2 |
+| onset SNR test | CURRENT_REL > 1.30, the same margin as the gate | 2.2 |
+| onset weakest-band test | > 1.00 (kick, hat), > 1.15 (snare, where the voice lives) | 2.2 |
 | arbiter window | 25 ms, weights 1.0/0.9/0.8 | 2.2 |
+| arbiter same-precedence block | 330 ms | 2.2 |
+| arbiter cross-kind shadow | 330 ms over a snare, 200 ms over a hat | 2.2 |
+| liveliness gate | floor 1.30, full 1.55 — a ramp, not a switch | 2.2 |
+| beat grid grounding | full within 2 s of an onset, abandoned after 4 s | 2.3 |
 | refractory | 120 ms (160 ms hat) | 4.4 |
 | kick AHR | 15 / 100 / 320 ms | 4.1 |
 | snare AHR | 8 / 80 / 240 ms | 4.1 |
@@ -1139,7 +1167,11 @@ Time constants in seconds. Nothing here was derived from a song.
 | **key minimum on-time** | **150 ms** | 6.3 |
 | **key minimum off-time** | **100 ms** | 6.3 |
 | key down-slew | ≥ 200 ms full→black | 6.3 |
-| peak gravity fall | 110 ms per row | 6.4 |
+| peak gravity fall | 150 ms per row — the slow end of §6.4's window | 6.4 |
+| register peak-hold | 150 ms, the §6.3 minimum on-time | 6.4 |
+| resting wash AHR | 50 / 0 / 600 ms, over §9's own floors | 9 |
+| analysis-clock slew | 2 % per buffer, resync above 250 ms | 1.1 |
+| user sensitivity | 0.5 … 2.0, as `1 − (1 − x)^s` after the interlock | 6.3 |
 | spatial blur σ | 1.0 cell | 6.2 |
 | gamma | 2.2 | 6.5 |
 | extrapolation limit | 20 ms | 6.1 |

@@ -148,9 +148,19 @@ public struct GestureList: Sendable {
     public mutating func trigger(_ gesture: Gesture, at time: Double,
                                  minimumAge: Double = 0) -> Bool {
         prune(at: time)
-        // Absorption: anything still building or holding takes the new energy.
+        // Absorption: anything still building or holding takes the new energy —
+        // but only if it is the *same* event. P5 is "a trigger arriving while a
+        // gesture is in ATTACK or HOLD raises that gesture's amplitude", and a
+        // snare is not a louder kick: it has its own origin, speed and hue
+        // (§9.3), and VU filters its accents by kind (§9.5). Matching on
+        // `Kind` alone made every ripple ring a `.ring` and every VU accent a
+        // `.pulse`, so a drum landing inside another drum's attack+hold was
+        // silently merged into it — with the wrong origin, colour and speed,
+        // and on any backbeat that is the common case rather than the corner
+        // one.
         if let index = gestures.firstIndex(where: { candidate in
             candidate.kind == gesture.kind
+                && candidate.onsetKind == gesture.onsetKind
                 && (candidate.phase(at: time) != .release
                     || time - candidate.startTime < minimumAge)
         }) {

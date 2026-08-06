@@ -57,7 +57,8 @@ final class VisualizerController {
     private var sensitivity: Double
     private var autoGainEnabled: Bool
 
-    private var isStopping = false
+    /// Written on the main thread, read in both background loop conditions.
+    private let isStopping = AtomicFlag(false)
 
     private(set) var isRunning = false
     private(set) var lastError: String?
@@ -151,7 +152,7 @@ final class VisualizerController {
             }
         }
 
-        isStopping = false
+        isStopping.value = false
         let transport = Thread { [weak self] in self?.transportLoop() }
         transport.name = "com.glorious-lights.visualizer.transport"
         transport.qualityOfService = .userInitiated
@@ -173,24 +174,60 @@ final class VisualizerController {
     }
 
     /// Stops rendering and hands the transport back. Main thread.
-    func stop() {
-        guard isRunning else { return }
+    func stop() { stop(because: nil) }
+
+    /// The single teardown path, whether the user asked or the transport failed.
+    ///
+    /// A transport-thread failure used to call `fail(...)` and return, which set
+    /// a message and nothing else: the lease stayed held by `.visualizer` — so
+    /// every menu action was refused for the rest of the session — the render
+    /// thread went on composing at 30 fps into a slot nobody drained, and
+    /// `start()` returned early on `guard !isRunning`. There was no way back
+    /// except finding and toggling stop.
+    private func stop(because failure: String?) {
+        guard isRunning else {
+            if let failure { fail(failure) }
+            return
+        }
         capture?.stop()
         capture?.onSamples = nil
         capture = nil
 
-        isStopping = true
+        isStopping.value = true
         while renderThread?.isFinished == false || transportThread?.isFinished == false {
             Thread.sleep(forTimeInterval: 0.005)
         }
+        lastTiming = timingSummary
         renderThread = nil
         transportThread = nil
         engine = nil
 
         lease.release(.visualizer)
         isRunning = false
+        lastError = failure
         onStatusChange?()
     }
+
+    /// What the render clock and the frame handoff actually did, for §10.5's
+    /// first open measurement gap: nothing on the hardware side recorded the
+    /// tick distribution, the stale-frame rate or the dropped-frame count, so
+    /// "does the board actually run at 30 fps?" had no answer off the simulator.
+    private var timingSummary: String? {
+        guard let engine, engine.telemetry.frames > 0 else { return lastTiming }
+        let telemetry = engine.telemetry
+        let delivered = frameSlot.deliveredFrames + frameSlot.droppedFrames
+        return String(format: "%d frames, tick p95 %.1f ms / max %.1f ms, "
+                      + "%.1f %% late, %.1f %% stale, %.1f %% delivered",
+                      telemetry.frames,
+                      telemetry.intervalP95 * 1000, telemetry.intervalMax * 1000,
+                      100 * Double(telemetry.lateFrames) / Double(telemetry.frames),
+                      100 * telemetry.staleFraction,
+                      delivered > 0
+                          ? 100 * Double(frameSlot.deliveredFrames) / Double(delivered) : 0)
+    }
+
+    /// The last run's timing summary, for the menu to show.
+    private(set) var lastTiming: String?
 
     private func makeCapture() -> AudioSourceCapturing? {
         switch source {
@@ -223,15 +260,16 @@ final class VisualizerController {
         let interval = engine.frameInterval
         var next = ProcessInfo.processInfo.systemUptime + interval
 
-        while !isStopping {
+        while !isStopping.value {
             let now = ProcessInfo.processInfo.systemUptime
             if next > now { Thread.sleep(forTimeInterval: next - now) }
-            if isStopping { break }
+            if isStopping.value { break }
 
             let settings = currentSettings
             engine.mode = settings.mode
             engine.themeColor = settings.color
             engine.sensitivity = settings.sensitivity
+            engine.autoGain = settings.autoGain
 
             // Compose for the SCHEDULED time, not for `now`.
             frameSlot.put(engine.renderFrame(at: next))
@@ -255,14 +293,13 @@ final class VisualizerController {
             try keyboard.open()
             try keyboard.beginStreaming()
         } catch {
-            let message = String(describing: error)
-            DispatchQueue.main.async { [weak self] in self?.fail(message) }
             keyboard.stop()
+            reportFailure(String(describing: error))
             return
         }
 
         var lastSent: [RGB]?
-        while !isStopping {
+        while !isStopping.value {
             guard let frame = frameSlot.take() else {
                 // Nothing new to send. Sleep a fraction of a frame rather than
                 // spinning; the render clock is what decides timing.
@@ -277,14 +314,21 @@ final class VisualizerController {
             do {
                 try keyboard.sendFrame(packets: GMMKTransaction.bracket(packets))
             } catch {
-                let message = String(describing: error)
-                DispatchQueue.main.async { [weak self] in self?.fail(message) }
+                reportFailure(String(describing: error))
                 break
             }
         }
 
         keyboard.endStreaming()
         keyboard.stop()
+    }
+
+    /// Called from the transport thread. Asks every loop to wind down now, then
+    /// hands the teardown — which owns the lease and joins the threads — to the
+    /// main thread.
+    private func reportFailure(_ message: String) {
+        isStopping.value = true
+        DispatchQueue.main.async { [weak self] in self?.stop(because: message) }
     }
 
     /// Dirty-region diffing (§7.2).

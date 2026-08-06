@@ -36,6 +36,27 @@ public enum OnsetKind: String, CaseIterable, Sendable {
         }
     }
 
+    /// How long a *higher*-precedence accepted event keeps this kind's region
+    /// contaminated, and so how long one physical hit can go on producing
+    /// candidates here (§2.2).
+    ///
+    /// Per kind because the smear is not symmetric. A kick's body is a
+    /// low-frequency swing that goes on exciting the 250 Hz–1 kHz snare region
+    /// for the length of its decay, so a snare detected a third of a second
+    /// into a kick is very often the same drum. Its energy at 6–16 kHz is a
+    /// click that is over in a few tens of milliseconds, so a hat is a
+    /// different event much sooner — and a single shared window long enough for
+    /// the snare case deleted almost every offbeat hat on the battery's own
+    /// four-on-the-floor case, which is the detail the whole redesign exists to
+    /// show.
+    public var shadowSeconds: Double {
+        switch self {
+        case .kick:  return 0.330
+        case .snare: return 0.330
+        case .hat:   return 0.200
+        }
+    }
+
     /// Tie-break weight in the cross-band arbiter (§2.2).
     public var arbiterWeight: Double {
         switch self {
@@ -170,9 +191,22 @@ public struct TempoTracker: Sendable {
 
     /// Pulls the phase gently toward a detected beat. Never snaps: a hard reset
     /// on every kick makes the grid as jittery as the detector.
-    public mutating func align(toBeatAt time: Double) {
+    ///
+    /// - Parameters:
+    ///   - time: when the beat actually happened.
+    ///   - now: the timestamp of the hop this is being called from. The two are
+    ///     not the same — peak-picking sees the transient one or two hops after
+    ///     it happened, and the event is timestamped back by the group delay on
+    ///     top of that. Correcting as though the beat were *now* biased the grid
+    ///     36–47 ms late on every alignment, which the render-side prediction
+    ///     lead then happened to cancel. Two errors that agree numerically is
+    ///     not the same as either being right.
+    public mutating func align(toBeatAt time: Double, now: Double) {
         guard estimate.bpm > 0 else { return }
-        let wrapped = phaseAccumulator > 0.5 ? phaseAccumulator - 1 : phaseAccumulator
+        // Where the grid says the phase was at the beat's own instant.
+        var atBeat = phaseAccumulator - (now - time) / estimate.beatPeriod
+        atBeat -= atBeat.rounded(.down)
+        let wrapped = atBeat > 0.5 ? atBeat - 1 : atBeat
         phaseAccumulator -= wrapped * Self.phaseCorrection
         phaseAccumulator -= phaseAccumulator.rounded(.down)
         estimate.phase = phaseAccumulator

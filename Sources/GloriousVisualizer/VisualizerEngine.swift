@@ -63,6 +63,12 @@ public final class VisualizerEngine {
         set { renderer.themeColor = newValue }
     }
 
+    /// Whether the percentile AGC may move the gain (§3.3).
+    public var autoGain: Bool {
+        get { analyzer.autoGain.value }
+        set { analyzer.autoGain.value = newValue }
+    }
+
     // MARK: - Analysis side
 
     /// Runs analysis over whatever whole hops these samples complete.
@@ -121,7 +127,18 @@ public final class VisualizerEngine {
         // the multiply last, the p10 on-duration collapsed to 30–70 ms on every
         // case whose loudness moves, which is the metric the interlock exists to
         // guarantee.
-        let scale = sensitivity * brightness
+        //
+        // The *user's* sensitivity is the exception, and goes after. It is a
+        // taste control on how bright the board is, not a statement about the
+        // material, and putting it upstream made the interlock's own decisions
+        // depend on it: at the shipped minimum the whole composed picture
+        // landed under the 0.14 rise threshold, so the board went dark between
+        // gestures and every gesture became an on→off→on cycle for every key it
+        // touched — measured flicker p95 went from 0.000 to 1.000 purely by
+        // moving the slider. Downstream of the interlock the hold decisions are
+        // made on what the modes asked for, which is what this type's own
+        // documentation has always claimed.
+        let scale = brightness
         func write(_ led: UInt16, _ colour: (r: Double, g: Double, b: Double)) {
             let offset = Int(led) - Int(GMMKKeyMap.minLEDIndex)
             guard levels.indices.contains(offset) else { return }
@@ -138,7 +155,7 @@ public final class VisualizerEngine {
             let peak = canvas.peak(column: index)
             for led in column.peakKeys { write(led, peak) }
         }
-        return interlock.encode(levels, brightness: 1, now: now, dt: dt)
+        return interlock.encode(levels, sensitivity: max(sensitivity, 0), now: now, dt: dt)
     }
 
     /// Finds the analysis states bracketing `time` and evaluates them there.

@@ -204,9 +204,12 @@ public struct KeyInterlock: Sendable {
     /// Runs the interlock over one frame of linear-lightness colours and encodes
     /// the result.
     ///
-    /// - Parameter levels: per-LED `(r, g, b)` in lightness units, 0…1.
+    /// - Parameters:
+    ///   - levels: per-LED `(r, g, b)` in lightness units, 0…1.
+    ///   - sensitivity: the user's gain, applied **after** the hold decision so
+    ///     that turning it down cannot make the interlock let go of a key.
     public mutating func encode(_ levels: [(r: Double, g: Double, b: Double)],
-                                brightness: Double,
+                                sensitivity: Double,
                                 now: Double, dt: Double) -> [RGB] {
         var out = [RGB](repeating: .black, count: keys.count)
         for index in keys.indices {
@@ -217,12 +220,28 @@ public struct KeyInterlock: Sendable {
             let lightness = max(colour.r, max(colour.g, colour.b))
             let held = keys[index].update(min(lightness, 1), now: now, dt: dt)
             guard held > 0, lightness > 0 else { continue }
-            let scale = held / lightness * brightness
-            out[index] = RGB(red: Self.gamma(colour.r * scale),
-                             green: Self.gamma(colour.g * scale),
-                             blue: Self.gamma(colour.b * scale))
+            let scale = held / lightness
+            out[index] = RGB(red: Self.gamma(Self.gain(colour.r * scale, sensitivity)),
+                             green: Self.gamma(Self.gain(colour.g * scale, sensitivity)),
+                             blue: Self.gamma(Self.gain(colour.b * scale, sensitivity)))
         }
         return out
+    }
+
+    /// The user's sensitivity, as a gain that cannot clip and cannot crush.
+    ///
+    /// `1 − (1 − x)^s` is monotone in both arguments, fixes 0 and 1, and is the
+    /// identity at `s = 1`. A plain multiply is neither: at the top of the
+    /// shipped range it drove most of the board to full scale, where a kick has
+    /// nowhere left to go — the frame-to-frame difference collapsed below M2's
+    /// *lower* bound and nearly half the events produced no measurable response
+    /// at all, which is the design's "other way to fail the user's complaint".
+    /// This keeps the ordering and the dynamics of what the model composed and
+    /// only changes how much of the range they occupy.
+    public static func gain(_ lightness: Double, _ sensitivity: Double) -> Double {
+        let x = clamp(lightness, 0, 1)
+        guard sensitivity != 1, sensitivity > 0 else { return x }
+        return 1 - pow(1 - x, sensitivity)
     }
 
     /// The one gamma encode in the system (§6.5).
