@@ -12,6 +12,8 @@ let package = Package(
         .library(name: "GloriousSync", targets: ["GloriousSync"]),
         .library(name: "GloriousVisualizer", targets: ["GloriousVisualizer"]),
         .library(name: "GloriousAudioCapture", targets: ["GloriousAudioCapture"]),
+        .library(name: "StripProtocol", targets: ["StripProtocol"]),
+        .library(name: "StripBLE", targets: ["StripBLE"]),
         .executable(name: "gmmk-cli", targets: ["gmmk-cli"]),
         .executable(name: "GMMKLightsApp", targets: ["GMMKLightsApp"]),
         // Development tool. Deliberately not part of the app bundle, which
@@ -36,14 +38,22 @@ let package = Package(
         // Capture lives outside the app target so command-line tools can drive
         // the same microphone and process-tap code the app uses.
         .target(name: "GloriousAudioCapture", dependencies: ["GloriousVisualizer"]),
+        // A third device with a third protocol: a Bluetooth LE strip. Shares
+        // nothing with the keyboard or the mouse — different transport,
+        // different framing, and several mutually incompatible vendor
+        // dialects — so, like the mouse, it gets its own pair of targets.
+        .target(name: "StripProtocol"),
+        .target(name: "StripBLE", dependencies: ["StripProtocol"]),
         .executableTarget(name: "gmmk-cli",
                           dependencies: ["GMMKProtocol", "GMMKHID",
-                                         "GloriousMouseProtocol", "GloriousMouseHID"]),
+                                         "GloriousMouseProtocol", "GloriousMouseHID",
+                                         "StripProtocol", "StripBLE"]),
         .executableTarget(name: "GMMKLightsApp",
                           dependencies: ["GMMKProtocol", "GMMKHID",
                                          "GloriousMouseProtocol", "GloriousMouseHID",
                                          "GloriousSync", "GloriousVisualizer",
-                                         "GloriousAudioCapture"]),
+                                         "GloriousAudioCapture",
+                                         "StripProtocol", "StripBLE"]),
         .executableTarget(name: "viz-sim",
                           dependencies: ["GMMKProtocol", "GloriousVisualizer"]),
         .executableTarget(name: "viz-diag",
@@ -53,5 +63,6 @@ let package = Package(
         .testTarget(name: "GloriousMouseProtocolTests", dependencies: ["GloriousMouseProtocol"]),
         .testTarget(name: "GloriousSyncTests", dependencies: ["GloriousSync"]),
         .testTarget(name: "GloriousVisualizerTests", dependencies: ["GloriousVisualizer"]),
+        .testTarget(name: "StripProtocolTests", dependencies: ["StripProtocol"]),
     ]
 )
