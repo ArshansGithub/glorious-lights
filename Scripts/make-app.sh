@@ -90,10 +90,28 @@ PLIST
 
 plutil -lint "$APP/Contents/Info.plist"
 
-echo "==> Signing (ad-hoc)"
 # --deep is deprecated for signing but harmless here and asked for explicitly;
 # this bundle has no nested code for it to reach anyway.
-codesign --force --deep --sign - --timestamp=none "$APP"
+# Signing identity. Ad-hoc ("-") signatures change with every build, and macOS
+# ties privacy grants (Input Monitoring, audio capture) to the signature — so an
+# ad-hoc rebuild silently invalidates permissions the user already granted, while
+# still showing them as enabled in System Settings. A real certificate keeps the
+# identity stable across rebuilds.
+#
+# Override with GL_SIGN_IDENTITY; otherwise prefer, in order: a Developer ID
+# (the only one strangers' Macs accept without the Gatekeeper dance), any valid
+# Apple Development certificate, then ad-hoc.
+if [ -z "${GL_SIGN_IDENTITY:-}" ]; then
+    GL_SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+        | grep 'Developer ID Application' | grep -v CSSMERR | head -1 | sed 's/.*"\(.*\)"/\1/' || true)
+fi
+if [ -z "${GL_SIGN_IDENTITY:-}" ]; then
+    GL_SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+        | grep 'Apple Development' | grep -v CSSMERR | head -1 | sed 's/.*"\(.*\)"/\1/' || true)
+fi
+GL_SIGN_IDENTITY="${GL_SIGN_IDENTITY:--}"
+echo "==> Signing as: $GL_SIGN_IDENTITY"
+codesign --force --deep --sign "$GL_SIGN_IDENTITY" --timestamp=none "$APP"
 codesign --verify --strict "$APP"
 
 echo "==> Bundle:"
