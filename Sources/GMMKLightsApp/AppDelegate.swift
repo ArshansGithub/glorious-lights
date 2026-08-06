@@ -28,7 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var visualizer = VisualizerController(
         lease: controller.lease,
         source: settings.visualizerSource,
-        style: settings.visualizerStyle,
+        mode: settings.visualizerMode,
         themeColor: settings.color,
         sensitivity: settings.visualizerSensitivity,
         autoGain: settings.visualizerAutoGain)
@@ -36,7 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                             action: nil, keyEquivalent: "")
     private let visualizerOptionsItem = NSMenuItem(title: "Visualizer Options",
                                                    action: nil, keyEquivalent: "")
-    private let visualizerStyleMenu = NSMenu()
+    private let visualizerModeMenu = NSMenu()
     private let visualizerSourceMenu = NSMenu()
     private let visualizerSensitivityMenu = NSMenu()
     private let visualizerAutoGainItem = NSMenuItem(title: "Auto Gain",
@@ -454,17 +454,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func buildVisualizerOptions() -> NSMenuItem {
         let submenu = NSMenu()
 
-        for style in VisualizerStyle.allCases {
-            let item = NSMenuItem(title: style.displayName,
-                                  action: #selector(selectVisualizerStyle(_:)),
+        for mode in VisualizerMode.allCases {
+            let item = NSMenuItem(title: mode.displayName,
+                                  action: #selector(selectVisualizerMode(_:)),
                                   keyEquivalent: "")
             item.target = self
-            item.representedObject = style
-            visualizerStyleMenu.addItem(item)
+            item.representedObject = mode
+            item.toolTip = mode.summary
+            visualizerModeMenu.addItem(item)
         }
-        let styleItem = NSMenuItem(title: "Style", action: nil, keyEquivalent: "")
-        styleItem.submenu = visualizerStyleMenu
-        submenu.addItem(styleItem)
+        let modeItem = NSMenuItem(title: "Mode", action: nil, keyEquivalent: "")
+        modeItem.submenu = visualizerModeMenu
+        submenu.addItem(modeItem)
 
         for source in AudioSource.allCases {
             let item = NSMenuItem(title: source.displayName,
@@ -547,8 +548,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 : "Needs \(itemSource.permissionName) permission."
         }
 
-        for item in visualizerStyleMenu.items {
-            item.state = (item.representedObject as? VisualizerStyle) == settings.visualizerStyle
+        for item in visualizerModeMenu.items {
+            item.state = (item.representedObject as? VisualizerMode) == settings.visualizerMode
                 ? .on : .off
         }
         for item in visualizerSensitivityMenu.items {
@@ -586,7 +587,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func startVisualizer() {
         visualizer.source = settings.visualizerSource
-        visualizer.update(style: settings.visualizerStyle,
+        visualizer.update(mode: settings.visualizerMode,
                           themeColor: settings.color,
                           sensitivity: settings.visualizerSensitivity,
                           autoGain: settings.visualizerAutoGain)
@@ -653,11 +654,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshVisualizerItems()
     }
 
-    @objc private func selectVisualizerStyle(_ sender: NSMenuItem) {
-        guard let style = sender.representedObject as? VisualizerStyle else { return }
-        settings.visualizerStyle = style
+    @objc private func selectVisualizerMode(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? VisualizerMode else { return }
+        settings.visualizerMode = mode
         settings.save()
-        visualizer.update(style: style, themeColor: settings.color)
+        visualizer.update(mode: mode, themeColor: settings.color)
         refreshVisualizerItems()
     }
 

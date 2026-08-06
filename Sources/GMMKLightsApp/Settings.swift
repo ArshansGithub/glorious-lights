@@ -31,7 +31,7 @@ struct Settings {
         static let lookBrightness = "sync.look.brightness"
         static let lookSpeed = "sync.look.speed"
         static let mouseLEDColors = "mouse.ledColors"
-        static let visualizerStyle = "visualizer.style"
+        static let visualizerMode = "visualizer.mode"
         static let visualizerSensitivity = "visualizer.sensitivity"
         static let visualizerAutoGain = "visualizer.autoGain"
         static let visualizerSource = "visualizer.source"
@@ -94,10 +94,11 @@ struct Settings {
     /// Where the visualizer listens. Defaulted lazily rather than here: the
     /// preferred source depends on which permissions are already granted, which
     /// is not known until the app asks.
-    var visualizerSource: AudioSource = .microphone
+    var visualizerSource: AudioSource = .systemAudio
 
-    /// How the audio visualizer paints its bars.
-    var visualizerStyle: VisualizerStyle = .heat
+    /// Which gesture the visualizer draws. Pulse is the default: it is the
+    /// mode that looks intentional with the widest range of material.
+    var visualizerMode: VisualizerMode = .pulse
     /// Gain multiplier applied *on top of* the pipeline's own source-relative
     /// normalisation, so 1.0 is "what the normaliser thinks is right" rather
     /// than any absolute level.
@@ -196,9 +197,9 @@ struct Settings {
         if let stored = defaults.object(forKey: Key.hasChosenVisualizerSource) as? Bool {
             hasChosenVisualizerSource = stored
         }
-        if let raw = defaults.string(forKey: Key.visualizerStyle),
-           let stored = VisualizerStyle(rawValue: raw) {
-            visualizerStyle = stored
+        if let raw = defaults.string(forKey: Key.visualizerMode),
+           let stored = VisualizerMode(rawValue: raw) {
+            visualizerMode = stored
         }
         if let stored = defaults.object(forKey: Key.visualizerSensitivity) as? Double {
             // The old scale meant something else — an absolute multiplier
@@ -240,7 +241,7 @@ struct Settings {
         defaults.set(mouseLEDColors.map(\.hexString), forKey: Key.mouseLEDColors)
         defaults.set(visualizerSource.rawValue, forKey: Key.visualizerSource)
         defaults.set(hasChosenVisualizerSource, forKey: Key.hasChosenVisualizerSource)
-        defaults.set(visualizerStyle.rawValue, forKey: Key.visualizerStyle)
+        defaults.set(visualizerMode.rawValue, forKey: Key.visualizerMode)
         defaults.set(visualizerSensitivity, forKey: Key.visualizerSensitivity)
         defaults.set(visualizerAutoGain, forKey: Key.visualizerAutoGain)
     }

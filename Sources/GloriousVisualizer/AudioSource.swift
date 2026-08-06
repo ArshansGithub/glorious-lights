@@ -15,8 +15,19 @@ public enum AudioSource: String, CaseIterable, Sendable {
 
     public var displayName: String {
         switch self {
-        case .microphone:  return "Microphone"
+        case .microphone:  return "Room (Microphone)"
         case .systemAudio: return "System Audio"
+        }
+    }
+
+    /// What this source is good for, for a menu tooltip.
+    public var summary: String {
+        switch self {
+        case .microphone:
+            return "Hears the room. Smoothed and slowed for ambience and parties "
+                 + "rather than for following a track."
+        case .systemAudio:
+            return "Hears what is playing. The right choice for music."
         }
     }
 

@@ -64,7 +64,7 @@ final class VisualizerController {
     /// Set on the main thread, read by the render thread; guarded by its own
     /// lock so a style change mid-frame cannot tear.
     private let settingsLock = NSLock()
-    private var style: VisualizerStyle
+    private var mode: VisualizerMode
     private var themeColor: RGB
     private var sensitivity: Double
     private var autoGainEnabled: Bool
@@ -82,13 +82,13 @@ final class VisualizerController {
 
     init(lease: TransportLease,
          source: AudioSource,
-         style: VisualizerStyle,
+         mode: VisualizerMode,
          themeColor: RGB,
          sensitivity: Double,
          autoGain: Bool) {
         self.lease = lease
         self.source = source
-        self.style = style
+        self.mode = mode
         self.themeColor = themeColor
         self.sensitivity = sensitivity
         self.autoGainEnabled = autoGain
@@ -96,23 +96,23 @@ final class VisualizerController {
 
     // MARK: - Settings
 
-    func update(style: VisualizerStyle? = nil,
+    func update(mode: VisualizerMode? = nil,
                 themeColor: RGB? = nil,
                 sensitivity: Double? = nil,
                 autoGain: Bool? = nil) {
         settingsLock.lock()
-        if let style { self.style = style }
+        if let mode { self.mode = mode }
         if let themeColor { self.themeColor = themeColor }
         if let sensitivity { self.sensitivity = sensitivity }
         if let autoGain { self.autoGainEnabled = autoGain }
         settingsLock.unlock()
     }
 
-    private var currentSettings: (style: VisualizerStyle, color: RGB,
+    private var currentSettings: (mode: VisualizerMode, color: RGB,
                                   sensitivity: Double, autoGain: Bool) {
         settingsLock.lock()
         defer { settingsLock.unlock() }
-        return (style, themeColor, sensitivity, autoGainEnabled)
+        return (mode, themeColor, sensitivity, autoGainEnabled)
     }
 
     // MARK: - Lifecycle
@@ -137,7 +137,9 @@ final class VisualizerController {
         let pipeline = VisualizerPipeline(
             sampleRate: Float(capture.sampleRate),
             bandCount: VisualizerLayout.columns.count,
-            tuning: .init(sensitivity: settings.sensitivity, autoGain: settings.autoGain))
+            tuning: .init(sensitivity: settings.sensitivity,
+                          autoGain: settings.autoGain,
+                          sourceProfile: source == .microphone ? .room : .music))
         self.pipeline = pipeline
         // The FFT happens on the audio thread, so the render thread only ever
         // does arithmetic on 17 floats before sending.
@@ -158,7 +160,9 @@ final class VisualizerController {
             let corrected = VisualizerPipeline(
                 sampleRate: Float(capture.sampleRate),
                 bandCount: VisualizerLayout.columns.count,
-                tuning: .init(sensitivity: settings.sensitivity, autoGain: settings.autoGain))
+                tuning: .init(sensitivity: settings.sensitivity,
+                              autoGain: settings.autoGain,
+                              sourceProfile: source == .microphone ? .room : .music))
             self.pipeline = corrected
             capture.onSamples = { [weak corrected] samples in corrected?.analyze(samples) }
         }
@@ -221,6 +225,8 @@ final class VisualizerController {
     private func renderLoop() {
         let frameInterval = 1 / Self.targetFrameRate
         var lastFrame = ProcessInfo.processInfo.systemUptime
+        let renderer = ModeRenderer(mode: currentSettings.mode,
+                                    themeColor: currentSettings.color)
 
         do {
             try keyboard.open()
@@ -245,9 +251,10 @@ final class VisualizerController {
             pipeline.tuning.sensitivity = settings.sensitivity
             pipeline.tuning.autoGain = settings.autoGain
 
-            let heights = pipeline.advance(elapsed: elapsed)
-            let renderer = BarRenderer(style: settings.style, themeColor: settings.color)
-            let colors = renderer.frame(levels: heights)
+            renderer.mode = settings.mode
+            renderer.themeColor = settings.color
+            let musical = pipeline.musicalFrame(elapsed: elapsed)
+            let colors = renderer.render(musical, elapsed: elapsed)
 
             do {
                 try keyboard.sendFrame(
