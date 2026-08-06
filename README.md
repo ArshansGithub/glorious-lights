@@ -72,6 +72,14 @@ swift build -c release
   firmware version, RGB effect, color, brightness, speed, DPI stages, polling
   rate and debounce. It reads the mouse's settings on connect and never writes
   anything until you pick something.
+- **One desk, one look:** *Desk Themes* applies a curated look — Mint Uniform,
+  Seafoam Wave, Ocean, Ember, Ice, Midnight — to every device that's plugged in,
+  translating it into each one's own vocabulary. *Sync Devices* keeps them
+  together after that: a color, effect or brightness change made to either
+  device is applied to the other as well. The two disagree about almost every
+  scale (the keyboard's speed field is a *delay* running backwards, and its
+  brightness has an "off" level the mouse can't express), so the translation
+  lives in one tested place — see `Sources/GloriousSync`.
 - **CLI:** `swift run -c release gmmk-cli help`
 
 ```sh
@@ -165,6 +173,7 @@ it only becomes a brick if something then writes flash.
 | `GMMKHID` | Keyboard: IOKit HID transport — vendor-interface matching, 64-byte frames, hello-read session opener, echo-paced sends |
 | `GloriousMouseProtocol` | Mouse: the 520-byte config blob with typed accessors, the safe-verb command channel, and the ISP guard |
 | `GloriousMouseHID` | Mouse: IOKit feature-report transport, vendor-collection matching, hot-plug |
+| `GloriousSync` | The only place the two meet: a pure translation layer mapping a device-neutral desk look onto each device's own effects and scales |
 | `gmmk-cli` | Both devices, plus the keyboard bring-up/debug toolkit (`probe0`–`probe3`, `read`, `raw`) |
 | `GMMKLightsApp` | The menu-bar app for both |
 | `docs/` | The protocol references — likely the most complete public documentation of either device's protocol |

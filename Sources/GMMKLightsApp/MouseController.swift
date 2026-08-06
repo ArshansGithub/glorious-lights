@@ -1,6 +1,7 @@
 import Foundation
 import GloriousMouseHID
 import GloriousMouseProtocol
+import GloriousSync
 
 /// Owns the mouse transport and turns menu actions into blob writes.
 ///
@@ -177,6 +178,24 @@ final class MouseController {
                 MouseModeParameter(speed: speed ?? current.speed,
                                    brightness: brightness ?? current.brightness),
                 for: effect)
+        }
+    }
+
+    /// Applies a whole translated look: effect, its colour if it has one, its
+    /// packed speed/brightness byte, and the rainbow direction where that
+    /// matters — all in the single blob write the protocol requires anyway.
+    func apply(_ plan: GloriousSync.MousePlan) {
+        modifyConfig { blob in
+            blob.effect = plan.effect
+            if let color = plan.color {
+                try blob.setColors([color], for: plan.effect)
+            }
+            if plan.effect.hasModeByte {
+                try blob.setModeParameter(plan.parameter, for: plan.effect)
+            }
+            if let direction = plan.rainbowDirection {
+                blob.rainbowDirection = direction
+            }
         }
     }
 

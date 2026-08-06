@@ -1,6 +1,7 @@
 import AppKit
 import GMMKProtocol
 import GloriousMouseProtocol
+import GloriousSync
 
 /// Status-item menu for both devices: the keyboard's effect picker, brightness,
 /// speed, colour and switch compensation, then the mouse's own section.
@@ -17,6 +18,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         [weak self] in self?.presentColorPanel(for: .mouse)
     }
     private var settings = Settings()
+    private lazy var sync = SyncCoordinator(keyboard: controller,
+                                            mouse: mouseController) { [weak self] in
+        self?.settings.compensationProfile ?? .neutral
+    }
+
+    private let syncSeparator = NSMenuItem.separator()
+    private let syncItem = NSMenuItem(title: "Sync Devices", action: nil, keyEquivalent: "")
+    private let themesItem = NSMenuItem(title: "Desk Themes", action: nil, keyEquivalent: "")
 
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
@@ -125,8 +134,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         brightnessRow.onChange = { [weak self] percent in
             guard let self else { return }
             self.settings.brightnessPercent = percent
+            self.rememberKeyboardLook()
             self.settings.save()
             self.controller.setBrightness(percent: percent)
+            // The mouse write is a whole blob, so it rides the slider's own
+            // throttle rather than firing on every intermediate value.
+            self.syncToMouse()
         }
         menu.addItem(row(brightnessRow))
 
@@ -157,6 +170,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(switchFriendlyItem())
 
         mouseSection.install(in: menu)
+        mouseSection.onLookChanged = { [weak self] in self?.syncFromMouse() }
+
+        menu.addItem(syncSeparator)
+        syncItem.action = #selector(toggleSync(_:))
+        syncItem.target = self
+        menu.addItem(syncItem)
+
+        let themesMenu = NSMenu()
+        for theme in DeskTheme.all {
+            let item = NSMenuItem(title: theme.name,
+                                  action: #selector(selectTheme(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = theme.look
+            item.image = swatchImage(nsColor(theme.look.color.keyboardColor))
+            themesMenu.addItem(item)
+        }
+        themesItem.submenu = themesMenu
+        menu.addItem(themesItem)
+
         menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "Quit Glorious Lights",
@@ -260,6 +293,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshConnectionItem()
         refreshEnablement()
         mouseSection.refresh()
+        refreshSyncSection()
+    }
+
+    /// The sync section is about *both* devices, so it only appears when at
+    /// least one is here — and the toggle itself only means anything when both
+    /// are, since it describes copying changes from one to the other.
+    private func refreshSyncSection() {
+        let anyDevice = controller.isConnected || mouseController.isConnected
+        let bothDevices = controller.isConnected && mouseController.isConnected
+        for item in [syncSeparator, syncItem, themesItem] { item.isHidden = !anyDevice }
+
+        syncItem.state = settings.syncDevices ? .on : .off
+        syncItem.isEnabled = bothDevices
+        syncItem.toolTip = bothDevices
+            ? "Apply a change made to one device to the other as well."
+            : "Both the keyboard and the mouse have to be connected to sync them."
+        // Themes need no partner: they apply to whatever is plugged in.
+        themesItem.isEnabled = anyDevice
     }
 
     // MARK: - Actions
@@ -268,9 +319,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let mode = sender.representedObject as? LightingMode else { return }
         settings.mode = mode
         settings.compensated = false
+        rememberKeyboardLook()
         settings.save()
         refreshEnablement()
         controller.setMode(mode)
+        syncToMouse()
     }
 
     /// Paints the whole board the chosen colour, correcting the keys whose
@@ -282,9 +335,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func applyCompensated(_ sender: NSMenuItem) {
         settings.mode = .custom
         settings.compensated = true
+        rememberKeyboardLook()
         settings.save()
         refreshEnablement()
         paintCompensated()
+        syncToMouse()
     }
 
     /// Applies a ``SwitchFriendlyPalette`` swatch.
@@ -306,6 +361,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.setSolidColor(color,
                                  brightnessPercent: settings.brightnessPercent,
                                  compensation: profile)
+        rememberKeyboardLook()
+        syncToMouse()
     }
 
     @objc private func openTuner(_ sender: NSMenuItem) {
@@ -332,11 +389,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                     profile: settings.compensationProfile)
     }
 
+    // MARK: - Sync
+
+    @objc private func toggleSync(_ sender: NSMenuItem) {
+        settings.syncDevices.toggle()
+        settings.save()
+        refreshSyncSection()
+        // Turning it on is itself an instruction to match: push the look the
+        // keyboard is showing onto the mouse, rather than waiting for the next
+        // change and leaving the desk mismatched in the meantime.
+        if settings.syncDevices { sync.applyToMouse(settings.deskLook) }
+    }
+
+    /// Applies a curated look to every device that is present, regardless of the
+    /// sync toggle — picking a theme *is* the instruction to match.
+    @objc private func selectTheme(_ sender: NSMenuItem) {
+        guard let look = sender.representedObject as? DeskLook else { return }
+        settings.deskLook = look
+        // Keep the keyboard's own UI state honest about what was just sent.
+        settings.color = look.color.keyboardColor
+        settings.brightnessPercent = Int((look.clampedBrightness * 100).rounded())
+        let plan = GloriousSync.keyboardPlan(for: look)
+        settings.mode = plan.mode
+        settings.rainbow = plan.rainbow
+        settings.compensated = plan.mode == .fixed && !plan.rainbow
+            && settings.compensationProfile.isActive
+        settings.save()
+        applySettingsToUI()
+        sync.apply(look)
+    }
+
+    /// Mirrors a keyboard-side change onto the mouse, if syncing is on and the
+    /// change is one a desk look can describe.
+    private func syncToMouse() {
+        guard settings.syncDevices, mouseController.isConnected else { return }
+        sync.applyToMouse(settings.deskLook)
+    }
+
+    /// Mirrors a mouse-side change onto the keyboard, reading back what the
+    /// mouse actually ended up with rather than what was asked for.
+    private func syncFromMouse() {
+        guard settings.syncDevices, controller.isConnected,
+              let config = mouseController.config,
+              var look = sync.deskLook(fromMouse: config) else { return }
+        // An effect with no colour of its own keeps the look's existing one, so
+        // switching the mouse to rainbow and back does not lose the colour.
+        if GloriousSync.mousePlan(for: look).color == nil {
+            look.color = settings.deskLook.color
+        }
+        settings.deskLook = look
+        let plan = GloriousSync.keyboardPlan(for: look)
+        settings.mode = plan.mode
+        settings.rainbow = plan.rainbow
+        settings.color = look.color.keyboardColor
+        settings.brightnessPercent = Int((look.clampedBrightness * 100).rounded())
+        settings.compensated = false
+        settings.save()
+        applySettingsToUI()
+        sync.applyToKeyboard(look)
+    }
+
+    /// Records a keyboard-side change in the stored look, so a later sync or a
+    /// relaunch describes what the desk is actually showing.
+    private func rememberKeyboardLook() {
+        settings.deskLook.color = DeskColor(settings.color)
+        settings.deskLook.brightness = Double(settings.brightnessPercent) / 100
+        // The speed row is 1 (slowest) … 5 (fastest); a look is 0…1.
+        settings.deskLook.speed = Double(settings.speed - 1) / 4
+        // An effect with no counterpart leaves the family alone rather than
+        // approximating: picking Vortex says nothing about what the mouse
+        // should do, so the stored look keeps whatever it had.
+        if let family = GloriousSync.family(forKeyboardMode: settings.mode,
+                                            rainbow: settings.rainbow) {
+            settings.deskLook.family = family
+        }
+    }
+
     @objc private func toggleRainbow(_ sender: NSMenuItem) {
         settings.rainbow.toggle()
+        rememberKeyboardLook()
         settings.save()
         refreshEnablement()
         controller.setRainbow(settings.rainbow)
+        syncToMouse()
     }
 
     /// Opens the shared colour panel pointed at one device or the other.
@@ -404,6 +539,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // One call either way: an active profile turns this into a per-key
         // paint, a neutral one into the global colour write.
         controller.setColor(rgb, compensation: profile)
+        rememberKeyboardLook()
+        syncToMouse()
     }
 
     /// A mouse colour change is a read-modify-write of the whole 520-byte blob

@@ -75,6 +75,20 @@ final class KeyboardController {
              throttleKey: throttleKey)
     }
 
+    /// The device's own 0–4 scale, for callers that already have a level.
+    /// Unthrottled: this is a one-shot apply, not a drag.
+    func setBrightness(level: UInt8) {
+        send(GMMKTransaction.setBrightness(level: level))
+    }
+
+    /// Mode, brightness, delay, rainbow flag and colour in one transaction —
+    /// a whole look, applied without the board showing a half-finished state.
+    func applyLook(mode: LightingMode, rainbow: Bool, brightness: UInt8,
+                   delay: UInt8, color: RGB) {
+        send(GMMKTransaction.applyLook(mode: mode, rainbow: rainbow,
+                                       brightness: brightness, delay: delay, color: color))
+    }
+
     /// `speed` is 1 (slowest) – 5 (fastest); the device gets delay 3–0.
     func setSpeed(_ speed: Int, throttleKey: String? = "speed") {
         send(GMMKTransaction.setDelay(Delay.delay(fromSpeed: speed)), throttleKey: throttleKey)

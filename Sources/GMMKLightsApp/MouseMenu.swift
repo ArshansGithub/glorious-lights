@@ -22,6 +22,14 @@ final class MouseMenuSection: NSObject {
     /// Asks the delegate to open the shared colour panel targeted at the mouse.
     private let presentColorPanel: () -> Void
 
+    /// Fires after a user action in this section that changes how the mouse
+    /// looks, once the write has landed and the blob has been re-read.
+    ///
+    /// The delegate uses it to sync the keyboard *from what the mouse actually
+    /// ended up with* rather than from what was asked for — the two can differ,
+    /// and the device is the authority.
+    var onLookChanged: (() -> Void)?
+
     // MARK: - Items
 
     private let separator = NSMenuItem.separator()
@@ -271,6 +279,7 @@ final class MouseMenuSection: NSObject {
     @objc private func selectEffect(_ sender: NSMenuItem) {
         guard let effect = sender.representedObject as? MouseRGBEffect else { return }
         controller.setEffect(effect)
+        onLookChanged?()
     }
 
     @objc private func openColorPanel() {
@@ -280,11 +289,13 @@ final class MouseMenuSection: NSObject {
     @objc private func selectBrightness(_ sender: NSMenuItem) {
         guard let level = sender.representedObject as? Int else { return }
         controller.setModeParameter(brightness: UInt8(level))
+        onLookChanged?()
     }
 
     @objc private func selectSpeed(_ sender: NSMenuItem) {
         guard let speed = sender.representedObject as? Int else { return }
         controller.setModeParameter(speed: UInt8(speed))
+        onLookChanged?()
     }
 
     /// The blob stores the active stage as a **1-based ordinal over the enabled
