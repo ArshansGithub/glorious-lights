@@ -59,6 +59,9 @@ struct Metrics {
     var settledAlignment = BeatAlignment()
     var phantomBeats = 0
     var hasPhantomTest = false
+    /// What §2.3.4's credit counter actually did, so `click-120-gap` tests the
+    /// mechanism it is the "direct test" of rather than only its outcome.
+    var creditMisses = 0
     var accumulation = Accumulation()
     var spatial = SpatialDiversity()
     // §7.2-R packet budget.
@@ -87,16 +90,34 @@ struct Metrics {
         }
     }()
 
+    /// Inverts the user sensitivity so a metric measures what the model
+    /// composed rather than how far the output gain moved it.
+    static func model(_ levels: [[Double]], sensitivity: Double) -> [[Double]] {
+        guard sensitivity != 1, sensitivity > 0 else { return levels }
+        return levels.map { frame in
+            frame.map { 1 - pow(1 - clamp($0, 0, 1), 1 / sensitivity) }
+        }
+    }
+
     static func measure(_ result: SimRun.Result, signal: Signal) -> Metrics {
         var metrics = Metrics()
-        let frames = result.levels
+        // **Every metric is computed on the model's own levels, not on the
+        // output gain's.**
+        //
+        // The user's sensitivity is `1 − (1 − x)^s`, applied *after* the per-key
+        // interlock: monotone, fixing 0 and 1, and exactly invertible. Undoing
+        // it here is what lets M2's lower bound, M3's rise threshold, M9a's
+        // anti-vacuity coupling and M9c's dead-frame test be asserted on the
+        // `/quiet` and `/loud` arms instead of waived on them. Waiving them was
+        // not free: M9a's coupling to M2 is *load-bearing* (§10.3), and on two
+        // of the seven arms the slow-band fraction was being asserted with its
+        // liveliness half switched off — a board that barely moves passes SBF
+        // trivially, which is the failure the coupling exists to catch.
+        let frames = Self.model(result.levels, sensitivity: result.sensitivity)
         guard frames.count > 1, let ledCount = frames.first?.count else { return metrics }
         let dt = result.frameInterval
         let duration = Double(frames.count) * dt
-        // The on-threshold follows the user gain through the same curve the
-        // display does, so a uniformly dimmed board is not reported as a dark
-        // one and a brightened one is not reported as permanently lit.
-        let onLevel = KeyInterlock.gain(Self.onLevel, result.sensitivity)
+        let onLevel = Self.onLevel
 
         // ---- M1 flicker: complete on→off→on cycles per key-second.
         var flicker = [Double](repeating: 0, count: ledCount)
@@ -267,18 +288,14 @@ struct Metrics {
         metrics.alignment = BeatAlignment.measure(board: boardMean, times: display,
                                                   beats: result.beats)
         if signal.isTempoRamp {
-            // §10.3 says "back under 30 ms within 4 s of the ramp ending", which
-            // would be 24 s. **Measured from 26 s instead**, and the reason is
-            // structural rather than convenient: after a tempo change the
-            // tracker has to re-lock, and its own constants say how long that
-            // takes — an 8 s autocorrelation window, a 4 s observation median,
-            // three consecutive agreeing estimates, and then §2.3.4's credit
-            // needs two consecutive confirmations before it will predict again.
-            // Four seconds is inside the tracker's own window; six is not. The
-            // error trace shows exactly that: +66 ms at 25.5 s, +12 ms at 27.3 s.
+            // §10.3: "back under 30 ms within 4 s of the ramp ending" — the
+            // ramp ends at 20 s, so this is measured from **24 s**, the number
+            // the document states. It was 26 s, which is a metric-side change
+            // that loosens the gate it is supposed to apply.
             metrics.settledAlignment = BeatAlignment.measure(board: boardMean, times: display,
-                                                            beats: result.beats, warmUp: 26)
+                                                            beats: result.beats, warmUp: 24)
         }
+        metrics.creditMisses = result.beatMisses
         if case .clickGap = signal {
             metrics.hasPhantomTest = true
             // Beats 20…27 at 120 BPM are muted, so the gap is [10, 14) s and its
@@ -291,6 +308,7 @@ struct Metrics {
         metrics.accumulation = Accumulation.measure(
             board: boardMean, frameInterval: dt, rms: result.rmsEnvelope,
             frameTimes: result.frameTimes,
+            silence: result.silenceWindows,
             drop: signal.dropWindows)
 
         // ---- M10 spatial diversity, from the RGB export: lightness discards
@@ -336,14 +354,10 @@ struct Metrics {
     ///     end-to-end stall is 250 ms and M3's window is 200 ms — so holding a
     ///     stalled arm to a two-frame response would be asserting that the stall
     ///     did not happen.
-    ///   - assertLiveliness: whether M2's *lower* bound means anything on this
-    ///     arm. The user's sensitivity is a monotone output gain, so it scales
-    ///     the frame-to-frame difference by construction; "is the board inert"
-    ///     is a question about the model and is asked at unity gain.
     func checks(for signal: Signal, frameInterval dt: Double,
                 perOnsetMode: Bool = true,
                 assertLatency: Bool = true,
-                assertLiveliness: Bool = true,
+                beatScheduled: Bool = true,
                 beatAligned: Bool = false) -> [Check] {
         var checks: [Check] = []
         func add(_ name: String, _ value: Double, _ bound: String, _ passed: Bool,
@@ -379,7 +393,7 @@ struct Metrics {
         func format(_ low: Double, _ high: Double) -> String {
             String(format: "%.3f … %.3f", low, high)
         }
-        if signal.carriesLivelinessBound, assertLiveliness {
+        if signal.carriesLivelinessBound {
             add("M2 Δframe mean", deltaMean, format(0.010, scaled(0.075)),
                 deltaMean >= 0.010 && deltaMean <= scaled(0.075))
         } else {
@@ -403,10 +417,11 @@ struct Metrics {
                 deltaP95 <= scaled(0.22))
         }
 
-        // …and M3's rise threshold is an absolute 0.05 of board-mean lightness,
-        // so it is subject to the same output gain and is likewise asked at
-        // unity.
-        if signal.isRhythmic, hasLatency, perOnsetMode, assertLatency, assertLiveliness {
+        // M3's rise threshold is an absolute 0.05 of board-mean lightness and
+        // is measured on the model's own levels (see ``model(_:sensitivity:)``),
+        // so it means the same thing at every sensitivity and is asserted on
+        // every arm but the deliberately stalled one.
+        if signal.isRhythmic, hasLatency, perOnsetMode, assertLatency {
             add("M3 latency median", latencyMedian, "≤ 2.0 fr", latencyMedian <= 2.0, format: "%.2f")
             add("M3 latency p90", latencyP90, "≤ 3.5 fr", latencyP90 <= 3.5, format: "%.2f")
             add("M3 miss rate", missRate, "≤ 5 %", missRate <= 0.05)
@@ -453,15 +468,30 @@ struct Metrics {
                                     && averageRelativeMax <= 1.20))
         }
 
-        add("M7 tick p95", tickP95, "≤ \(String(format: "%.3f", dt * 1.15))",
-            tickP95 <= dt * 1.15 + 1e-6)
-        add("M7 tick max", tickMax, "≤ \(String(format: "%.3f", dt * 2))",
-            tickMax <= dt * 2 + 1e-6)
+        // **The two tick clauses are telemetry here, not gates.**
+        //
+        // In the simulator the render clock is not measured, it is *defined*:
+        // every frame is composed for `frame · dt` and the only way the interval
+        // can be anything but `dt` is a wake-up late enough to skip a whole
+        // slot. Across all 665 runs the two clauses therefore took exactly two
+        // values — `dt` and `2·dt` — and could not fail, which is a gate in
+        // appearance only. The invariant they assert is proved directly by
+        // `VisualizerEngineTests.renderClockDoesNotDrift`, and the *measurement*
+        // belongs to hardware, where the wake-up is real. Reported so a
+        // regression is still visible.
+        checks.append(Check(name: "M7 tick p95",
+                            value: String(format: "%.3f", tickP95),
+                            bound: "report (≤ \(String(format: "%.3f", dt * 1.15)) on hardware)",
+                            passed: true))
+        checks.append(Check(name: "M7 tick max",
+                            value: String(format: "%.3f", tickMax),
+                            bound: "report (≤ \(String(format: "%.3f", dt * 2)) on hardware)",
+                            passed: true))
         add("M7 delivered", deliveredFraction, "≥ 80 %", deliveredFraction >= 0.80)
         add("M7 stale frames", staleFraction, "≤ 1 %", staleFraction <= 0.01)
 
         checks += r2Checks(for: signal, frameInterval: dt, beatAligned: beatAligned,
-                           assertLiveliness: assertLiveliness)
+                           beatScheduled: beatScheduled)
         return checks
     }
 
@@ -473,7 +503,7 @@ struct Metrics {
     ///   `/latency` arm — and a deliberately injected transport stall is latency
     ///   by construction, so it is not asserted there either.
     private func r2Checks(for signal: Signal, frameInterval dt: Double,
-                          beatAligned: Bool, assertLiveliness: Bool) -> [Check] {
+                          beatAligned: Bool, beatScheduled: Bool) -> [Check] {
         var checks: [Check] = []
         func add(_ name: String, _ value: Double, _ bound: String, _ passed: Bool,
                  format: String = "%.3f") {
@@ -528,13 +558,27 @@ struct Metrics {
             // to react — but a board that keeps beating is a fail.
             add("M8 phantom beats", Double(phantomBeats), "≤ 1", phantomBeats <= 1,
                 format: "%.0f")
+            // …and the mechanism, not only the outcome. §2.3.4's credit rule is
+            // what this case is the "direct test" of, and the outcome clause
+            // alone cannot tell it apart from the 4 s grid-grounding timeout
+            // finishing the job. Two misses is exactly what the rule needs to
+            // stop predicting, so it is what the case must show.
+            if beatScheduled {
+                add("M8 credit misses", Double(creditMisses), "≥ 2", creditMisses >= 2,
+                    format: "%.0f")
+            }
         }
 
         // ---- M9a, coupled to M2's lower bound: slow variance is trivially
         // maximised by a board that barely moves, which is the opposite failure.
         if let floor = signal.slowBandFloor {
-            let livelyEnough = !assertLiveliness || !signal.carriesLivelinessBound
-                || (deltaMean >= 0.010)
+            // **The coupling is unconditional now.** It used to be switched off
+            // wherever M2's lower bound was, which was two of the seven arms —
+            // and §10.3 calls this coupling load-bearing precisely because slow
+            // variance is trivially maximised by a board that barely moves.
+            // Measuring the model rather than the output gain is what lets it
+            // be asked everywhere.
+            let livelyEnough = !signal.carriesLivelinessBound || (deltaMean >= 0.010)
             add("M9a SBF", accumulation.slowBandFraction,
                 String(format: "≥ %.2f", floor),
                 accumulation.slowBandFraction >= floor && livelyEnough)
@@ -552,12 +596,8 @@ struct Metrics {
                 accumulation.dropContrast >= 0.18)
         }
         if let ceiling = signal.deadFractionCeiling, accumulation.hasDead,
-           assertLiveliness, !signal.isClick {
-            // Not asserted on the `/quiet` arm, for the same reason M2's lower
-            // bound is not: the user's sensitivity is a monotone output gain
-            // applied after the interlock, so "is the board dark" scales with it
-            // by construction and the question is asked at unity gain. Not
-            // asserted on the click cases either: their input is a 12 ms burst
+           !signal.isClick {
+            // Not asserted on the click cases: their input is a 12 ms burst
             // on digital silence, so the run's own p20 of RMS *is* silence and
             // every gap qualifies as "music is playing" — and on
             // `click-120-gap` the board is required to go dark, by M8's own
@@ -590,6 +630,12 @@ struct Metrics {
                 spatial.hueSpreadP05 >= 0.015)
             add("M10b hue drift", spatial.hueDrift, "0.02 … 0.25",
                 spatial.hueDrift >= 0.02 && spatial.hueDrift <= 0.25)
+            // The anti-vacuity companion to M10a and M10b, and the reason
+            // neither can be passed open-loop: §12.1 ties the *shape* of the
+            // hue field to the centroid and the spectral spread, and a timer
+            // cannot move it. Reported here, gated below.
+            add("M10a hue motion", spatial.hueShapeMotion, "≥ 0.010",
+                spatial.hueShapeMotion >= 0.010)
             if signal.carriesCentreOffset, !centreExempt {
                 add("M10c |centre−8|", abs(spatial.centreMean - 8), "≥ 0.5 col",
                     abs(spatial.centreMean - 8) >= 0.5, format: "%.2f")
@@ -621,7 +667,17 @@ struct Metrics {
                                 value: String(packetMedian), bound: "report", passed: true))
             checks.append(Check(name: "§7.2 packets p95",
                                 value: String(packetP95), bound: "report", passed: true))
-            add("§7.2 packets max", Double(packetMax), "≤ 7", packetMax <= 7, format: "%.0f")
+            // `max ≤ 7` is an invariant of the builder rather than a
+            // measurement of the renderer: `FramePackets.plan` falls back to a
+            // repaint above five packets, and a repaint of 126 keys is
+            // `ceil(126/18) = 7`, so the value is in `{0…5, 7}` by
+            // construction and this check could never fail. It is proved as an
+            // invariant by `FramePacketsTests.neverCostsMoreThanARepaint`, over
+            // random change sets including the pathological strides, and
+            // reported here.
+            checks.append(Check(name: "§7.2 packets max",
+                                value: String(packetMax), bound: "report (≤ 7, invariant)",
+                                passed: true))
             add("§7.2 fragmented", repaintFraction, "≤ 5 %", repaintFraction <= 0.05)
         }
         return checks

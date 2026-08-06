@@ -205,9 +205,8 @@ struct BatteryArm {
     var jitter: Double = 0
     var sensitivity: Double = 1
     var stall: (length: Double, rate: Double)?
-    /// See ``Metrics/checks(for:frameInterval:perOnsetMode:assertLatency:assertLiveliness:beatAligned:)``.
+    /// See ``Metrics/checks(for:frameInterval:perOnsetMode:assertLatency:beatAligned:)``.
     var assertLatency = true
-    var assertLiveliness = true
     /// The display-side delay, seconds. M8 is asserted only where this is
     /// non-zero.
     var outputLatency: Double = 0
@@ -222,9 +221,15 @@ let batteryArms: [BatteryArm] = [
     BatteryArm(name: "/jitter", fps: fps, jitter: batteryJitter),
     BatteryArm(name: "/stall", fps: fps, stall: (0.200, 0.5), assertLatency: false),
     BatteryArm(name: "/15fps", fps: 15),
-    BatteryArm(name: "/quiet", fps: fps, sensitivity: 0.5, assertLiveliness: false),
-    BatteryArm(name: "/loud", fps: fps, sensitivity: 2.0, assertLiveliness: false),
-    BatteryArm(name: "/latency", fps: fps, outputLatency: batteryOutputLatency),
+    BatteryArm(name: "/quiet", fps: fps, sensitivity: 0.5),
+    BatteryArm(name: "/loud", fps: fps, sensitivity: 2.0),
+    // **The `/latency` arm carries the measured jitter too.** With a perfectly
+    // regular wake-up the engine's `L̂` is handed the arm's own constant with no
+    // estimation error at all, and M8's `sd(e)` — "the important one" — would be
+    // measuring a scheduler that knows the future. The jitter is what gives the
+    // latency estimate the variance the hardware has.
+    BatteryArm(name: "/latency", fps: fps, jitter: batteryJitter,
+               outputLatency: batteryOutputLatency),
 ]
 
 if battery {
@@ -275,7 +280,7 @@ if battery {
                 for: job.signal, frameInterval: result.frameInterval,
                 perOnsetMode: job.mode == .pulse || job.mode == .ripple,
                 assertLatency: job.arm.assertLatency,
-                assertLiveliness: job.arm.assertLiveliness,
+                beatScheduled: job.mode.isBeatScheduled,
                 beatAligned: job.arm.outputLatency > 0 && job.arm.stall == nil
                     && job.mode.isBeatScheduled)
             resultsLock.lock()
@@ -437,6 +442,7 @@ report += "\n      first: "
 report += "\n\n    metrics\n"
 for check in metrics.checks(for: signal, frameInterval: result.frameInterval,
                             perOnsetMode: mode == .pulse || mode == .ripple,
+                            beatScheduled: mode.isBeatScheduled,
                             beatAligned: outputLatencyMilliseconds > 0
                                 && mode.isBeatScheduled) {
     report += String(format: "      %-24@ %-10@ %-16@ %@\n",

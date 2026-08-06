@@ -52,10 +52,30 @@ public struct EnergyModel: Sendable {
     /// this section exists to remove, wearing a different hat. 18 dB is the
     /// crest factor §10.1 specifies for `ballad-72`, i.e. the programme range of
     /// sparse acoustic material; below it a master reads flat, which is what
-    /// §11.1 asks for. Measured across the battery it is also where
-    /// `build-drop`'s correlations peak (ρ_slow 0.85 at 18 dB, 0.61 at 6 dB,
-    /// 0.85 at 30 dB) without making quiet material inert (`ballad-72`'s
-    /// frame-to-frame difference falls under M2's floor at 30 dB).
+    /// §11.1 asks for.
+    ///
+    /// **What this actually measures at HEAD**, replacing a comment that quoted
+    /// figures the build does not produce: `build-drop/pulse` scores ρ_slow
+    /// **0.725** and ρ_build **0.652** against bounds of 0.80 and 0.60, and
+    /// `crescendo/pulse` scores ρ_slow **0.218**. The earlier "ρ_slow 0.85 at
+    /// 18 dB" was not reproducible — every one of the battery's seventy ρ_slow
+    /// checks fails at HEAD — and a normative-looking justification that states
+    /// a measurement the build does not produce is worse than no justification.
+    ///
+    /// The residual on `crescendo` is **structural, not a tuning error**, and it
+    /// is worth writing down so nobody sweeps this constant again looking for
+    /// it. `E` is `(Λ − R_lo) / max(R_hi − R_lo, floor)` with `R_lo` a slow p05,
+    /// so on a *monotone* ramp the numerator grows with the material while the
+    /// divisor is pinned at the floor: `E` therefore saturates exactly `floor`
+    /// decibels above where the ramp started. `crescendo`'s RMS envelope spans
+    /// 66 dB, so at 18 dB the board reaches full three quarters of the way
+    /// through the rise and is flat for the rest. Widening the floor fixes
+    /// `crescendo` and costs `build-drop` its `dropContrast` (a 20 dB build
+    /// would then use a fifth of the range); narrowing it does the reverse. And
+    /// letting `R_hi` chase the ramp — the other lever — makes `E ≡ 1` for the
+    /// whole rise, which is §11.0's "normalised while it is happening" defect
+    /// arriving by a different route. No single value of this constant satisfies
+    /// both cases; see §10.5.
     public static let dynamicRangeFloor: Double = 18.0
 
     /// PHRASE ballistics. **The hold is the anti-cliff term at this timescale**:
@@ -214,10 +234,33 @@ public struct EnergyModel: Sendable {
         // level legitimately enters (§3.3's clamped AGC), so it is what the
         // ramp-out belongs on. Any open-gate hop resets the timer instantly:
         // rise is unrestricted, only the fall is held back.
+        // **…and by `E` *and* `Σ` together, which is what a room floor trips.**
+        //
+        // Gating on the master gate alone leaves a hole the size of a quiet
+        // room. The gate is `smoothstep(0.018, 0.030, rmsPeak · gain)` with the
+        // AGC gain clamped at 16×, so it decides "is anything playing" inside a
+        // 4.4 dB window centred on −57 dBFS: a −45 dBFS noise floor — where a
+        // microphone in a quiet room actually sits — reads 0.09 through it and
+        // is therefore "music". Measured on 20 s of 128 BPM material followed by
+        // a noise tail, the board went dark, *relit*, and then held a board mean
+        // of 0.10 indefinitely on nothing but room tone.
+        //
+        // `E < 0.05` alone is §11.3's literal condition and cannot be used
+        // alone either: `E` is a percentile of the last sixty seconds, so a
+        // passage that is genuinely playing but quiet sits at `E ≈ 0` by
+        // construction, and `cut-transitions`' five seconds of −34 dBFS piano
+        // ramped itself to black while the music was audible.
+        //
+        // `Σ` is what separates the two, and it is separated by the mechanism
+        // §11.3 already specifies rather than by a new threshold: SECTION falls
+        // with τ = 20 s and is rate-limited to 0.25 per second, so five seconds
+        // of quiet piano *cannot* pull it under ``quietLevel`` while a minute of
+        // room tone certainly does. Quiet music keeps its section; a room does
+        // not have one.
         if !hasOpened {
             silentFor = 0
             silenceRamp = 0
-        } else if !gateOpen, energy < Self.silenceLevel {
+        } else if !gateOpen || (energy < Self.silenceLevel && sectionValue < Self.quietLevel) {
             silentFor += dt
             silenceRamp = smoothstep(Self.silenceRampStart, Self.silenceRampEnd, silentFor)
         } else {
@@ -309,16 +352,30 @@ public struct Composition: Equatable, Sendable {
     /// §11.4 promises "board-mean lightness ≥ 0.09 · mean_x shape ≥ 0.06,
     /// which is M9c's floor", and deliberately makes it a board-mean rather than
     /// a per-key floor so that M1 and M4 keep measuring the model. But §6.3's
-    /// interlock will not *light* a key until the composed level exceeds 0.14,
-    /// so a bed of 0.09 × a shape of ~0.9 reaches the board as exactly nothing:
-    /// the promise cannot be kept by a number below the threshold that decides
-    /// whether anything is shown at all. Measured with 0.09, `cut-transitions`
-    /// went completely black for the five seconds of quiet piano in each half —
-    /// 26 % of the frames in which the ground truth says music is playing, on a
-    /// bound of 5 % — which is the user's own complaint about quiet material,
-    /// not a metric artefact. 0.16 is the smallest value that clears the
-    /// interlock through the shallowest `shape` any mode uses.
-    public static let bedFloor: Double = 0.16          // B0
+    /// interlock will not *light* a key until the composed level exceeds 0.14.
+    ///
+    /// **It is 0.09, the document's own number, and the 0.16 it replaces was a
+    /// defect rather than a deviation.** A bed of 0.16 sits *above* §6.3's 0.14
+    /// rise threshold, which makes it a **per-key floor** — the one thing
+    /// §11.4 property 1 forbids in as many words: "a per-key floor above the
+    /// interlock's 0.14 rise threshold would make M1 and M4 vacuous — the exact
+    /// circularity `ModeRenderer` was already corrected for once." It did. On
+    /// `edm-128/pulse`, 83 mapped LEDs produced 83 on/off transitions in a 30 s
+    /// run — one each, every key lighting once and never going out — so M1 read
+    /// 0.000 in 665 runs out of 665 and M4's on-duration median read the length
+    /// of the run. Two whole metric families, 2 275 checks, asserted nothing.
+    ///
+    /// The same number was also what kept the board glowing on room tone: with
+    /// the bed alone above the rise threshold, a −45 dBFS noise floor lit every
+    /// key to a board mean of 0.10 and held it there indefinitely.
+    ///
+    /// What 0.16 was really compensating for was a *second* defect, in the
+    /// interlock: a held key's output was snapped up to the rise threshold, so
+    /// the bed had to clear 0.14 to be seen at all. §6.3 says the interlock "is
+    /// a filter, not a source: it cannot create light that the model did not ask
+    /// for", and snapping is precisely creating it. With the snap gone the bed
+    /// is displayed at the level the model composed, and 0.09 works as written.
+    public static let bedFloor: Double = 0.09          // B0
     public static let bedScale: Double = 0.15          // B1
     public static let swellScale: Double = 0.55        // S1
     public static let swellReference: Double = 0.85    // k

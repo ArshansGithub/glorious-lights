@@ -185,7 +185,7 @@ public struct KeyHold: Equatable, Sendable {
         // Rising is unbounded — attacks must stay instant. Falling is rate
         // limited, and while the key is held on it cannot fall below the level
         // at which the model said it was lit.
-        let desired = lit ? max(x, Self.riseThreshold) : 0
+        let desired = lit ? x : 0
         if desired >= displayed {
             displayed = desired
         } else {

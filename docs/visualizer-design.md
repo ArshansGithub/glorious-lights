@@ -948,6 +948,7 @@ Rules, evaluated per key per frame against the composed level `x ∈ [0,1]`:
 | slew limit (down) | ≤ `1/0.200` per second | a key cannot fall from full to black faster than 200 ms |
 | slew limit (up) | unbounded | attacks must stay instant (P4/§4.1) |
 | snap-to-zero | none | fades to zero via the ramp; there is no epsilon cliff |
+| **snap-to-threshold** | **none** | a held key shows the level the model composed, never the rise threshold. Clarified in r2.1: the implementation displayed `max(x, 0.14)` while lit, which *creates light the model did not ask for* — and, because 0.14 sits above M1 and M4's 0.10 on-level, it also made both metrics unfailable |
 
 The minimum on-time and off-time together give a **hard ceiling of 4 on→off→on
 transitions per key-second** (one full cycle needs ≥150+100 = 250 ms). The
@@ -1426,9 +1427,26 @@ one-bar stop, a badly gain-staged verse — none of them can collapse the bed.
 Additionally `Σ` is rate-limited to a fall of **0.25 per second** at all times,
 so even the accelerated path takes ≥ 4 s from full to zero.
 
-**True silence still darkens the board.** Once the gate has opened, if
-`E < 0.05` continuously for `T_silence = 4.0 s`, a ramp-out multiplier is
-applied to the whole composition:
+**True silence still darkens the board.** Once the gate has opened, if the
+master gate is closed **or** `E < 0.05` *and* `Σ < 0.15` continuously for
+`T_silence = 4.0 s`, a ramp-out multiplier is applied to the whole composition:
+
+*(Amended in r2.1. `E < 0.05` alone cannot be the condition: `E` is a percentile
+of the last sixty seconds, so a passage that is genuinely playing but quiet sits
+at `E ≈ 0` by construction, and `cut-transitions`' five seconds of −34 dBFS
+piano ramped itself to black while the music was audible — 26 % of the frames the
+ground truth calls playing, against a 5 % bound. The master gate alone cannot be
+the condition either: it is `smoothstep(0.018, 0.030, rms·gain)` with the AGC
+gain clamped at 16×, so it decides "is anything playing" inside a 4.4 dB window
+centred on −57 dBFS, and a −45 dBFS room-tone floor — where a microphone in a
+quiet room actually sits — reads as music. Measured, the board went dark,
+**relit**, and held a board mean of 0.10 indefinitely on nothing but room tone.
+`Σ` is what separates the two, using the mechanism this section already
+specifies rather than a new threshold: SECTION falls with τ = 20 s and is
+rate-limited to 0.25 per second, so five seconds of quiet piano cannot pull it
+under `quietLevel` while a minute of room tone certainly does. Quiet music keeps
+its section; a room does not have one. The new `music-then-room` case in §10.1 is
+what asserts this.)*
 
 ```
 outAmount = smoothstep(4.0, 8.0, secondsSinceContinuousSilence)     // 0 → 1
@@ -1687,6 +1705,12 @@ unless stated.
 | `click-90-ramp` | 90 BPM for 10 s, ramping linearly to 100 BPM over 10 s, then 100 BPM for 10 s | prediction must not overshoot on a tempo change; the ±2 %/beat rate limit is exercised here |
 | `click-120-gap` | `click-120` with beats 21–28 muted (4 s of silence mid-run) | **phantom-gesture test.** §2.3.4's credit rule must stop the board beating through the gap |
 | `build-drop` | 128 BPM: 8 s filtered intro → 16 s build (kick + rising noise sweep, RMS rising ~18 dB monotonically) → 1 s pre-drop silence → 12 s full-energy drop → 8 s breakdown. 45 s | **M9's main case.** The generator emits its own per-hop RMS as ground truth |
+
+**New case (r2.1):**
+
+| id | signal | what it catches |
+|---|---|---|
+| `music-then-room` | 20 s of 128 BPM four-on-the-floor, then 55 s of −45 dBFS room tone. 75 s | **M9c's silence complement.** The clause "board-mean ≤ 0.03 after 10 s of silence" was emitted **zero** times in 13 138 checks: `cut-transitions`' silences are 0.5 s and the clause needs ten seconds, so `DeadFrac` ran entirely uncoupled and a board glowing on room noise passed the whole table. −45 dBFS, not `near-silence`'s −60: the AGC's own gain clamp already decides −60 dBFS, and the question is what happens in the 15 dB above it |
 
 `build-drop` is the case r1 has no answer to at all, and it is deliberately not
 a synthetic abstraction: it is the shape of the material the user was listening
@@ -2002,6 +2026,28 @@ circular standard deviation.
 * **`p05_f σ_h ≥ 0.015`** — no frame may be monochrome.
 * r1 scores **≈ 0** here by construction: one hue for the whole board.
 
+**M10a hue motion `μ_h` — the anti-vacuity companion (new in r2.1), and it is a
+coupling, not an independent row.**
+
+> Per frame, let `h(x,f)` be column `x`'s brightness-weighted circular mean hue
+> and `p(x,f) = wrap(h(x,f) − mean_x h)` the frame's hue *profile* — the shape of
+> the field with the palette's own rotation removed. Let `p̄(x)` be the circular
+> mean profile over the run. Then
+> ```
+> μ_h = median_f  sqrt( mean_x wrap(p(x,f) − p̄(x))² )
+> ```
+> **Bound: `μ_h ≥ 0.010` turns** on every case M10a applies to.
+
+Why it is load-bearing: **M10a and M10b can both be passed with no audio input at
+all.** A board built from a static ±0.30-turn hue gradient plus §12.1's constant
+`1/180` turn-per-second clock — literally `H0` and `A·G` with the music taken
+out — scores `median σ_h` 0.091, `p05` 0.079 and hue drift 0.048 through the
+shipped measurement, i.e. it passes M10a and M10b outright. What that board
+cannot do is change the *shape* of the gradient, and §12.1 makes the shape
+follow the music twice over: the boundary `x_c` is the spectral centroid and the
+fan width `A` is the spectral spread. `μ_h` is exactly zero for any hue field
+that is a fixed function of column, however fast the palette rotates.
+
 **M10b — hue must also move in time, but not spin.**
 
 > `sd over time of the brightness-weighted circular mean hue`, over a 30 s
@@ -2075,18 +2121,21 @@ circular standard deviation.
 | **M9d τ_mem** | reported, expect ≥ 1.5 s | all — diagnostic only |
 | **M10a median σ_h** | **0.035 … 0.20 turns** (≥ 0.055 on edm-128, spectrum) | musical cases |
 | **M10a p05 σ_h** | **≥ 0.015 turns** | musical cases |
+| **M10a hue motion μ_h** | **≥ 0.010 turns** | musical cases — *the anti-vacuity coupling for M10a and M10b* |
 | **M10b hue drift sd** | **0.02 … 0.25 turns** | musical cases |
 | **M10c \|mean x̄ − 8\|** | **≥ 0.5 col** | pulse, ripple, spectrum (VU exempt) |
 | **M10c sd(x̄)** | **≥ 1.5 col** | all musical, all modes |
 | **M10c p95−p05(x̄)** | **≥ 4.0 col** | all musical, all modes |
 | **M10d column starvation** | **0.5× … 1.8× the column mean** | all musical, all modes |
-| **§7.2-R packets/frame** | median ≤ 2, p95 ≤ 4, max ≤ 7, fallback ≤ 5 % | sim + hardware |
+| **§7.2-R packets/frame** | median ≤ 2, p95 ≤ 4, **max ≤ 7 (invariant, unit-tested)**, fallback ≤ 5 % | sim + hardware |
+| **M8 credit misses** | **≥ 2** — §2.3.4's counter must be what stopped the board | `click-120-gap` |
+| **M9c silence complement** | board-mean ≤ 0.03, 10 s into a ground-truth silence | `music-then-room` |
 
-`viz-sim --battery` runs the full matrix (**19** signals × 5 modes × **7** arms)
+`viz-sim --battery` runs the full matrix (**20** signals × 5 modes × **7** arms)
 and prints a pass/fail table. It is a CI gate: a change that
 regresses any bound is rejected regardless of how it looks on any one track.
 
-**Three anti-vacuity couplings are load-bearing and must be implemented as
+**Five anti-vacuity couplings are load-bearing and must be implemented as
 couplings, not as independent rows** — an implementer who evaluates them
 separately can satisfy every bound with a board nobody wants to look at:
 
@@ -2096,9 +2145,37 @@ separately can satisfy every bound with a board nobody wants to look at:
    parked-bright-spot does the reverse.
 3. **M8 requires the gestures-per-beat floor.** A flat board has perfect beat
    alignment because it has no beats.
+4. **M10a and M10b require `μ_h`** (added in r2.1). Both are satisfied by a
+   static gradient on a timer, with the audio disconnected.
+5. **M9c's `DeadFrac` requires its silence complement**, and the complement must
+   be *emitted*: a bound that no case in the battery can reach is not a coupling,
+   it is a comment. `music-then-room` exists for this and for nothing else.
+
+**And the couplings must be asserted on every arm.** M9a's coupling to M2 was
+switched off wherever M2's lower bound was, which was the `/quiet` and `/loud`
+arms — so on two arms in seven the slow-band fraction was asserted with its
+liveliness half missing. The user's sensitivity is `1 − (1 − x)^s`, monotone and
+exactly invertible, so the fix is to measure the *model's* levels rather than the
+output gain's: `viz-sim` inverts the curve before computing any metric, and M2's
+lower bound, M3's rise threshold, M9a's coupling and M9c are then asked
+everywhere.
 
 Equally, the r1 couplings still stand: M1/M4 must keep measuring the *model*,
 which is why §11.4's bed guarantee is a board-mean and not a per-key floor.
+
+**Two bounds are invariants, not measurements, and are reported rather than
+gated in `viz-sim` (r2.1).** A check that cannot fail is not a gate:
+
+* **M7's two tick clauses.** In the simulator the render clock is not measured,
+  it is *defined* — every frame is composed for `frame · dt_f` — so across 665
+  runs the interval took exactly two values, `dt_f` and `2·dt_f`, and neither
+  bound could ever fail. The clauses stay normative **on hardware**, where the
+  wake-up is real; in the simulator they are telemetry, and the invariant is
+  proved directly by a unit test.
+* **§7.2-R's `max ≤ 7`.** `FramePackets.plan` falls back to a repaint above five
+  packets and a repaint of 126 keys is `ceil(126/18) = 7`, so the value lies in
+  `{0…5, 7}` by construction. Proved as an invariant over random change sets
+  including the pathological strides, and reported here.
 
 ### 10.4 What the metrics do NOT cover
 
@@ -2159,6 +2236,44 @@ watching `animation.mp4` and the hardware.
    music; it is not measured. Once §11 ships, the falsifiable follow-up is
    whether varying `Φ`'s release between 0.8 s and 3 s changes the verdict, and
    the answer belongs in this document rather than in a commit message.
+
+**Open gaps added in r2.1** — these are places where two clauses of *this
+document* are in tension, found by making the metrics able to fail. None of them
+is a tuning error and none should be swept for again without reading this first.
+
+8. **`E`'s single dynamic-range floor cannot serve both `crescendo` and
+   `build-drop`.** `E = (Λ − R_lo)/max(R_hi − R_lo, floor)` with a slow `R_lo`
+   saturates exactly `floor` decibels above where a monotone rise started.
+   `crescendo`'s RMS envelope spans 66 dB and `build-drop`'s spans 20 dB, so
+   `crescendo` needs a wide floor and `build-drop`'s `dropContrast ≥ 0.18` needs
+   a narrow one. Letting `R_hi` chase the ramp instead makes `E ≡ 1` for the
+   whole rise — §11.0's own defect by another route — because *no causal
+   percentile normaliser can represent a monotone ramp*. Measured at HEAD:
+   `crescendo/pulse` ρ_slow 0.218, `build-drop/pulse` ρ_slow 0.725, against
+   0.80. Either M9b's bound on `crescendo` is a claim P1 cannot support, or `E`
+   needs a second, non-percentile reference. This has to be settled in the
+   design before it is settled in a constant.
+9. **M9a's `SBF ≥ 0.35` on `edm-128` and `dnb-174` asks a strictly periodic loop
+   to produce sub-0.5 Hz power.** Both generators repeat exactly every one or two
+   beats — 1.07 Hz and above — so their input contains no energy below 0.5 Hz at
+   all, and a display that tracked them perfectly would score near zero. The
+   bound is well posed on `crescendo` and `build-drop`, which have structure; on
+   the two steady loops it is asking the board to invent some. Measured at HEAD:
+   `edm-128/pulse` 0.153, `dnb-174` 0.044.
+10. **M10c's `sd(x̄) ≥ 1.5` columns is stated for every mode, including the two
+    whose identity is to be symmetric.** `pulse` is "the board breathes" and `vu`
+    is a centre-out meter; both have a brightness centre of mass pinned near
+    column 8 by construction, and §12.4's own `shape` — a 25 % tilt across 16
+    columns — can move it by at most ±0.4. Reaching 1.5 requires the accent to
+    carry roughly half the board's light, which is a different mode. Measured at
+    HEAD: 230 of 245 checks fail, values 0.31–2.17.
+11. **M1/M4's on-level (0.10) sits between the interlock's fall (0.06) and rise
+    (0.14) thresholds**, so "lit" and "on" are not the same predicate: a key the
+    interlock is holding can be measured off, and §6.3's minimum on-time
+    therefore does *not* guarantee M4's `p10 ≥ 0.15 s` the way §10.2 says it
+    does. Closing the gap means moving one of the three numbers, and which one is
+    a design question: 0.10 in linear lightness is PWM code 2 of 255, i.e. all
+    three thresholds describe a nearly-black key.
 
 ---
 
@@ -2255,6 +2370,21 @@ constants, wire-format constants, and dimensionless ratios.
 | pulse shape | `1 − 0.25 · abs(x − x_c(t)) / 16` | 12.4 |
 | column uniformity band | 0.5× … 1.8× the column mean | 12.5 |
 | simulated output latency | 12 ms (`/latency` arm) | 10.1 |
+
+**Added in r2.1 — constants the implementation introduced and this table did
+not name.** Every one of them was in the code and in none of the deviation
+tables; a constant that is not in Appendix A is a constant nobody can audit.
+
+| symbol | value | § | why it is not in the r2 table above |
+|---|---|---|---|
+| energy dynamic-range floor | **18 dB**, not §11.1's 6 dB | 11.1 | at 6 dB `E` saturates six decibels above the noise floor and carries no dynamics at all. See §10.5 gap 6: no single value satisfies both `crescendo` and `build-drop` |
+| energy reference max range | 40 dB (`R_lo ≥ R_hi − 40`) | 11.1 | a p05 falls nineteen times faster than it rises, so one stretch of digital silence pins the floor for minutes and `E` reads 1.000 for ever. A ratio between two observed quantities, so P1 holds |
+| energy soft knee | starts at 0.5 of the span | 11.1 | §11.1 writes a hard clamp; a clamp makes every level above p95 identical, which is the failure §11 exists to remove |
+| accent context gain | `0.70 + 0.30·Φ` | 11.4 | §11.4 scales the accent by `headroom`, which *shrinks* as the section gets loud, so a soft intro kick painted the same board as a drop kick and `dropContrast` measured 0.05 |
+| pulse gesture crest | σ = 3.0 columns, pedestal 0.40 | 12.4 | §12.4 specifies pulse's `shape` and says nothing about the gesture's own kernel. The pedestal is what keeps "the board breathes" true while the crest carries the register |
+| VU arm bed floor | 0.62 (not 0.45) | 12.4 | a meter that only occasionally reaches its outermost columns starves them, and M10d bounds every column to 0.5…1.8× the board's own column mean |
+| M8 warm-up | 8 s | 10.2 | §2.3's tracker autocorrelates over 8 s and requires three agreeing estimates; alignment measured before any of that is the lock-in transient |
+| M10a hue motion floor | 0.010 turns | 10.2 | new in r2.1 — the anti-vacuity companion to M10a and M10b, below |
 
 ## Appendix B — migration order
 

@@ -67,6 +67,8 @@ struct SimRun {
         var beats: [Double] = []
         /// The generator's own RMS envelope, for M9b and M9c.
         var rmsEnvelope: [(time: Double, rms: Double)] = []
+        /// Ground-truth silence windows, for M9c's complement.
+        var silenceWindows: [ClosedRange<Double>] = []
         /// §7.2-R: colour packets per delivered frame, and how many frames fell
         /// back to a full repaint. Produced by running the real
         /// ``FramePackets/plan(for:lastSent:)`` over consecutive frames, which is
@@ -98,6 +100,7 @@ struct SimRun {
         result.events = track.events
         result.beats = track.beats
         result.rmsEnvelope = track.rmsEnvelope
+        result.silenceWindows = track.silenceWindows
         result.frameInterval = engine.frameInterval
         result.sensitivity = sensitivity
 
@@ -115,8 +118,18 @@ struct SimRun {
         var energies: [Double] = []
         var sigmas: [Double] = []
         var published: [Double] = []
+        let dumpEnergy = ProcessInfo.processInfo.environment["VIZ_E"] != nil
+        if dumpEnergy {
+            for point in track.rmsEnvelope {
+                print(String(format: "R %7.3f %.8f", point.time, point.rms))
+            }
+        }
         engine.bus.onPublish = { state, onsets in
             detected += onsets
+            if dumpEnergy {
+                print(String(format: "E %7.3f %.4f %.4f %.4f", state.time,
+                             state.energy, state.phrase, state.section))
+            }
             // The first five seconds are the warm-up the design explicitly
             // allows for; M6 is a claim about steady state.
             if state.time >= 5 {
@@ -184,9 +197,20 @@ struct SimRun {
 
             // The transport's contribution to `L̂`, reported before the frame
             // that will use it is composed. On hardware this comes from the
-            // echoed `END`; here it is the arm's own injected delay, which is
-            // the same quantity measured the same way (§8.2-R).
-            engine.reportDelivery(lag: outputLatency)
+            // echoed `END` and is `systemUptime − frame.scheduledFor`, so it
+            // carries compose time and USB variance and the scheduler is
+            // therefore working from an *estimate*.
+            //
+            // Reporting the arm's constant `outputLatency` here handed the
+            // scheduler the true latency with zero estimation error on every
+            // frame, which is not a pipeline the hardware has: M8's `sd(e)`
+            // would then be a claim the simulator cannot support. What is
+            // reported instead is the lag this frame's delivery actually
+            // suffered — the display's own late wake-up and, mid-stall, the
+            // stall itself — measured the same way the app measures it.
+            let lateness = max(0, wake - scheduled)
+            engine.reportDelivery(lag: outputLatency + lateness
+                                  + (stalled ? (stall?.length ?? 0) : 0))
             let colors = engine.renderFrame(at: scheduled)
             result.tickIntervals.append(scheduled - lastComposed)
             lastComposed = scheduled

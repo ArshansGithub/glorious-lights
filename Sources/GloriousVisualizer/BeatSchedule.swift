@@ -168,8 +168,24 @@ public struct BeatSchedule: Sendable {
         // seconds after the last onset, and the board must not go on beating at
         // a tempo the music has stopped playing.
         guard state.tempo.bpm > 0, state.tempo.gridWeight > 0 else {
+            // **A prediction that is abandoned is still a prediction that was
+            // not confirmed.** Clearing the slots silently meant the credit
+            // counter never saw the failure, so on `click-120-gap` — the case
+            // that exists to test §2.3.4 — the whole four-second gap produced
+            // *one* miss against eight muted beats, and what actually stopped
+            // the board was the grid-grounding timeout rather than the credit
+            // rule. The check passed while the mechanism it names went
+            // untested. A slot whose beat time has already passed was a
+            // published prediction that nothing confirmed, whether or not a
+            // gesture was launched on it; one still in the future was never
+            // asserted and is simply dropped.
+            for slot in slots where slot.time <= now && !slot.confirmed {
+                misses += 1
+                credit = clamp(credit + Self.creditOnMiss, -Self.creditLimit,
+                               Self.creditLimit)
+            }
             slots.removeAll()
-            credit = 0
+            credit = min(credit, 0)
             return nil
         }
 

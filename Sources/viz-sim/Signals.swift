@@ -26,6 +26,17 @@ struct Track {
     var isStationary = false
     /// Whether the case is silent enough that a dark board is correct.
     var isSilence = false
+    /// **Ground-truth silence windows** — stretches in which the generator put
+    /// no programme material at all, only digital silence or a room-tone noise
+    /// floor.
+    ///
+    /// M9c's complement is asserted against these rather than against a
+    /// percentile of the run's own RMS. A percentile cannot express "this is a
+    /// noise floor, not quiet music": a stationary noise bed's own p05 sits
+    /// inside the bed, so the run reads as continuously playing and the one
+    /// clause that says the board must go dark is never emitted. The generator
+    /// knows where it stopped playing; nothing else does.
+    var silenceWindows: [ClosedRange<Double>] = []
 
     /// Fills ``rmsEnvelope`` from the samples, at the analysis hop rate.
     mutating func measureRMS(sampleRate: Double, hop: Int = 512) {
@@ -93,6 +104,16 @@ enum Signal {
     /// abstraction: it is the shape of the material the user was listening to
     /// when they used the word "cliff".
     case buildDrop
+    /// **Music, then a room.** 20 s of four-on-the-floor followed by 55 s of a
+    /// −45 dBFS noise floor — the level a microphone in a quiet room actually
+    /// sits at, not the −60 dBFS of `near-silence`.
+    ///
+    /// It exists because M9c's silence complement was emitted **zero** times by
+    /// the whole battery: `cut-transitions`' silences are 0.5 s and the clause
+    /// needs ten seconds, so "the board must be dark ten seconds into a
+    /// silence" was never once asserted, and a board that relights on room tone
+    /// and holds a bright floor indefinitely passed every check in the table.
+    case roomTone
     case file(URL)
 
     /// The battery, in the order it is reported.
@@ -102,6 +123,7 @@ enum Signal {
         .sustainedTone(frequency: 1_000),
         .pink, .white, .nearSilence, .dnb174, .polyrhythm,
         .click(bpm: 120), .click(bpm: 112), .clickRamp, .clickGap, .buildDrop,
+        .roomTone,
     ]
 
     static func parse(_ text: String) -> Signal? {
@@ -125,6 +147,7 @@ enum Signal {
         case "click-90-ramp":   return .clickRamp
         case "click-120-gap":   return .clickGap
         case "build-drop":      return .buildDrop
+        case "music-then-room": return .roomTone
         default:                return nil
         }
     }
@@ -147,6 +170,7 @@ enum Signal {
         case .clickRamp:       return "click-90-ramp"
         case .clickGap:        return "click-120-gap"
         case .buildDrop:       return "build-drop"
+        case .roomTone:        return "music-then-room"
         case .file(let url):   return url.lastPathComponent
         }
     }
@@ -155,7 +179,7 @@ enum Signal {
     /// exempt, because inert is the correct answer there.
     var isMusical: Bool {
         switch self {
-        case .sustainedTone, .pink, .white, .nearSilence: return false
+        case .sustainedTone, .pink, .white, .nearSilence, .roomTone: return false
         default: return true
         }
     }
@@ -166,6 +190,10 @@ enum Signal {
     func duration(default fallback: Double) -> Double {
         switch self {
         case .buildDrop: return max(fallback, 45)
+        // 20 s of music, then 55 s of room tone: the complement needs ten
+        // seconds inside the silence before it collects anything, and a board
+        // that merely takes a long time to give up must be visible as such.
+        case .roomTone:  return max(fallback, 75)
         default:         return fallback
         }
     }
@@ -218,7 +246,11 @@ enum Signal {
     var deadFractionCeiling: Double? {
         switch self {
         case .cutTransitions: return 0.05
-        case .sustainedTone, .pink, .white, .nearSilence: return nil
+        // Two thirds of this case is deliberately *not* playing, and its own
+        // p20 therefore falls inside the noise floor — so "music is genuinely
+        // playing" cannot be defined from a percentile here. The case carries
+        // the complement instead.
+        case .sustainedTone, .pink, .white, .nearSilence, .roomTone: return nil
         default: return 0.01
         }
     }
@@ -298,7 +330,7 @@ enum Signal {
     /// "does this need a per-genre constant".
     var hasSteadyState: Bool {
         switch self {
-        case .crescendo, .cutTransitions, .buildDrop, .clickGap: return false
+        case .crescendo, .cutTransitions, .buildDrop, .clickGap, .roomTone: return false
         default: return true
         }
     }
@@ -365,6 +397,8 @@ enum Signal {
         case .clickRamp:      return synth.clickRamp()
         case .clickGap:       return synth.click(bpm: 120, muting: 20..<28)
         case .buildDrop:      return synth.buildDrop(bpm: 128)
+        case .roomTone:       return synth.musicThenRoom(bpm: 128, music: 20,
+                                                         floorDB: -45)
         case .file(let url):
             return Track(samples: try Synth.readFile(url, sampleRate: sampleRate,
                                                      duration: duration))
@@ -690,6 +724,44 @@ struct Synth {
         }
         return Track(samples: buffer, isStationary: true,
                      isSilence: amplitude < 0.01)
+    }
+
+    /// Music, then a room: the case the whole battery was missing.
+    ///
+    /// A microphone in a quiet room sits at −50…−40 dBFS, not at the −60 dBFS
+    /// `near-silence` uses, and the difference is the whole question. The board
+    /// must give up on a room the same way it gives up on digital silence.
+    mutating func musicThenRoom(bpm: Double, music: Double, floorDB: Double) -> Track {
+        var track = Track(samples: [], hasBeat: true)
+        let beat = 60 / bpm
+        var time = 0.0
+        var step = 0
+        while time < music {
+            kick(at: time)
+            track.events.append((time, .kick))
+            if step % 4 == 1 || step % 4 == 3 {
+                snare(at: time)
+                track.events.append((time, .snare))
+            }
+            hat(at: time + beat / 2)
+            track.events.append((time + beat / 2, .hat))
+            time += beat
+            step += 1
+        }
+        add(at: 0, length: music) { u in
+            var value = 0.0
+            for harmonic in 1...6 { value += sin(2 * .pi * 55 * Double(harmonic) * u) / Double(harmonic) }
+            return 0.30 * value / 2
+        }
+        // The room. Stationary, uncorrelated, and *above* the level at which
+        // the AGC's gain clamp alone can decide the question.
+        let floor = pow(10, floorDB / 20)
+        for position in index(music)..<count {
+            buffer[position] += Float(floor * random.nextGaussian())
+        }
+        track.silenceWindows = [music...duration]
+        track.samples = buffer
+        return track
     }
 
     mutating func breakbeat(bpm: Double) -> Track {

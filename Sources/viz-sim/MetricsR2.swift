@@ -150,6 +150,7 @@ struct Accumulation {
     static func measure(board: [Double], frameInterval dt: Double,
                         rms: [(time: Double, rms: Double)],
                         frameTimes: [Double],
+                        silence: [ClosedRange<Double>],
                         drop: (intro: ClosedRange<Double>, drop: ClosedRange<Double>)?)
         -> Accumulation {
         var result = Accumulation()
@@ -168,6 +169,12 @@ struct Accumulation {
                                                    dt: Self.step(of: rms), tau: 1.0),
                                       at: rms.map(\.time), onto: frameTimes)
         result.hasBuild = true
+        if ProcessInfo.processInfo.environment["VIZ_M9"] != nil {
+            for index in stride(from: 0, to: board.count, by: 1) {
+                print(String(format: "t %6.2f  r %.5f  b %.4f", frameTimes[index],
+                             reference[index], board[index]))
+            }
+        }
         result.buildCorrelation = Self.pearson(reference, board)
         result.slowCorrelation = Self.pearson(Self.onePole(reference, dt: dt, tau: 1 / (2 * .pi * 0.25)),
                                               Self.onePole(board, dt: dt, tau: 1 / (2 * .pi * 0.25)))
@@ -199,18 +206,21 @@ struct Accumulation {
 
         // …and the complement, asserted at the same time: ten seconds into a
         // genuine silence the board must be dark.
-        let quiet = levels[min(levels.count - 1, Int(Double(levels.count - 1) * 0.05))]
-        var silentSince: Double?
+        //
+        // Measured against the **generator's own silence windows**, not against
+        // a percentile of the run's RMS. A percentile cannot say "this is a
+        // room, not quiet music": a stationary noise floor's own p05 sits
+        // inside the floor, so a run that is two thirds room tone reads as
+        // continuously playing and the clause is never emitted. Measured at
+        // HEAD before this change, it was emitted **zero** times in 13 138
+        // checks — which is why a board that relights on room tone and holds a
+        // bright floor for ever passed the whole table.
         var silentSamples: [Double] = []
         for (index, time) in frameTimes.enumerated() {
-            let level = Self.sample(rms, at: time, span: dt) ?? 0
-            if level <= max(quiet, 1e-6) {
-                if silentSince == nil { silentSince = time }
-                if let since = silentSince, time - since >= 10 {
-                    silentSamples.append(board[index])
-                }
-            } else {
-                silentSince = nil
+            for window in silence where time >= window.lowerBound + 10
+                && time <= window.upperBound {
+                silentSamples.append(board[index])
+                break
             }
         }
         if !silentSamples.isEmpty {
@@ -359,6 +369,19 @@ struct SpatialDiversity {
     var hueSpreadP05: Double = 0
     /// M10b.
     var hueDrift: Double = 0
+    /// M10a's anti-vacuity companion: how much the *shape* of the hue field
+    /// across the board moves, once the frame's own mean hue is removed.
+    ///
+    /// M10a and M10b can both be satisfied with no audio input at all. A static
+    /// `±0.30`-turn gradient plus §12.1's constant `1/180` turn-per-second
+    /// clock — literally the design's own `H0` and `A·G` with the music taken
+    /// out — scores σ_h 0.091 and drift 0.048 through the shipped measurement,
+    /// i.e. it passes both. What that board cannot do is *change the shape* of
+    /// the gradient: §12.1 makes the boundary position `x_c` follow the
+    /// centroid and the fan width `A` follow the spectral spread, and neither
+    /// moves on a timer. This is the residual after the frame's circular mean
+    /// is removed, so a rotating palette contributes nothing to it.
+    var hueShapeMotion: Double = 0
     /// M10c, in columns.
     var centreMean: Double = 8
     var centreDeviation: Double = 0
@@ -391,13 +414,18 @@ struct SpatialDiversity {
         var centres: [Double] = []
         var columnTotals = [Double](repeating: 0, count: columns)
         var columnFrames = 0
+        // Per-frame hue profiles, relative to the frame's own mean hue.
+        var profiles: [[Double]] = []
 
         for frame in colors {
             var weight = 0.0
             var cosine = 0.0, sine = 0.0
             var columnValues = [Double](repeating: 0, count: columns)
+            var columnHues = [Double](repeating: .nan, count: columns)
             for (index, leds) in columnLEDs.enumerated() {
                 var sum = 0.0
+                var columnWeight = 0.0
+                var columnCosine = 0.0, columnSine = 0.0
                 for led in leds where led >= 0 && led < frame.count {
                     let colour = frame[led]
                     let r = KeyInterlock.decode(colour.red)
@@ -412,8 +440,14 @@ struct SpatialDiversity {
                     weight += value
                     cosine += value * cos(2 * .pi * hue)
                     sine += value * sin(2 * .pi * hue)
+                    columnWeight += value
+                    columnCosine += value * cos(2 * .pi * hue)
+                    columnSine += value * sin(2 * .pi * hue)
                 }
                 columnValues[index] = leds.isEmpty ? 0 : sum / Double(leds.count)
+                if columnWeight > 1e-9 {
+                    columnHues[index] = atan2(columnSine, columnCosine) / (2 * .pi)
+                }
             }
             let ledCount = Double(frame.count)
             let boardMean = weight / max(ledCount, 1)
@@ -428,6 +462,15 @@ struct SpatialDiversity {
             meanHue -= meanHue.rounded(.down)
             meanHues.append(meanHue)
 
+            // The hue profile: every column's hue minus this frame's own mean
+            // hue, wrapped to ±0.5 turns. Columns that are dark this frame
+            // carry no hue and are left out of the comparison.
+            if columnHues.contains(where: { !$0.isNaN }) {
+                profiles.append(columnHues.map { hue in
+                    hue.isNaN ? Double.nan : Self.wrapTurns(hue - meanHue)
+                })
+            }
+
             let columnSum = columnValues.reduce(0, +)
             if columnSum >= visibleMean * Double(columns) {
                 var moment = 0.0
@@ -441,6 +484,7 @@ struct SpatialDiversity {
         result.hueSpreadMedian = percentile(spreads, 0.5)
         result.hueSpreadP05 = percentile(spreads, 0.05)
         result.hueDrift = Self.circularDeviation(meanHues)
+        result.hueShapeMotion = Self.profileMotion(profiles, columns: columns)
         result.centreMean = centres.reduce(0, +) / Double(centres.count)
         let centreMean = result.centreMean
         result.centreDeviation = (centres.reduce(0) { $0 + ($1 - centreMean) * ($1 - centreMean) }
@@ -454,6 +498,44 @@ struct SpatialDiversity {
             result.columnMaxRatio = (averages.max() ?? 0) / overall
         }
         return result
+    }
+
+    /// Wraps a hue difference into `±0.5` turns.
+    static func wrapTurns(_ turns: Double) -> Double {
+        var value = turns - turns.rounded(.down)
+        if value > 0.5 { value -= 1 }
+        return value
+    }
+
+    /// How far a frame's hue profile departs from the run's average profile,
+    /// in turns — the median over frames of the RMS over columns.
+    ///
+    /// Zero for any board whose hue field is a fixed function of column, no
+    /// matter how fast the whole palette rotates.
+    static func profileMotion(_ profiles: [[Double]], columns: Int) -> Double {
+        guard profiles.count > 8 else { return 0 }
+        var average = [Double](repeating: 0, count: columns)
+        for column in 0..<columns {
+            var cosine = 0.0, sine = 0.0, count = 0.0
+            for profile in profiles where !profile[column].isNaN {
+                cosine += cos(2 * .pi * profile[column])
+                sine += sin(2 * .pi * profile[column])
+                count += 1
+            }
+            average[column] = count > 0 ? atan2(sine, cosine) / (2 * .pi) : 0
+        }
+        var residuals: [Double] = []
+        for profile in profiles {
+            var sum = 0.0
+            var count = 0.0
+            for column in 0..<columns where !profile[column].isNaN {
+                let difference = Self.wrapTurns(profile[column] - average[column])
+                sum += difference * difference
+                count += 1
+            }
+            if count > 0 { residuals.append((sum / count).squareRoot()) }
+        }
+        return residuals.isEmpty ? 0 : percentile(residuals, 0.5)
     }
 
     /// Standard deviation of a circular quantity, in turns — the mean hue
