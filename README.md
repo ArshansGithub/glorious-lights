@@ -43,8 +43,12 @@ Along the way we discovered several things nobody had documented (see
 
 ```sh
 brew tap ArshansGithub/tap
+brew trust arshansgithub/tap        # Homebrew 6+ gates third-party taps
 brew install --cask glorious-lights
 ```
+
+The `brew trust` step is not optional on Homebrew 6 — without it `brew install`
+refuses to load the cask at all.
 
 **Or download** `Glorious-Lights-1.0.0.zip` from the
 [latest release](https://github.com/ArshansGithub/glorious-lights/releases/latest),
