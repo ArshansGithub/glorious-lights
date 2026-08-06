@@ -35,19 +35,27 @@ public final class SpectrumAnalyzer {
     public let sampleRate: Float
     public let bandCount: Int
 
+    /// Whether the pink-noise equalisation is applied. Off is the pre-tuning
+    /// behaviour, kept so the simulator can measure before and after with one
+    /// binary rather than by checking out an old commit.
+    public let isEqualized: Bool
+
     private let log2n: vDSP_Length
     private let fftSetup: FFTSetup
     private let window: [Float]
     /// Inclusive bin range for each band, precomputed once.
     private let bandBins: [(lower: Int, upper: Int)]
+    /// Per-band multiplier that flattens pink noise. See ``pinkEqualization(for:sampleRate:)``.
+    private let bandWeights: [Float]
 
     /// - Parameters:
     ///   - sampleRate: the capture rate, e.g. 48000.
     ///   - bandCount: how many columns the display has.
-    public init(sampleRate: Float, bandCount: Int) {
+    public init(sampleRate: Float, bandCount: Int, equalized: Bool = true) {
         precondition(bandCount > 0, "a spectrum needs at least one band")
         self.sampleRate = sampleRate
         self.bandCount = bandCount
+        self.isEqualized = equalized
         self.log2n = vDSP_Length(log2(Float(Self.windowSize)).rounded())
         guard let setup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) else {
             preconditionFailure("vDSP_create_fftsetup failed for \(Self.windowSize) samples")
@@ -61,6 +69,9 @@ public final class SpectrumAnalyzer {
         self.window = hann
 
         self.bandBins = Self.bandBinRanges(sampleRate: sampleRate, bandCount: bandCount)
+        self.bandWeights = equalized
+            ? Self.pinkEqualization(for: bandBins, sampleRate: sampleRate)
+            : [Float](repeating: 1, count: bandCount)
     }
 
     deinit { vDSP_destroy_fftsetup(fftSetup) }
@@ -91,6 +102,41 @@ public final class SpectrumAnalyzer {
         return ranges
     }
 
+    /// Per-band multipliers that make **pink noise produce a flat display**.
+    ///
+    /// This is the fix for a spectrum analyser that looks like it only has bass.
+    /// Music is roughly pink — power falls as `1/f` — so with equal weighting the
+    /// bottom bands pin at full scale while the top of the board sits dark, no
+    /// matter what the gain is set to. Weighting each band by the inverse of the
+    /// response pink noise *would* produce there turns "flat display" into the
+    /// meaning of "typical music", which is what makes the whole board move.
+    ///
+    /// Pink noise has power ∝ `1/f`, so magnitude ∝ `f^-1/2`. The expected mean
+    /// magnitude of a band is therefore the mean of `f^-1/2` across the bins it
+    /// actually covers — computed here from the real bin ranges rather than from
+    /// a centre-frequency approximation, because the low bands span very few
+    /// bins and the approximation is worst exactly there.
+    ///
+    /// Weights are normalised to a geometric mean of 1, so equalisation changes
+    /// the *shape* of the display without changing its overall level — a
+    /// sensitivity that worked before still works.
+    static func pinkEqualization(for bands: [(lower: Int, upper: Int)],
+                                 sampleRate: Float) -> [Float] {
+        let binWidth = sampleRate / Float(windowSize)
+        let expected: [Float] = bands.map { range in
+            var total: Float = 0
+            for bin in range.lower...range.upper {
+                total += 1 / sqrt(Float(bin) * binWidth)
+            }
+            return total / Float(range.upper - range.lower + 1)
+        }
+        // Geometric mean, so one very low band cannot drag the normaliser the
+        // way an arithmetic mean would.
+        let logSum = expected.reduce(Float(0)) { $0 + log($1) }
+        let geometricMean = exp(logSum / Float(expected.count))
+        return expected.map { geometricMean / $0 }
+    }
+
     /// One magnitude per band for a window of samples, each roughly `0…1` for
     /// ordinary programme material — but **not clamped**, because the caller's
     /// gain stage is what decides what counts as full scale.
@@ -119,11 +165,11 @@ public final class SpectrumAnalyzer {
         var scale = 2 / Float(Self.windowSize)
         vDSP_vsmul(magnitudes, 1, &scale, &magnitudes, 1, vDSP_Length(magnitudes.count))
 
-        return bandBins.map { range in
+        return bandBins.enumerated().map { index, range in
             let slice = magnitudes[range.lower...range.upper]
             var mean: Float = 0
             vDSP_meanv(Array(slice), 1, &mean, vDSP_Length(slice.count))
-            return mean
+            return mean * bandWeights[index]
         }
     }
 }

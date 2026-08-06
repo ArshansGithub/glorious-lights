@@ -53,12 +53,12 @@ final class VisualizerController {
     /// The visualizer's own transport, touched only from ``renderThread``.
     private let keyboard = GMMKKeyboard()
 
-    private var analyzer: SpectrumAnalyzer?
+    /// The shared analysis-and-display pipeline. The audio thread feeds it and
+    /// the render thread advances it; it owns the coalescing, so there is no
+    /// second copy of the gate, gain or smoothing here for the simulator to
+    /// drift away from.
+    private var pipeline: VisualizerPipeline?
     private var renderThread: Thread?
-
-    /// Written by the audio thread, read by the render thread.
-    private let levelsLock = NSLock()
-    private var latestLevels: [Float]?
 
     /// Set on the main thread, read by the render thread; guarded by its own
     /// lock so a style change mid-frame cannot tear.
@@ -132,18 +132,15 @@ final class VisualizerController {
         }
         self.capture = capture
 
-        let analyzer = SpectrumAnalyzer(sampleRate: Float(capture.sampleRate),
-                                        bandCount: VisualizerLayout.columns.count)
-        self.analyzer = analyzer
-        capture.onSamples = { [weak self] samples in
-            guard let self else { return }
-            // The FFT happens here, on the audio thread, so the render thread
-            // only ever does arithmetic on 17 floats before sending.
-            let levels = analyzer.levels(from: samples)
-            self.levelsLock.lock()
-            self.latestLevels = levels
-            self.levelsLock.unlock()
-        }
+        let settings = currentSettings
+        let pipeline = VisualizerPipeline(
+            sampleRate: Float(capture.sampleRate),
+            bandCount: VisualizerLayout.columns.count,
+            tuning: .init(sensitivity: settings.sensitivity, autoGain: settings.autoGain))
+        self.pipeline = pipeline
+        // The FFT happens on the audio thread, so the render thread only ever
+        // does arithmetic on 17 floats before sending.
+        capture.onSamples = { [weak pipeline] samples in pipeline?.analyze(samples) }
 
         do {
             try capture.start()
@@ -154,18 +151,15 @@ final class VisualizerController {
         }
 
         // The tap reports its own rate, which need not be the 48 kHz assumed
-        // before it started, so the analyzer is rebuilt once it is known.
-        if abs(capture.sampleRate - Double(analyzer.sampleRate)) > 1 {
-            let corrected = SpectrumAnalyzer(sampleRate: Float(capture.sampleRate),
-                                             bandCount: VisualizerLayout.columns.count)
-            self.analyzer = corrected
-            capture.onSamples = { [weak self] samples in
-                guard let self else { return }
-                let levels = corrected.levels(from: samples)
-                self.levelsLock.lock()
-                self.latestLevels = levels
-                self.levelsLock.unlock()
-            }
+        // before it started, and the band edges are derived from it — so the
+        // pipeline is rebuilt once the real rate is known.
+        if abs(capture.sampleRate - Double(pipeline.sampleRate)) > 1 {
+            let corrected = VisualizerPipeline(
+                sampleRate: Float(capture.sampleRate),
+                bandCount: VisualizerLayout.columns.count,
+                tuning: .init(sensitivity: settings.sensitivity, autoGain: settings.autoGain))
+            self.pipeline = corrected
+            capture.onSamples = { [weak corrected] samples in corrected?.analyze(samples) }
         }
 
         isStopping = false
@@ -200,11 +194,7 @@ final class VisualizerController {
             Thread.sleep(forTimeInterval: 0.005)
         }
         renderThread = nil
-        analyzer = nil
-
-        levelsLock.lock()
-        latestLevels = nil
-        levelsLock.unlock()
+        pipeline = nil
 
         lease.release(.visualizer)
         isRunning = false
@@ -229,8 +219,6 @@ final class VisualizerController {
 
     private func renderLoop() {
         let frameInterval = 1 / Self.targetFrameRate
-        var smoother = LevelSmoother(bandCount: VisualizerLayout.columns.count)
-        var autoGain = AutoGain()
         var lastFrame = ProcessInfo.processInfo.systemUptime
 
         do {
@@ -248,27 +236,17 @@ final class VisualizerController {
             let elapsed = frameStart - lastFrame
             lastFrame = frameStart
 
-            // Take the newest analysis and drop anything older. Nothing is
-            // queued, so a slow frame loses intermediate audio rather than
-            // accumulating a backlog.
-            levelsLock.lock()
-            let raw = latestLevels
-            levelsLock.unlock()
-
+            // The pipeline holds the newest analysis and drops anything older,
+            // so a slow frame loses intermediate audio rather than accumulating
+            // a backlog.
             let settings = currentSettings
-            var levels = raw ?? [Float](repeating: 0, count: VisualizerLayout.columns.count)
+            guard let pipeline else { break }
+            pipeline.tuning.sensitivity = settings.sensitivity
+            pipeline.tuning.autoGain = settings.autoGain
 
-            var gain = Float(settings.sensitivity)
-            if settings.autoGain {
-                gain *= autoGain.update(observedPeak: levels.max() ?? 0, elapsed: elapsed)
-            }
-            for index in levels.indices {
-                levels[index] = min(max(levels[index] * gain, 0), 1)
-            }
-
-            let smoothed = smoother.update(with: levels, elapsed: elapsed)
+            let heights = pipeline.advance(elapsed: elapsed)
             let renderer = BarRenderer(style: settings.style, themeColor: settings.color)
-            let colors = renderer.frame(levels: smoothed)
+            let colors = renderer.frame(levels: heights)
 
             do {
                 try keyboard.sendFrame(

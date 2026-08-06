@@ -330,6 +330,234 @@ final class VisualizerTests: XCTestCase {
         }
     }
 
+    // MARK: - Pink-noise equalisation
+
+    /// **Spectrally exact** pink noise: one sinusoid per FFT bin with amplitude
+    /// proportional to `f^-1/2` and a random phase.
+    ///
+    /// Deliberately not the Voss-McCartney generator the simulator uses. Voss is
+    /// cheap and looks pink, but it deviates from a true `1/f` slope at both
+    /// ends of the range — so a flatness test fed by it measures the
+    /// *generator's* error as much as the equaliser's. Synthesising bin by bin
+    /// makes the input pink by construction, which is the only way this test is
+    /// a statement about the equalisation.
+    ///
+    /// Being exactly periodic in the analysis window also means no spectral
+    /// leakage, so no averaging over many windows is needed.
+    private func exactPinkNoise(seed: UInt64) -> [Float] {
+        let count = SpectrumAnalyzer.windowSize
+        var state = seed &* 6_364_136_223_846_793_005 &+ 1
+        func nextPhase() -> Double {
+            state ^= state << 13
+            state ^= state >> 7
+            state ^= state << 17
+            return Double(state >> 11) / Double(1 << 53) * 2 * .pi
+        }
+
+        var output = [Double](repeating: 0, count: count)
+        for bin in 1..<(count / 2) {
+            // Power ∝ 1/f means amplitude ∝ f^-1/2; bin index is proportional
+            // to frequency, so the bin number serves directly.
+            let amplitude = 1 / sqrt(Double(bin))
+            let phase = nextPhase()
+            let step = 2 * Double.pi * Double(bin) / Double(count)
+            for sample in 0..<count {
+                output[sample] += amplitude * sin(step * Double(sample) + phase)
+            }
+        }
+        // Normalise to a sane peak so the numbers resemble real audio.
+        let peak = output.map(abs).max() ?? 1
+        let scale = peak > 0 ? 0.5 / peak : 1
+        return output.map { Float($0 * scale) }
+    }
+
+    /// Average band levels over a few phase seeds.
+    private func averagePinkLevels(equalized: Bool, windows: Int = 8) -> [Double] {
+        let analyzer = SpectrumAnalyzer(sampleRate: 48_000, bandCount: 17, equalized: equalized)
+        var totals = [Double](repeating: 0, count: 17)
+        for window in 0..<windows {
+            let levels = analyzer.levels(from: exactPinkNoise(seed: UInt64(window + 1)))
+            for band in 0..<17 { totals[band] += Double(levels[band]) }
+        }
+        return totals.map { $0 / Double(windows) }
+    }
+
+    /// **The property the equalisation exists for: pink noise makes a flat
+    /// board.** Music is roughly pink, so without this the bottom columns pin
+    /// and the top of the board stays dark whatever the gain — which is exactly
+    /// what the first live test reported.
+    func testPinkNoiseProducesAFlatBarProfile() {
+        let levels = averagePinkLevels(equalized: true)
+        let mean = levels.reduce(0, +) / Double(levels.count)
+        XCTAssertGreaterThan(mean, 0)
+
+        // Measured: spread 0.27, tallest band 1.30x the shortest. The residual
+        // is not an error in the weights — it is the Hann window spreading each
+        // synthesised bin across its neighbours, which the narrow low bands feel
+        // most because they span the fewest bins. On a five-row column a 1.3x
+        // difference is well under one row, so the board reads as flat.
+        let spread = (levels.max()! - levels.min()!) / mean
+        XCTAssertLessThan(spread, 0.4,
+                          "pink noise should light the board evenly; got \(levels)")
+        XCTAssertLessThan(levels.max()! / levels.min()!, 1.45)
+    }
+
+    /// The same measurement without equalisation, to show the fix is doing the
+    /// work rather than the signal being flat to begin with.
+    func testUnequalizedPinkNoiseIsStronglyBassHeavy() {
+        let levels = averagePinkLevels(equalized: false)
+        let mean = levels.reduce(0, +) / Double(levels.count)
+        // Measured: the lowest band sits 21x the highest — the "energy clusters
+        // in the corners, board stays dark" the first live test reported.
+        let spread = (levels.max()! - levels.min()!) / mean
+        XCTAssertGreaterThan(spread, 2.5,
+                             "unequalised pink noise should be visibly bass-heavy")
+        XCTAssertGreaterThan(levels.max()! / levels.min()!, 10)
+        // And it is the low bands that dominate, not some arbitrary band.
+        XCTAssertEqual(levels.firstIndex(of: levels.max()!), 0)
+    }
+
+    /// The weights are normalised so equalisation changes the shape of the
+    /// display without moving its overall level — a sensitivity that worked
+    /// before still works.
+    func testEqualizationPreservesOverallLevel() {
+        let ranges = SpectrumAnalyzer.bandBinRanges(sampleRate: 48_000, bandCount: 17)
+        let weights = SpectrumAnalyzer.pinkEqualization(for: ranges, sampleRate: 48_000)
+        XCTAssertEqual(weights.count, 17)
+        let logSum = weights.reduce(Float(0)) { $0 + log($1) }
+        XCTAssertEqual(Double(exp(logSum / Float(weights.count))), 1.0, accuracy: 0.001)
+        // Higher bands are boosted, lower ones cut — the shape of a pink tilt.
+        XCTAssertLessThan(weights.first!, 1)
+        XCTAssertGreaterThan(weights.last!, 1)
+        XCTAssertEqual(weights, weights.sorted())
+    }
+
+    // MARK: - Noise gate
+
+    private func pipeline(noiseFloorDB: Double = VisualizerPipeline.defaultNoiseFloorDB,
+                          sensitivity: Double = 1,
+                          autoGain: Bool = false) -> VisualizerPipeline {
+        VisualizerPipeline(sampleRate: 48_000, bandCount: 3,
+                           tuning: .init(sensitivity: sensitivity,
+                                         autoGain: autoGain,
+                                         noiseFloorDB: noiseFloorDB,
+                                         equalization: true))
+    }
+
+    /// A band below the floor produces a bar of exactly zero — not a small
+    /// number that still lights the bottom row.
+    func testBandsBelowTheFloorAreFullyDark() {
+        let pipeline = self.pipeline(noiseFloorDB: -40)   // 0.01 linear
+        let quiet: [Float] = [0.001, 0.002, 0.005]
+        var heights = [Float]()
+        for _ in 0..<20 { heights = pipeline.advance(levels: quiet, elapsed: 1.0 / 15) }
+        XCTAssertEqual(heights, [0, 0, 0])
+        XCTAssertEqual(BarRenderer.rowsLit(level: heights[0], rowCount: 5), 0)
+    }
+
+    /// A band above the floor is unaffected by the gate.
+    func testBandsAboveTheFloorPassThrough() {
+        let pipeline = self.pipeline(noiseFloorDB: -40)
+        let heights = pipeline.advance(levels: [0.5, 0.5, 0.5], elapsed: 1.0 / 15)
+        XCTAssertTrue(heights.allSatisfy { $0 > 0.4 }, "\(heights)")
+    }
+
+    /// **Gating happens before the gain.** Otherwise a high sensitivity — or an
+    /// auto-gain multiplier wound up during a quiet passage — amplifies the room
+    /// noise straight through the gate, which is the flicker this is meant to
+    /// remove.
+    func testTheGateIsNotDefeatedByHighSensitivity() {
+        let pipeline = self.pipeline(noiseFloorDB: -40, sensitivity: 100)
+        var heights = [Float]()
+        for _ in 0..<20 { heights = pipeline.advance(levels: [0.001, 0.001, 0.001],
+                                                     elapsed: 1.0 / 15) }
+        XCTAssertEqual(heights, [0, 0, 0])
+    }
+
+    func testTheGateIsNotDefeatedByAutoGain() {
+        let pipeline = self.pipeline(noiseFloorDB: -40, sensitivity: 1, autoGain: true)
+        var heights = [Float]()
+        for _ in 0..<60 { heights = pipeline.advance(levels: [0.002, 0.002, 0.002],
+                                                     elapsed: 1.0 / 15) }
+        XCTAssertEqual(heights, [0, 0, 0])
+    }
+
+    /// A disabled floor is the pre-tuning behaviour: everything passes.
+    func testTheGateCanBeDisabled() {
+        let pipeline = VisualizerPipeline(sampleRate: 48_000, bandCount: 3,
+                                          tuning: .preTuning)
+        let heights = pipeline.advance(levels: [0.001, 0.001, 0.001], elapsed: 1.0 / 15)
+        XCTAssertTrue(heights.allSatisfy { $0 > 0 }, "\(heights)")
+    }
+
+    // MARK: - Gate hysteresis
+
+    /// **A band sitting on the threshold must not chatter.** Once closed, the
+    /// gate needs a level meaningfully above the floor to reopen, or noise
+    /// hovering at the boundary flickers the bar once per frame — the very
+    /// thing the gate was added to stop.
+    func testAClosedGateNeedsMoreThanTheFloorToReopen() {
+        let pipeline = self.pipeline(noiseFloorDB: -40)
+        let close = Float(pow(10.0, -40.0 / 20.0))            // 0.0100
+
+        // Close it.
+        for _ in 0..<10 { _ = pipeline.advance(levels: [0, 0, 0], elapsed: 1.0 / 15) }
+
+        // Just above the closing threshold is not enough to reopen.
+        let justAbove = close * 1.05
+        var heights = [Float]()
+        for _ in 0..<10 {
+            heights = pipeline.advance(levels: [justAbove, justAbove, justAbove],
+                                       elapsed: 1.0 / 15)
+        }
+        XCTAssertEqual(heights, [0, 0, 0], "the gate reopened on a level barely above the floor")
+
+        // Clearly above the hysteresis margin does reopen it.
+        let open = Float(pow(10.0, (-40.0 + VisualizerPipeline.gateHysteresisDB) / 20.0))
+        heights = pipeline.advance(levels: [open * 1.1, open * 1.1, open * 1.1],
+                                   elapsed: 1.0 / 15)
+        XCTAssertTrue(heights.allSatisfy { $0 > 0 }, "\(heights)")
+    }
+
+    /// Once open, the gate does not close until the level falls below the
+    /// *lower* threshold — the other half of the hysteresis.
+    func testAnOpenGateStaysOpenBetweenTheThresholds() {
+        let pipeline = self.pipeline(noiseFloorDB: -40)
+        let close = Float(pow(10.0, -40.0 / 20.0))
+        let open = Float(pow(10.0, (-40.0 + VisualizerPipeline.gateHysteresisDB) / 20.0))
+
+        _ = pipeline.advance(levels: [open * 2, open * 2, open * 2], elapsed: 1.0 / 15)
+        // Between the two thresholds: still open, so the bar is still driven.
+        let between = (close + open) / 2
+        let heights = pipeline.advance(levels: [between, between, between], elapsed: 1.0 / 15)
+        XCTAssertTrue(heights.allSatisfy { $0 > 0 }, "\(heights)")
+    }
+
+    /// A gated band decays rather than snapping, so a passage ending does not
+    /// look like the display crashed — but it does reach exactly zero.
+    func testAGatedBarDecaysToExactlyZero() {
+        let pipeline = self.pipeline(noiseFloorDB: -40)
+        _ = pipeline.advance(levels: [1, 1, 1], elapsed: 1.0 / 15)
+
+        let firstAfterGating = pipeline.advance(levels: [0, 0, 0], elapsed: 1.0 / 15)
+        XCTAssertGreaterThan(firstAfterGating[0], 0, "the bar should fall, not snap")
+        XCTAssertLessThan(firstAfterGating[0], 1)
+
+        var heights = firstAfterGating
+        for _ in 0..<40 { heights = pipeline.advance(levels: [0, 0, 0], elapsed: 1.0 / 15) }
+        XCTAssertEqual(heights, [0, 0, 0], "an exponential tail must still reach zero")
+    }
+
+    /// The pipeline is the one place the app and the simulator share, so a reset
+    /// has to clear everything a session could inherit.
+    func testResetClearsDisplayState() {
+        let pipeline = self.pipeline(noiseFloorDB: -40)
+        _ = pipeline.advance(levels: [1, 1, 1], elapsed: 1.0 / 15)
+        pipeline.reset()
+        let heights = pipeline.advance(levels: [0, 0, 0], elapsed: 1.0 / 15)
+        XCTAssertEqual(heights, [0, 0, 0])
+    }
+
     // MARK: - Source selection
 
     /// System audio is what someone playing music actually wants — it hears the
