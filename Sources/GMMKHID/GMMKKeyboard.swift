@@ -88,6 +88,32 @@ public final class GMMKKeyboard {
     /// why it is the fallback and not the default.
     private static let blindPacingDelay: TimeInterval = 0.350
 
+    /// When the reply channel is treated as silent until, on the reference
+    /// clock. Zero means "not silent".
+    private var blindUntil: TimeInterval = 0
+    /// Current back-off, doubling on each silence and reset by any reply.
+    private var silenceBackoff: TimeInterval = 0.25
+
+    /// The longest a lost echo may keep the transport in blind mode.
+    ///
+    /// Silence used to be scoped to the *rest of the transaction* and never
+    /// recovered within it, so one unanswered packet cost
+    /// `packets × 350 ms` — a multi-second freeze in the middle of a frame,
+    /// during which the board holds still and then teleports. Scoping it to a
+    /// short, exponentially recovering window bounds the damage at one blind
+    /// interval and lets paced mode come back on its own.
+    public static let maximumSilenceBackoff: TimeInterval = 2.0
+
+    private func noteSilence() {
+        blindUntil = Date().timeIntervalSinceReferenceDate + silenceBackoff
+        silenceBackoff = Swift.min(silenceBackoff * 2, Self.maximumSilenceBackoff)
+    }
+
+    private func noteReply() {
+        blindUntil = 0
+        silenceBackoff = 0.25
+    }
+
     /// Called for every packet that was sent ``maxSendAttempts`` times without
     /// the firmware ever answering. The write has probably still landed in
     /// config RAM, but it may not have been applied — worth surfacing in a
@@ -443,7 +469,7 @@ public final class GMMKKeyboard {
         // attempts the reply channel is not coming back mid-transaction, so the
         // rest go out on the other pacing that was observed to work: a fixed
         // ~350 ms gap, no waiting.
-        var replyChannelIsSilent = false
+        var replyChannelIsSilent = blindUntil > Date().timeIntervalSinceReferenceDate
         do {
             // The hello read comes first, and its own silence is worth
             // respecting: a board that will not answer this will not answer the
@@ -468,7 +494,12 @@ public final class GMMKKeyboard {
                 let result = try sendPaced(packet,
                                            packetIndex: index,
                                            blind: replyChannelIsSilent)
-                if result.wentSilent { replyChannelIsSilent = true }
+                if result.wentSilent {
+                    replyChannelIsSilent = true
+                    noteSilence()
+                } else if !replyChannelIsSilent {
+                    noteReply()
+                }
             }
         } catch {
             if sentAny, packets.first == GMMKPacket.start(), packets.last == GMMKPacket.end() {

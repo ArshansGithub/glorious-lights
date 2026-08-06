@@ -35,9 +35,13 @@ public final class AudioCapture: AudioSourceCapturing {
         }
     }
 
-    /// Samples per callback. Matches the analyzer's window so a frame is one
-    /// window rather than a re-buffered fraction of one.
-    public static let bufferSize: AVAudioFrameCount = 2048
+    /// Samples per callback.
+    ///
+    /// 512 at 48 kHz is 10.7 ms — one analysis hop. It used to be 2048, which is
+    /// 42.7 ms of capture latency *and* delivers four hops in a burst, so the
+    /// analysis rate was a stutter rather than a rate. The callback now only
+    /// copies samples into the engine, so a small buffer costs nothing.
+    public static let bufferSize: AVAudioFrameCount = 512
 
     public init() {}
 
