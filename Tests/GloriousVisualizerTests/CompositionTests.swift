@@ -371,4 +371,47 @@ final class CompositionTests: XCTestCase {
         XCTAssertEqual(model.silenceRamp, 1, accuracy: 1e-9,
                        "a board must give up on a room the way it gives up on silence")
     }
+
+    /// The reference window is a span of **seconds**, not a count of loud hops.
+    ///
+    /// Sparse material — a click track is the extreme, but any percussive track
+    /// with real gaps is the same shape — clears the seeding guard on a few per
+    /// cent of its hops. While the guard applied to every update rather than to
+    /// seeding alone, those few per cent were the tracker's whole diet: on
+    /// `click-112`, 116 hops of 2 806, so a 60 s window became an effective 24
+    /// minutes and `p05` and `p95` were still 0.01 dB apart after thirty
+    /// seconds. `E` was then decided by whichever hop happened to seed it, and
+    /// the board went black for twenty seconds of a thirty second run.
+    ///
+    /// The invariant that catches it: two burst periods that differ only in
+    /// tempo must not produce qualitatively different energy.
+    func testSparseMaterialStillSeparatesTheEnergyReference() {
+        let dt = 1.0 / 93.75
+        /// Peak `E` over the last ten seconds of a burst train at this period.
+        func peakEnergy(burstPeriod: Double) -> Double {
+            var model = EnergyModel()
+            var now = 0.0
+            var peak = 0.0
+            while now < 30 {
+                // A 12 ms burst on digital silence, exactly like the click cases.
+                let phase = now.truncatingRemainder(dividingBy: burstPeriod)
+                let rms = phase < 0.012 ? 0.08 : 0.0
+                model.update(rms: rms, gateOpen: true, now: now, dt: dt)
+                if now >= 20 { peak = max(peak, model.energy) }
+                now += dt
+            }
+            return peak
+        }
+        // 120 BPM and 112 BPM — the two the battery runs, and the pair that
+        // differed by 13 dB of reference purely through where the seed landed.
+        let fast = peakEnergy(burstPeriod: 0.500)
+        let slow = peakEnergy(burstPeriod: 60.0 / 112)
+        XCTAssertGreaterThan(fast, 0.2, "a burst must lift E above the reference floor")
+        XCTAssertGreaterThan(slow, 0.2,
+                             "a 7 % change of tempo must not blank the board: E was "
+                             + "pinned at its seed and never cleared 0.05")
+        XCTAssertEqual(fast, slow, accuracy: 0.25,
+                       "two tempos of the same material must not land on different "
+                       + "energy references")
+    }
 }

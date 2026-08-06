@@ -164,6 +164,8 @@ public struct EnergyModel: Sendable {
     private var escaping = false
     private var silentFor: Double = 0
     private var hasOpened = false
+    /// Whether a hop carrying real programme material has seeded the reference.
+    private var referenceSeeded = false
 
     public init() {}
 
@@ -208,7 +210,28 @@ public struct EnergyModel: Sendable {
         // converter's own noise floor and is never used as a decision threshold
         // (P1c) — the *decision* about whether anything is playing is the master
         // gate, which is the other half of this condition.
-        if gateOpen, rms > 1e-6 { low.update(rms, dt: dt); high.update(rms, dt: dt) }
+        // …but the guard is on **seeding only**, and it used to apply to every
+        // update. That made the reference's window a count of loud hops rather
+        // than a span of seconds. On `click-112` — a 12 ms burst twice a second
+        // on digital silence — 116 hops of 2 806 cleared `1e-6`, so a 60 s
+        // window became an effective 24 minutes and both trackers were still
+        // sitting on the single hop that seeded them thirty seconds in: `p05`
+        // and `p95` were 0.01 dB apart, and where that seed landed decided the
+        // whole run. On `click-120` it landed 13 dB below the click and `E`
+        // reached 0.69 every beat; on `click-112` it landed *on* the click,
+        // `E` never cleared 0.05, and the board was **completely black from 6 s
+        // to 26 s** while the track played. A 7 % change of tempo, nothing else.
+        //
+        // Once the reference is seeded, a silent hop taken while the gate is
+        // open is a real observation that the level is low, and excluding it is
+        // exactly what lets `p05` climb to the material's own peak. ``maximumRange``
+        // is what stops it running away to the numerical guard, which is the job
+        // it was already there to do.
+        if gateOpen, rms > 1e-6 || referenceSeeded {
+            if rms > 1e-6 { referenceSeeded = true }
+            low.update(rms, dt: dt)
+            high.update(rms, dt: dt)
+        }
         let lambda = 20 * log10(max(rms, 1e-7))
         let lowDB = 20 * log10(max(low.value, 1e-7))
         let highDB = 20 * log10(max(high.value, 1e-7))
@@ -324,6 +347,7 @@ public struct EnergyModel: Sendable {
         silentFor = 0
         silenceRamp = 0
         hasOpened = false
+        referenceSeeded = false
         energy = 0
     }
 }
