@@ -1,10 +1,18 @@
-# GMMK Lights
+# Glorious Lights
 
-Control the RGB lighting of the original **GMMK 1** (Glorious Modular Mechanical
-Keyboard, 2018–2021, SONiX `0x0C45:0x652F`) from macOS — the keyboard Glorious
-Core doesn't support and the official GMMK Editor (Windows-only) left behind.
+Control the RGB lighting of the original **GMMK 1** keyboard (Glorious Modular
+Mechanical Keyboard, 2018–2021, SONiX `0x0C45:0x652F`) and the wired **Glorious
+Model O / O-** mouse (SinoWealth `0x258A:0x0036`) from macOS — the devices
+Glorious Core doesn't support and the official Windows-only editors left behind.
 
 A native Swift menu-bar app plus a CLI. No drivers, no kernel extensions.
+
+The two devices share nothing but this repository: different vendors, different
+transports, different protocols. The keyboard speaks 64-byte output reports with
+a checksum, START/END bracketing and echo pacing; the mouse speaks feature
+reports carrying one 520-byte configuration blob and no checksum at all. Each has
+its own targets and its own protocol reference, and the app shows whichever
+devices are plugged in.
 
 <img width="383" height="357" alt="image" src="https://github.com/user-attachments/assets/9dc20f23-8a51-429c-ad26-1b70d75b57ca" />
 
@@ -33,7 +41,7 @@ Along the way we discovered several things nobody had documented (see
 
 ```sh
 git clone <this repo>
-cd gmmk-lights
+cd glorious-lights
 swift build -c release
 ```
 
@@ -60,6 +68,10 @@ swift build -c release
   correction alone can only do so much (a cyan housing filters red out
   subtractively, and on a warm color red is already maxed), so the palette is
   still the better answer for most colors.
+- **Mouse:** when a Model O / O- is attached, the menu grows a mouse section —
+  firmware version, RGB effect, color, brightness, speed, DPI stages, polling
+  rate and debounce. It reads the mouse's settings on connect and never writes
+  anything until you pick something.
 - **CLI:** `swift run -c release gmmk-cli help`
 
 ```sh
@@ -75,44 +87,110 @@ On first use macOS will ask for **Input Monitoring** permission
 (System Settings → Privacy & Security → Input Monitoring) — that's the gate for
 opening any HID interface of a keyboard-class device. Grant it and relaunch.
 
+## The mouse
+
+`gmmk-cli mouse help` lists everything. The common ones:
+
+```sh
+gmmk-cli mouse info                 # decoded configuration + firmware + DPI stages
+gmmk-cli mouse dump before.bin      # BACK UP FIRST — see below
+gmmk-cli mouse color 00e5ff         # solid color
+gmmk-cli mouse effect wave --speed 2 --brightness 3
+gmmk-cli mouse dpi 2 1600           # stage 2 → 1600 dpi
+gmmk-cli mouse dpi-enable 6 off     # switch a stage off
+gmmk-cli mouse dpi-active 3         # 1-based over ENABLED stages only
+gmmk-cli mouse polling 1000
+gmmk-cli mouse debounce 8
+```
+
+### Back up before you write
+
+Every mouse setting except debounce lives in a single 520-byte configuration
+blob, and there is no way to poke one field: a write is always the whole blob
+read back, modified and sent again. That also means one bad write replaces
+everything at once. So:
+
+```sh
+gmmk-cli mouse dump before-anything.bin        # refuses to overwrite an existing file
+# …change things…
+gmmk-cli mouse restore before-anything.bin --config-size 131 --yes
+```
+
+`restore` needs `--config-size` because byte `0x03` of the write is
+`<config size> - 8`, and that byte is what decides whether the mouse accepts the
+write at all. `mouse info` prints the size the device reported — use that.
+Debounce is **not** in the blob (it is command `0x1a`), so a dump does not back
+it up; note the value from `mouse info` if you have changed it.
+
+The blob write is itself the commit. There is no save command, and the settings
+survive a replug.
+
 ## Compatibility
 
-Developed and hardware-verified against a **GMMK 1 TKL ANSI, firmware 1.08**.
-Full-size and Compact GMMK 1 boards share the same USB identity and protocol
-family and should work; per-effect color rendering varies between LED batches.
-GMMK Pro / GMMK 2 / GMMK 3 are **not** supported — those speak different
-protocols and have official macOS support via Glorious CORE.
+Developed and hardware-verified against a **GMMK 1 TKL ANSI, firmware 1.08** and
+a **wired Glorious Model O-**. Full-size and Compact GMMK 1 boards share the
+same USB identity and protocol family and should work; per-effect color
+rendering varies between LED batches. The Model O and Model O- are the same
+device to software — one USB ID, one detector in every published tool, no
+size-conditional logic anywhere. GMMK Pro / GMMK 2 / GMMK 3 and the **wireless**
+Model O/O- are **not** supported — different protocols, different USB IDs.
 
 ## Safety
 
-The GMMK 1's SN32 microcontroller exposes its flash bootloader via feature
-reports on the boot-keyboard interface. This project **never** sends feature
-reports there, never sends the keymap/macro command family, and never sends the
-four undocumented no-argument commands — see
-[`docs/protocol-tkl-notes.md`](docs/protocol-tkl-notes.md) §4 and §10 for what
-those hazards are. If your lighting ever ends up in a weird state, unplug and
-replug the keyboard; factory reset is `FN+ESC` then `F1+F3+F5`.
+Both devices have a firmware-flashing door, and both are avoided by
+construction rather than by care.
+
+**Keyboard.** The GMMK 1's SN32 microcontroller exposes its flash bootloader via
+feature reports on the boot-keyboard interface. This project **never** sends
+feature reports there, never sends the keymap/macro command family, and never
+sends the four undocumented no-argument commands — see
+[`docs/protocol-tkl-notes.md`](docs/protocol-tkl-notes.md) §4 and §10. If your
+lighting ever ends up in a weird state, unplug and replug the keyboard; factory
+reset is `FN+ESC` then `F1+F3+F5`.
+
+**Mouse.** This one is sharper: the SinoWealth ISP bootloader shares feature
+report 5 with the configuration protocol, so `05 75 …` — one byte away from the
+firmware-version read — drops the mouse into DFU. Every command goes through an
+**allow-list** of the six documented safe verbs, report 6 is refused outright,
+and the command space is never swept. See
+[`docs/mouse-protocol.md`](docs/mouse-protocol.md) §9. A mouse that does end up
+in the bootloader re-enumerates as `0603:1020` and is recovered by replugging;
+it only becomes a brick if something then writes flash.
 
 ## Project layout
 
 | Target | What it is |
 |---|---|
-| `GMMKProtocol` | Pure packet builders + checksum; golden-byte unit tests |
-| `GMMKHID` | IOKit HID transport: vendor-interface matching, 64-byte frames, hello-read session opener, echo-paced sends |
-| `gmmk-cli` | User commands plus the bring-up/debug toolkit (`probe0`–`probe3`, `read`, `raw`) |
-| `GMMKLightsApp` | The menu-bar app |
-| `docs/` | The protocol references — likely the most complete public documentation of this keyboard's protocol |
+| `GMMKProtocol` | Keyboard: pure packet builders + checksum, the ANSI TKL key map, switch-compensation math; golden-byte unit tests |
+| `GMMKHID` | Keyboard: IOKit HID transport — vendor-interface matching, 64-byte frames, hello-read session opener, echo-paced sends |
+| `GloriousMouseProtocol` | Mouse: the 520-byte config blob with typed accessors, the safe-verb command channel, and the ISP guard |
+| `GloriousMouseHID` | Mouse: IOKit feature-report transport, vendor-collection matching, hot-plug |
+| `gmmk-cli` | Both devices, plus the keyboard bring-up/debug toolkit (`probe0`–`probe3`, `read`, `raw`) |
+| `GMMKLightsApp` | The menu-bar app for both |
+| `docs/` | The protocol references — likely the most complete public documentation of either device's protocol |
+
+The mouse targets deliberately share no code with the keyboard's. Nothing in the
+keyboard's protocol transfers: no checksum, no bracketing, no interrupt channel,
+and a completely different notion of profiles.
 
 ## Attribution
 
-The wire protocol was reverse-engineered with the help of three earlier
-open-source projects — [`paulguy/gmmkctl`](https://github.com/paulguy/gmmkctl)
+The keyboard's wire protocol was reverse-engineered with the help of three
+earlier open-source projects — [`paulguy/gmmkctl`](https://github.com/paulguy/gmmkctl)
 (GPL-3.0), [`dokutan/rgb_keyboard`](https://github.com/dokutan/rgb_keyboard)
 (GPL-3.0-or-later, whose effect names this project's UI uses), and
 [`hangrydave/GKeyboardController`](https://github.com/hangrydave/GKeyboardController)
 (GPL-3.0) — and by static analysis of the official (freely distributed) GMMK
-Editor for interoperability. **No code from any of them was copied**; every
-line here is original Swift, and the macOS-specific findings are new. Details in
+Editor for interoperability.
+
+The mouse's protocol was documented from
+[`libratbag`](https://github.com/libratbag/libratbag)'s `driver-sinowealth.c`
+(MIT), [OpenRGB](https://gitlab.com/CalcProgrammer1/OpenRGB)'s Sinowealth
+controller (GPL-2.0), and [`carlossless/sinowisp`](https://github.com/carlossless/sinowisp)
+for the ISP hazards specifically.
+
+**No code from any of them was copied**; every line here is original Swift, and
+the macOS-specific findings are new. Details in
 [`docs/attribution.md`](docs/attribution.md).
 
 ## License

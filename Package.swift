@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "gmmk-lights",
+    name: "glorious-lights",
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "GMMKProtocol", targets: ["GMMKProtocol"]),

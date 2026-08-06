@@ -1,4 +1,8 @@
-# GMMK Lights — Design Spec (2026-08-05)
+# Glorious Lights — Design Spec (2026-08-05)
+
+> Historical: this is the original design spec, written when the project was
+> keyboard-only and called GMMK Lights. Mouse support came later — see
+> [`mouse-protocol.md`](mouse-protocol.md).
 
 ## Goal
 Native macOS menu-bar app to control RGB lighting on the original GMMK 1 TKL

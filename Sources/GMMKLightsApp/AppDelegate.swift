@@ -59,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "keyboard",
-                                           accessibilityDescription: "GMMK Lights")
+                                           accessibilityDescription: "Glorious Lights")
         statusItem.button?.image?.isTemplate = true
         statusItem.menu = menu
 
@@ -159,7 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mouseSection.install(in: menu)
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(title: "Quit GMMK Lights",
+        let quit = NSMenuItem(title: "Quit Glorious Lights",
                               action: #selector(NSApplication.terminate(_:)),
                               keyEquivalent: "q")
         quit.target = NSApp
