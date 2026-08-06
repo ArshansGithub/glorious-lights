@@ -573,3 +573,18 @@ Nothing here writes anything. Ordered so each step validates the next.
    and `SetFeature(4, 520)`. Read back and compare. Preserve every `unknown*`
    byte exactly.
 7. Never send anything from §9. Never sweep report 5.
+
+---
+
+## 13. Verified on hardware (2026-08-06, fw V103): the per-LED constant mode works
+
+§11 item 5 is resolved. Writing effect `0x06` with six distinct colours at
+`0x56`–`0x67` (RBG order, same as every other colour field) produces six
+individually-coloured LEDs — the first known working use of this mode in any
+software, Glorious's included.
+
+Physical mapping, established by writing R,G,B,Y,M,C in index order and
+observing: **each side strip carries all six LEDs in index order,
+front (cable end) to back; both strips are driven identically (mirrored); the
+scroll wheel follows LED index 1.** Perceived intermediate hues between
+adjacent LEDs are diffuser blending, not extra channels.

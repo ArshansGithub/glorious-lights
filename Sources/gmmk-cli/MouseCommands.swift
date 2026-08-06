@@ -484,6 +484,43 @@ func runMouseCommand(_ arguments: [String]) -> Never {
             "lift-off -> \(distance.displayName), reads back as \(after.liftOffDistance.displayName)"
         }
 
+    case "leds":
+        // Experimental: effect 0x06 ("constant") addresses all six LEDs
+        // individually via colours at 0x56-0x67 — present in the firmware but
+        // absent from Glorious's own software and unimplemented by OpenRGB and
+        // libratbag alike (docs/mouse-protocol.md §11 item 5). Takes 1-6
+        // colours; missing ones repeat the last.
+        guard !rest.isEmpty, rest.count <= 6 else {
+            fail("`mouse leds` takes 1-6 hex colours (RRGGBB), one per LED", .usage)
+        }
+        var ledColors: [MouseRGB] = []
+        for hexArg in rest {
+            guard let rgb = MouseRGB(hex: hexArg) else {
+                fail("'\(hexArg)' is not a hex colour (RRGGBB)", .usage)
+            }
+            ledColors.append(rgb)
+        }
+        while ledColors.count < 6 { ledColors.append(ledColors.last!) }
+        withMouse { mouse in
+            var blob = try mouse.readConfig(profile: .one)
+            guard let size = blob.observedConfigSize else {
+                fail("could not observe the config size from the read; refusing to write", .transport)
+            }
+            blob.effect = .constant
+            try blob.setColors(ledColors, for: .constant)
+            if let param = blob.modeParameter(for: .constant) {
+                try blob.setModeParameter(MouseModeParameter(speed: param.speed, brightness: 4),
+                                          for: .constant)
+            }
+            let prepared = blob.preparedForWrite(profile: .one, configSize: size)
+            try mouse.writeConfig(prepared)
+            let after = try mouse.readConfig(profile: .one)
+            let ok = after.effect == .constant && after.colors(for: .constant) == ledColors
+            print("per-LED constant mode: "
+                  + ledColors.map { "#\($0.hexString)" }.joined(separator: " ")
+                  + "\nwrite " + (ok ? "verified by read-back" : "NOT confirmed by read-back"))
+        }
+
     case "restore":
         guard let path = rest.first else {
             fail("`mouse restore` needs the path of a file written by `mouse dump`", .usage)
