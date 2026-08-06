@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private lazy var visualizer = VisualizerController(
         lease: controller.lease,
+        source: settings.visualizerSource,
         style: settings.visualizerStyle,
         themeColor: settings.color,
         sensitivity: settings.visualizerSensitivity,
@@ -35,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let visualizerOptionsItem = NSMenuItem(title: "Visualizer Options",
                                                    action: nil, keyEquivalent: "")
     private let visualizerStyleMenu = NSMenu()
+    private let visualizerSourceMenu = NSMenu()
     private let visualizerSensitivityMenu = NSMenu()
     private let visualizerAutoGainItem = NSMenuItem(title: "Auto Gain",
                                                     action: nil, keyEquivalent: "")
@@ -103,6 +105,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // own flash too, and the menu is drawn from what it reports.
         mouseController.onStatusChange = { [weak self] in self?.mouseSection.refresh() }
         mouseController.start()
+
+        // First launch only: prefer system audio when it is already granted,
+        // since it hears the mix rather than the room. Never overrides a source
+        // the user has since chosen, and never provokes a permission prompt —
+        // an ungranted source is simply not preferred.
+        if !settings.hasChosenVisualizerSource {
+            settings.visualizerSource = preferredAudioSource(
+                systemAudio: SystemAudio.authorization,
+                microphone: AudioCapture.authorization)
+            settings.hasChosenVisualizerSource = true
+            settings.save()
+            visualizer.source = settings.visualizerSource
+        }
 
         visualizer.onStatusChange = { [weak self] in self?.refreshVisualizerItems() }
 
@@ -450,6 +465,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         styleItem.submenu = visualizerStyleMenu
         submenu.addItem(styleItem)
 
+        for source in AudioSource.allCases {
+            let item = NSMenuItem(title: source.displayName,
+                                  action: #selector(selectVisualizerSource(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = source
+            visualizerSourceMenu.addItem(item)
+        }
+        let sourceItem = NSMenuItem(title: "Source", action: nil, keyEquivalent: "")
+        sourceItem.submenu = visualizerSourceMenu
+        submenu.addItem(sourceItem)
+
         // A multiplier, so the steps are geometric — the difference between 1x
         // and 2x matters far more than between 7x and 8x.
         for multiplier in [0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0] {
@@ -474,21 +501,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return visualizerOptionsItem
     }
 
+    /// Authorization for whichever source is selected.
+    private var currentSourceAuthorization: AudioSourceAuthorization {
+        switch settings.visualizerSource {
+        case .microphone:  return AudioCapture.authorization
+        case .systemAudio: return SystemAudio.authorization
+        }
+    }
+
     private func refreshVisualizerItems() {
         visualizerItem.state = visualizer.isRunning ? .on : .off
-        let authorization = AudioCapture.Authorization.current
+        let source = settings.visualizerSource
+        let authorization = currentSourceAuthorization
 
         switch authorization {
         case .denied:
-            visualizerItem.title = "Audio Visualizer — microphone access needed"
-            visualizerItem.toolTip = "Grant access in System Settings › Privacy & Security "
-                + "› Microphone, then try again."
+            visualizerItem.title = "Audio Visualizer — \(source.permissionName.lowercased()) "
+                + "access needed"
+            visualizerItem.toolTip = "Grant access in System Settings › Privacy & Security › "
+                + "\(source.permissionName), then try again."
+        case .unavailable:
+            visualizerItem.title = "Audio Visualizer — system audio needs macOS 14.2"
+            visualizerItem.toolTip = "Capturing system audio uses CoreAudio process taps, "
+                + "added in macOS 14.2. Switch the source to Microphone."
         case .granted, .undetermined:
             visualizerItem.title = "Audio Visualizer"
             visualizerItem.toolTip = visualizer.lastError
         }
         // Still clickable when denied: the click is what opens System Settings.
-        visualizerItem.isEnabled = controller.isConnected || authorization == .denied
+        visualizerItem.isEnabled = (controller.isConnected && authorization != .unavailable)
+            || authorization == .denied
+
+        for item in visualizerSourceMenu.items {
+            guard let itemSource = item.representedObject as? AudioSource else { continue }
+            item.state = itemSource == source ? .on : .off
+            let itemAuthorization = itemSource == .microphone
+                ? AudioCapture.authorization
+                : SystemAudio.authorization
+            item.isEnabled = itemAuthorization != .unavailable
+            item.toolTip = itemAuthorization == .unavailable
+                ? "Needs macOS 14.2 or later."
+                : "Needs \(itemSource.permissionName) permission."
+        }
 
         for item in visualizerStyleMenu.items {
             item.state = (item.representedObject as? VisualizerStyle) == settings.visualizerStyle
@@ -503,17 +557,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleVisualizer(_ sender: NSMenuItem) {
-        if AudioCapture.Authorization.current == .denied {
-            openMicrophoneSettings()
+        if currentSourceAuthorization == .denied {
+            openPrivacySettings(for: settings.visualizerSource)
             return
         }
         if visualizer.isRunning {
             stopVisualizer()
             return
         }
-        // Asking is asynchronous the first time, so the start hangs off the
-        // answer rather than racing it.
-        if AudioCapture.Authorization.current == .undetermined {
+        // The microphone can be asked ahead of time, and asking is
+        // asynchronous, so the start hangs off the answer rather than racing
+        // it. System audio has no such API — its prompt appears when the tap is
+        // created, so starting *is* the request.
+        if settings.visualizerSource == .microphone,
+           AudioCapture.authorization == .undetermined {
             AudioCapture.requestAuthorization { [weak self] authorization in
                 guard let self else { return }
                 if authorization == .granted { self.startVisualizer() }
@@ -525,6 +582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func startVisualizer() {
+        visualizer.source = settings.visualizerSource
         visualizer.update(style: settings.visualizerStyle,
                           themeColor: settings.color,
                           sensitivity: settings.visualizerSensitivity,
@@ -565,10 +623,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              color: settings.color)
     }
 
-    private func openMicrophoneSettings() {
-        let url = URL(string:
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+    /// Opens the Privacy pane for whichever permission the source needs.
+    ///
+    /// The anchors are the ones System Settings' own privacy extension
+    /// declares — system audio is `Privacy_AudioCapture`, a different pane from
+    /// the microphone's.
+    private func openPrivacySettings(for source: AudioSource) {
+        let anchor = source == .systemAudio ? "Privacy_AudioCapture" : "Privacy_Microphone"
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)")
         if let url { NSWorkspace.shared.open(url) }
+    }
+
+    @objc private func selectVisualizerSource(_ sender: NSMenuItem) {
+        guard let source = sender.representedObject as? AudioSource else { return }
+        settings.visualizerSource = source
+        settings.save()
+        // Switching source mid-session restarts capture: the pipeline is
+        // source-agnostic but the capture object is not.
+        if visualizer.isRunning {
+            visualizer.stop()
+            visualizer.source = source
+            visualizer.start()
+        } else {
+            visualizer.source = source
+        }
+        refreshVisualizerItems()
     }
 
     @objc private func selectVisualizerStyle(_ sender: NSMenuItem) {

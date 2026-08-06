@@ -1,5 +1,21 @@
 import AVFoundation
 import Foundation
+import GloriousVisualizer
+
+/// What the visualizer needs from a capture source, whichever it is.
+///
+/// Both implementations produce mono `Float` windows and nothing downstream
+/// knows which one it is talking to — the FFT, the smoothing and the render are
+/// identical either way.
+protocol AudioSourceCapturing: AnyObject {
+    /// Called on the capture thread with mono samples. Must not block.
+    var onSamples: (([Float]) -> Void)? { get set }
+    /// The rate the source is actually running at, valid once started.
+    var sampleRate: Double { get }
+    var isRunning: Bool { get }
+    func start() throws
+    func stop()
+}
 
 /// Microphone capture for the visualizer: a tap on the input node that hands
 /// mono `Float` windows to a callback.
@@ -7,22 +23,15 @@ import Foundation
 /// Deliberately thin. It knows nothing about spectra or keyboards — it starts an
 /// engine, downmixes whatever the device gives it, and calls back. Everything
 /// interesting happens downstream, where it can be tested without a microphone.
-final class AudioCapture {
+final class AudioCapture: AudioSourceCapturing {
 
-    /// Whether the user has granted, denied, or not yet been asked.
-    enum Authorization {
-        case granted
-        case denied
-        case undetermined
-
-        /// The current state, without prompting.
-        static var current: Authorization {
-            switch AVCaptureDevice.authorizationStatus(for: .audio) {
-            case .authorized:            return .granted
-            case .denied, .restricted:   return .denied
-            case .notDetermined:         return .undetermined
-            @unknown default:            return .denied
-            }
+    /// The current microphone authorization, without prompting.
+    static var authorization: AudioSourceAuthorization {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:            return .granted
+        case .denied, .restricted:   return .denied
+        case .notDetermined:         return .undetermined
+        @unknown default:            return .denied
         }
     }
 
@@ -61,7 +70,7 @@ final class AudioCapture {
     ///
     /// The completion is delivered on the main queue: AVFoundation calls back on
     /// an arbitrary one, and every caller here goes on to touch the menu.
-    static func requestAuthorization(_ completion: @escaping (Authorization) -> Void) {
+    static func requestAuthorization(_ completion: @escaping (AudioSourceAuthorization) -> Void) {
         AVCaptureDevice.requestAccess(for: .audio) { granted in
             DispatchQueue.main.async { completion(granted ? .granted : .denied) }
         }
@@ -74,7 +83,7 @@ final class AudioCapture {
     ///   indistinguishable from silence in the room.
     func start() throws {
         guard !isRunning else { return }
-        guard Authorization.current == .granted else { throw StartError.notAuthorized }
+        guard Self.authorization == .granted else { throw StartError.notAuthorized }
 
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)

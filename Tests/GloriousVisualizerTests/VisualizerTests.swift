@@ -330,6 +330,61 @@ final class VisualizerTests: XCTestCase {
         }
     }
 
+    // MARK: - Source selection
+
+    /// System audio is what someone playing music actually wants — it hears the
+    /// mix rather than the room — so it wins when it is already granted.
+    func testSystemAudioIsPreferredWhenGranted() {
+        XCTAssertEqual(preferredAudioSource(systemAudio: .granted, microphone: .granted),
+                       .systemAudio)
+        XCTAssertEqual(preferredAudioSource(systemAudio: .granted, microphone: .denied),
+                       .systemAudio)
+        XCTAssertEqual(preferredAudioSource(systemAudio: .granted, microphone: .undetermined),
+                       .systemAudio)
+    }
+
+    /// **Anything short of granted falls back rather than prompting.** The
+    /// permission dialog should follow a deliberate choice in the picker, not
+    /// appear because the app launched.
+    func testAnUngrantedSystemAudioDoesNotWin() {
+        for state: AudioSourceAuthorization in [.denied, .undetermined, .unavailable] {
+            XCTAssertEqual(preferredAudioSource(systemAudio: state, microphone: .granted),
+                           .microphone, "system audio \(state)")
+        }
+    }
+
+    /// With neither granted, the microphone is offered because its prompt is
+    /// the one users recognise — but only if it can still be asked for.
+    func testFallbackWhenNeitherIsGranted() {
+        XCTAssertEqual(preferredAudioSource(systemAudio: .undetermined,
+                                            microphone: .undetermined), .microphone)
+        XCTAssertEqual(preferredAudioSource(systemAudio: .undetermined, microphone: .denied),
+                       .systemAudio)
+        XCTAssertEqual(preferredAudioSource(systemAudio: .unavailable, microphone: .denied),
+                       .microphone)
+        XCTAssertEqual(preferredAudioSource(systemAudio: .denied, microphone: .denied),
+                       .microphone)
+    }
+
+    /// The picker's copy has to name the permission macOS will actually ask
+    /// for, or the instruction sends people to the wrong Settings pane.
+    func testSourcesNameTheirOwnPermission() {
+        XCTAssertEqual(AudioSource.microphone.permissionName, "Microphone")
+        XCTAssertEqual(AudioSource.systemAudio.permissionName, "Audio Recording")
+        XCTAssertEqual(Set(AudioSource.allCases.map(\.displayName)).count,
+                       AudioSource.allCases.count)
+        XCTAssertEqual(AudioSource.allCases.count, 2)
+    }
+
+    /// Raw values are persisted, so they are API and must not drift.
+    func testSourceRawValuesArePersistable() {
+        XCTAssertEqual(AudioSource.microphone.rawValue, "microphone")
+        XCTAssertEqual(AudioSource.systemAudio.rawValue, "systemAudio")
+        for source in AudioSource.allCases {
+            XCTAssertEqual(AudioSource(rawValue: source.rawValue), source)
+        }
+    }
+
     // MARK: - Auto-gain
 
     /// A loud peak takes effect at once; the reference then decays slowly, so

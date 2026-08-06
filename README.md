@@ -71,6 +71,18 @@ Two prompts, both one-time, both unavoidable:
    and relaunch. Without it the menu says the keyboard was found but is not
    usable.
 
+Only the audio visualizer needs anything further, and only when you start it:
+
+- **System Audio** source → *Audio Recording* permission (System Settings →
+  Privacy & Security → Audio Recording). This is the CoreAudio process-tap
+  route; it does **not** need Screen Recording, and it needs macOS 14.2 or
+  later. macOS has no API to ask for this ahead of time, so the prompt appears
+  the first time you start the visualizer on this source.
+- **Microphone** source → *Microphone* permission, asked for the usual way.
+
+If either is refused, the menu item says which permission is missing and
+clicking it opens the right Settings pane.
+
 The app has no Dock icon: it lives in the menu bar.
 
 ### Build from source
@@ -137,8 +149,10 @@ release archive and print its SHA-256.
   lives in one tested place — see `Sources/GloriousSync`.
 - **Audio visualizer:** *Audio Visualizer* turns the keyboard into a live
   spectrum analyzer — 17 columns of keys as bars, the function row flashing on
-  peaks, in either the heat ramp or your own color. It listens to the microphone
-  (asked for on first use, analysed in memory and never recorded), and it takes
+  peaks, in either the heat ramp or your own color. Listen to **system audio**
+  (what's actually playing, via a CoreAudio process tap — macOS 14.2+) or the
+  **microphone**, switchable in *Visualizer Options › Source*. Either way audio
+  is analysed in memory and never recorded, saved or sent anywhere. It takes
   over the keyboard while running, handing it back and restoring your look when
   you stop.
 - **CLI:** `swift run -c release gmmk-cli help`

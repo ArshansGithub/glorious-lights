@@ -34,6 +34,8 @@ struct Settings {
         static let visualizerStyle = "visualizer.style"
         static let visualizerSensitivity = "visualizer.sensitivity"
         static let visualizerAutoGain = "visualizer.autoGain"
+        static let visualizerSource = "visualizer.source"
+        static let hasChosenVisualizerSource = "visualizer.sourceChosen"
         /// What ``markedLEDIndices`` was called when the marked set could only
         /// mean "the Lynx-switch keys". Read once, for migration.
         static let legacyLynxLEDIndices = "compensation.lynxLEDIndices"
@@ -89,6 +91,11 @@ struct Settings {
                                                                blue: 0xFF),
                                            count: MouseLED.count)
 
+    /// Where the visualizer listens. Defaulted lazily rather than here: the
+    /// preferred source depends on which permissions are already granted, which
+    /// is not known until the app asks.
+    var visualizerSource: AudioSource = .microphone
+
     /// How the audio visualizer paints its bars.
     var visualizerStyle: VisualizerStyle = .heat
     /// Input gain multiplier, 0.5x to 8x. Not persisted as a percentage because
@@ -96,6 +103,9 @@ struct Settings {
     var visualizerSensitivity: Double = 2.0
     /// Whether the visualizer normalises to recent peaks.
     var visualizerAutoGain: Bool = true
+    /// Whether a source has ever been chosen, so the first launch can pick the
+    /// better default instead of overriding what the user picked later.
+    var hasChosenVisualizerSource: Bool = false
 
     /// The four compensation fields as the protocol layer wants them.
     var compensationProfile: SwitchCompensation.Profile {
@@ -178,6 +188,13 @@ struct Settings {
         if let stored = defaults.object(forKey: Key.lookSpeed) as? Double {
             deskLook.speed = min(max(stored, 0), 1)
         }
+        if let raw = defaults.string(forKey: Key.visualizerSource),
+           let stored = AudioSource(rawValue: raw) {
+            visualizerSource = stored
+        }
+        if let stored = defaults.object(forKey: Key.hasChosenVisualizerSource) as? Bool {
+            hasChosenVisualizerSource = stored
+        }
         if let raw = defaults.string(forKey: Key.visualizerStyle),
            let stored = VisualizerStyle(rawValue: raw) {
             visualizerStyle = stored
@@ -216,6 +233,8 @@ struct Settings {
         defaults.set(deskLook.brightness, forKey: Key.lookBrightness)
         defaults.set(deskLook.speed, forKey: Key.lookSpeed)
         defaults.set(mouseLEDColors.map(\.hexString), forKey: Key.mouseLEDColors)
+        defaults.set(visualizerSource.rawValue, forKey: Key.visualizerSource)
+        defaults.set(hasChosenVisualizerSource, forKey: Key.hasChosenVisualizerSource)
         defaults.set(visualizerStyle.rawValue, forKey: Key.visualizerStyle)
         defaults.set(visualizerSensitivity, forKey: Key.visualizerSensitivity)
         defaults.set(visualizerAutoGain, forKey: Key.visualizerAutoGain)

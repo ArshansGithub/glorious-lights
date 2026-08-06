@@ -42,7 +42,13 @@ final class VisualizerController {
     static let targetFrameRate: Double = 15
 
     private let lease: TransportLease
-    private let capture = AudioCapture()
+    /// Built per session from ``source``, because the two sources are different
+    /// objects with different lifetimes — everything downstream is identical.
+    private var capture: AudioSourceCapturing?
+
+    /// Which source the next start will use. Changing it while running has no
+    /// effect until the session is restarted; the delegate does that.
+    var source: AudioSource
 
     /// The visualizer's own transport, touched only from ``renderThread``.
     private let keyboard = GMMKKeyboard()
@@ -74,11 +80,13 @@ final class VisualizerController {
     var onStatusChange: (() -> Void)?
 
     init(lease: TransportLease,
+         source: AudioSource,
          style: VisualizerStyle,
          themeColor: RGB,
          sensitivity: Double,
          autoGain: Bool) {
         self.lease = lease
+        self.source = source
         self.style = style
         self.themeColor = themeColor
         self.sensitivity = sensitivity
@@ -118,6 +126,12 @@ final class VisualizerController {
             return fail("Something else is driving the keyboard right now.")
         }
 
+        guard let capture = makeCapture() else {
+            lease.release(.visualizer)
+            return fail("Capturing system audio needs macOS 14.2 or later.")
+        }
+        self.capture = capture
+
         let analyzer = SpectrumAnalyzer(sampleRate: Float(capture.sampleRate),
                                         bandCount: VisualizerLayout.columns.count)
         self.analyzer = analyzer
@@ -134,8 +148,24 @@ final class VisualizerController {
         do {
             try capture.start()
         } catch {
+            self.capture = nil
             lease.release(.visualizer)
             return fail(String(describing: error))
+        }
+
+        // The tap reports its own rate, which need not be the 48 kHz assumed
+        // before it started, so the analyzer is rebuilt once it is known.
+        if abs(capture.sampleRate - Double(analyzer.sampleRate)) > 1 {
+            let corrected = SpectrumAnalyzer(sampleRate: Float(capture.sampleRate),
+                                             bandCount: VisualizerLayout.columns.count)
+            self.analyzer = corrected
+            capture.onSamples = { [weak self] samples in
+                guard let self else { return }
+                let levels = corrected.levels(from: samples)
+                self.levelsLock.lock()
+                self.latestLevels = levels
+                self.levelsLock.unlock()
+            }
         }
 
         isStopping = false
@@ -159,8 +189,9 @@ final class VisualizerController {
     /// re-apply the user's own look without racing a final frame.
     func stop() {
         guard isRunning else { return }
-        capture.stop()
-        capture.onSamples = nil
+        capture?.stop()
+        capture?.onSamples = nil
+        capture = nil
 
         isStopping = true
         // The render loop checks the flag once per frame, so this is bounded by
@@ -178,6 +209,13 @@ final class VisualizerController {
         lease.release(.visualizer)
         isRunning = false
         onStatusChange?()
+    }
+
+    private func makeCapture() -> AudioSourceCapturing? {
+        switch source {
+        case .microphone:  return AudioCapture()
+        case .systemAudio: return SystemAudio.makeCapture()
+        }
     }
 
     @discardableResult
