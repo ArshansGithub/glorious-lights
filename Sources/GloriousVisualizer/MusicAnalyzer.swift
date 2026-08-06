@@ -52,10 +52,19 @@ public final class MusicAnalyzer {
     private var arbiter = OnsetArbiter()
     private var tempoTracker: TempoTracker
 
+    /// A fast-attack, slow-release envelope on the time-domain RMS, so "is
+    /// anything playing" is not a statement about duty cycle. See the master
+    /// brightness below.
+    private var rmsPeak = AHR(attack: 0.005, hold: 0.150, release: 0.600)
+
     private var overallFollower = RelativeFollower()
     private var loudnessReference = QuantileTracker(percentile: 0.90,
                                                     window: PercentileNormaliser.window)
     private var centroidNormaliser = PercentileNormaliser()
+
+    /// §11's three timescales. The one part of the pipeline whose reference
+    /// window is deliberately *longer* than the structure it shows (P9).
+    private var energy = EnergyModel()
 
     private var accents: [OnsetKind: AHR] = [:]
     private var vuEnvelope: AHR
@@ -76,6 +85,10 @@ public final class MusicAnalyzer {
     private var hasStarted = false
     private var lastHopTime: Double = 0
     private var lastOnsetTime: Double = -.infinity
+    /// Monotonic count of §11.3 novelty events, which §12.1's structure kick
+    /// consumes. A counter rather than a flag: the renderer samples states at
+    /// its own rate and may miss the hop an event fired on.
+    private var structureChanges = 0
 
     /// The AGC's gain is clamped to this ratio (§3.3). It is the one place the
     /// design's otherwise fully relative levelling meets an absolute, and it is
@@ -247,6 +260,16 @@ public final class MusicAnalyzer {
     /// is a difference between two adjacent windows). Events are timestamped
     /// back by this, so a gesture starts at the moment the drum was hit rather
     /// than at the moment the maths noticed.
+    /// Measured, r2: the residual is **material-dependent** and no constant
+    /// removes it. An impulsive transient is timestamped about 17 ms earlier
+    /// relative to its true onset than a 50 Hz kick with a 12 ms attack is,
+    /// because §3.1's whitening peak-follower rises instantaneously — a
+    /// broadband transient saturates its bins on the first hop whose window
+    /// touches it, while a low-frequency onset has to build for two or three
+    /// cycles before its bins move at all. Against ground truth the published
+    /// beat grid sits at −16 ms on the click cases and +3 ms on `edm-128` with
+    /// this constant, which straddles zero; §8.3's user offset is what dials out
+    /// whatever a given machine and a given genre leave over.
     public var groupDelay: Double {
         (Double(SpectrumAnalyzer.windowSize) / 2 + Double(hop) / 2) / sampleRate
     }
@@ -339,7 +362,41 @@ public final class MusicAnalyzer {
         // by the brightness control itself. A smoothstep over the bottom quarter
         // of the normalised range gives full brightness to anything genuinely
         // playing and ramps to black only for genuine silence.
-        let masterTarget = smoothstep(0.02, 0.25, clamp(rms * gain, 0, 1))
+        // …measured on a **peak-holding** envelope of the RMS, not on the hop's
+        // own RMS. "Is anything playing" is a question about the material, and a
+        // hop-by-hop RMS answers a question about duty cycle instead: a click
+        // track is 2 % sound and 98 % digital silence, so its mean RMS is 17 dB
+        // below its peak and the master envelope — whose 300 ms attack cannot
+        // follow a 10 ms burst — settled at 0.1 and left the board almost dark
+        // on a signal that is unambiguously playing. Sparse acoustic material
+        // has the same shape in a milder form. The peak envelope's own
+        // ballistics are §4.1's accent numbers, and it changes nothing on
+        // continuous material, where peak and mean coincide.
+        rmsPeak.update(target: rms, now: time, dt: dt)
+        // **The ramp is 0.02…0.06, not 0.02…0.25 (§11.5).** The wide ramp made
+        // the master a *level* spanning 22 dB, and §11.5 deletes exactly that:
+        // "master keeps its 'is anything playing' role only; dynamics come from
+        // `bed + swell`". As a level it was also the largest single cause of the
+        // board dying on quiet material — measured, 31 % of the frames of
+        // `cut-transitions` in which the ground truth says music is playing had
+        // a board mean under 0.06, because a −34 dBFS piano following a loud
+        // section reads 0.05 through an AGC whose reference is still set by the
+        // loud section. The lower edge stays where it is: with the AGC gain
+        // clamped to 16, a −60 dBFS noise bed reaches **exactly** 0.016 and must
+        // stay dark, and the lower edge is placed just above it.
+        //
+        // The upper edge is 0.030, not 0.25 and not 0.06. Anything wider is
+        // still a level, and a level is what §11.5 deletes: the AGC's reference
+        // is a 10 s p90, so during a quiet passage that follows a loud one the
+        // gain has not yet caught up and a −34 dBFS piano reads 0.048 — which a
+        // 0.02…0.25 ramp turns into 0.16 and a 0.02…0.06 ramp into 0.78, in both
+        // cases dimming genuinely audible music by the one multiplier that sits
+        // downstream of everything §11 does. Measured, the wider ramps left
+        // `cut-transitions` completely black for five seconds of each half.
+        // Between 0.016 (a −60 dBFS bed at maximum gain) and 0.030 there is
+        // nothing but the gain clamp itself, which is where the question "is
+        // anything playing" is actually decided.
+        let masterTarget = smoothstep(0.018, 0.030, clamp(rmsPeak.value * gain, 0, 1))
         masterEnvelope.update(target: masterTarget, now: time, dt: dt)
         state[AnalysisState.Channel.master] = masterEnvelope.value
 
@@ -418,10 +475,16 @@ public final class MusicAnalyzer {
             // Liveliness scales the gesture rather than gating it, so material
             // sitting near the stationary boundary fades in instead of
             // appearing all at once.
+            // Which band inside the region actually fired, for §12.4's origin
+            // map. A relative comparison between two bands of the same region,
+            // so it stays dimensionless (P1).
+            let firing = winner.kind.bands.max { bandCurrent[$0] < bandCurrent[$1] }
+                ?? winner.kind.bands.lowerBound
             events.append(OnsetEvent(time: winner.time - groupDelay,
                                      kind: winner.kind,
                                      strength: winner.strength,
-                                     confidence: winner.confidence * lively))
+                                     confidence: winner.confidence * lively,
+                                     band: firing))
             if winner.kind == .kick {
                 // The transient, not the hop that noticed it.
                 tempoTracker.align(toBeatAt: winner.time - groupDelay, now: time)
@@ -442,6 +505,12 @@ public final class MusicAnalyzer {
 
         state.tempo = tempoTracker.process(fluxSum: Float(max(0, totalFlux - medianFlux)),
                                            elapsed: dt)
+        // §2.3.1 — publish the beat, not just the phase. Computed here, where
+        // the phase actually lives, and never recomputed downstream.
+        if state.tempo.bpm > 0 {
+            state.tempo.nextBeatTime =
+                time + (1 - state.tempo.phase) * state.tempo.beatPeriod
+        }
         // The grid is only as believable as the signal is lively. Autocorrelating
         // the residual of a *stationary* signal still finds a peak — a 110 Hz
         // sine reported 114.8 BPM at confidence 0.46, comfortably over
@@ -488,11 +557,44 @@ public final class MusicAnalyzer {
         state[AnalysisState.Channel.brightness] =
             centroidNormaliser.update(logCentroid, dt: dt, frozen: frozen)
 
+        // §11 — the two slower references. Driven from the same RMS the AGC
+        // uses, but referenced against sixty seconds of its own history rather
+        // than four, which is the whole difference between a board with a memory
+        // and a board that returns to a constant after every hit (P9).
+        energy.update(rms: rms, gateOpen: !frozen, now: time, dt: dt)
+        state[AnalysisState.Channel.energy] = energy.energy
+        state[AnalysisState.Channel.phrase] = energy.phrase
+        state[AnalysisState.Channel.section] = energy.section
+        state[AnalysisState.Channel.silenceRamp] = energy.silenceRamp
+        if energy.noveltyFired { structureChanges += 1 }
+        state.structureChanges = structureChanges
+        state[AnalysisState.Channel.spread] = Self.spread(of: bandValues)
+
         return (state, events)
+    }
+
+    /// Normalised spectral entropy over the band set (§12.1).
+    ///
+    /// `spread = −Σ s_b·ln s_b / ln 8` with `s_b = band_b / Σ band`. A bass-only
+    /// passage occupies one band and reads near zero; a full-band passage reads
+    /// near one. It is what decides how far the hue field fans, so the board
+    /// collapses toward one colour exactly when the music does.
+    static func spread(of bands: [Double]) -> Double {
+        let total = bands.reduce(0, +)
+        guard total > QuantileTracker.floor, bands.count > 1 else { return 0 }
+        var entropy = 0.0
+        for value in bands {
+            let share = max(value, 0) / total
+            if share > 1e-12 { entropy -= share * log(share) }
+        }
+        return clamp(entropy / log(Double(bands.count)), 0, 1)
     }
 
     public func reset() {
         whitening.reset()
+        energy.reset()
+        rmsPeak.reset()
+        structureChanges = 0
         for index in followers.indices { followers[index].reset() }
         for index in normalisers.indices { normalisers[index].reset() }
         for index in gates.indices { gates[index].reset() }

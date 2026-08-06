@@ -53,7 +53,19 @@ public struct AnalysisState: Equatable, Sendable {
         public static let overallCurrent = master + 1
         public static let overallAverage = overallCurrent + 1
         public static let brightness = overallAverage + 1
-        public static let count = brightness + 1
+        /// `E(t)` — §11.1's long-referenced energy, normalised over 60 s.
+        public static let energy = brightness + 1
+        /// `Φ(t)` — the PHRASE layer, §11.2.
+        public static let phrase = energy + 1
+        /// `Σ(t)` — the SECTION layer, §11.3.
+        public static let section = phrase + 1
+        /// The §11.3 silence ramp-out, `0…1`.
+        public static let silenceRamp = section + 1
+        /// Normalised spectral entropy — how much of the spectrum is occupied.
+        /// §12.1 uses it as the gradient amplitude, so a bass-only passage
+        /// collapses the board toward one hue and a full-band passage fans it.
+        public static let spread = silenceRamp + 1
+        public static let count = spread + 1
     }
 
     /// Host time this state describes — the timestamp of the last sample in its
@@ -61,6 +73,10 @@ public struct AnalysisState: Equatable, Sendable {
     public var time: Double = 0
     public var channels = [Double](repeating: 0, count: Channel.count)
     public var tempo = TempoEstimate()
+    /// Monotonic count of §11.3 novelty events. Deliberately **not** a channel:
+    /// interpolating a counter would produce fractions of an event, and §12.1's
+    /// structure kick has to fire once per section change or not at all.
+    public var structureChanges = 0
 
     public init() {}
 
@@ -94,7 +110,26 @@ public struct AnalysisState: Equatable, Sendable {
     public var overallCurrentRelative: Double { channels[Channel.overallCurrent] }
     public var overallAverageRelative: Double { channels[Channel.overallAverage] }
     /// Spectral centroid mapped to `0…1` by its own percentiles: 0 dark, 1 bright.
+    ///
+    /// §12.1 changes what this *means* for the display: it is no longer the
+    /// board's colour but the **position of the colour boundary**.
     public var brightness: Double { channels[Channel.brightness] }
+
+    /// `E(t)`, `Φ(t)`, `Σ(t)` — the three timescales of §11. P9 requires every
+    /// displayed quantity to name the timescale it lives on; these are the two
+    /// slower references the fast relative values cannot supply.
+    public var energy: Double { channels[Channel.energy] }
+    public var phrase: Double { channels[Channel.phrase] }
+    public var section: Double { channels[Channel.section] }
+    /// `0` while music plays, ramping to `1` about eight seconds after it stops.
+    public var silenceRamp: Double { channels[Channel.silenceRamp] }
+    /// Normalised spectral entropy, `0…1`.
+    public var spread: Double { channels[Channel.spread] }
+
+    /// The §11.4 composition for this state.
+    public var composition: Composition {
+        Composition(phrase: phrase, section: section, silenceRamp: silenceRamp)
+    }
 
     /// The average of the bands a kick lives in — the trigger amplitude source
     /// for pulse and wave.
@@ -109,13 +144,19 @@ public struct AnalysisState: Equatable, Sendable {
     public static func mix(_ a: AnalysisState, _ b: AnalysisState, _ t: Double) -> AnalysisState {
         var out = a
         out.time = a.time + (b.time - a.time) * t
+        out.structureChanges = b.structureChanges
         for index in out.channels.indices {
             out.channels[index] = a.channels[index] + (b.channels[index] - a.channels[index]) * t
         }
+        // `nextBeatTime` is an absolute instant and `phaseSigma` a statistic:
+        // neither may be blended toward a stale value, so both come from the
+        // newer state whole (§2.3.1).
         out.tempo = TempoEstimate(bpm: b.tempo.bpm,
                                   confidence: a.tempo.confidence
                                       + (b.tempo.confidence - a.tempo.confidence) * t,
-                                  phase: b.tempo.phase)
+                                  phase: b.tempo.phase,
+                                  nextBeatTime: b.tempo.nextBeatTime,
+                                  phaseSigma: b.tempo.phaseSigma)
         return out
     }
 
@@ -128,6 +169,7 @@ public struct AnalysisState: Equatable, Sendable {
                                   _ t: Double) -> AnalysisState {
         var out = b
         out.time = b.time + (c.time - b.time) * t
+        out.structureChanges = c.structureChanges
         let t2 = t * t
         let t3 = t2 * t
         for index in out.channels.indices {
@@ -144,7 +186,9 @@ public struct AnalysisState: Equatable, Sendable {
         out.tempo = TempoEstimate(bpm: c.tempo.bpm,
                                   confidence: b.tempo.confidence
                                       + (c.tempo.confidence - b.tempo.confidence) * t,
-                                  phase: c.tempo.phase)
+                                  phase: c.tempo.phase,
+                                  nextBeatTime: c.tempo.nextBeatTime,
+                                  phaseSigma: c.tempo.phaseSigma)
         return out
     }
 }
