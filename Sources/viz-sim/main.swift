@@ -191,6 +191,8 @@ var referencePerFrame: [Float] = []
 var floorPerFrame: [Float] = []
 var litFractionPerFrame: [Double] = []
 var coherencePerFrame: [Double] = []
+var huePerFrame: [Double] = []
+var brightnessPerFrame: [Double] = []
 var bpmSamples: [Double] = []
 var confidenceSamples: [Double] = []
 var onsetCounts: [OnsetKind: Int] = [:]
@@ -204,6 +206,56 @@ do {
                             frameRate: fps)
 } catch {
     fail(String(describing: error))
+}
+
+/// Hue of a frame's brightest key, in degrees, and the frame's overall
+/// brightness as the mean luminance across every level key.
+///
+/// Hue is taken from the brightest key rather than averaged: averaging colours
+/// across a frame walks toward grey and would report a narrow spread even for a
+/// vividly varying board.
+func hueAndBrightness(_ colors: [RGB]) -> (hue: Double?, brightness: Double) {
+    func luminance(_ color: RGB) -> Double {
+        (0.2126 * Double(color.red) + 0.7152 * Double(color.green)
+         + 0.0722 * Double(color.blue)) / 255
+    }
+    var total = 0.0
+    var count = 0
+    var brightest = RGB.black
+    var peak = 0.0
+    for column in VisualizerLayout.columns {
+        for row in column.levelRows {
+            for led in row {
+                let offset = Int(led) - Int(GMMKKeyMap.minLEDIndex)
+                guard colors.indices.contains(offset) else { continue }
+                let value = luminance(colors[offset])
+                total += value
+                count += 1
+                if value > peak { peak = value; brightest = colors[offset] }
+            }
+        }
+    }
+    let brightness = count > 0 ? total / Double(count) : 0
+    guard peak > 0.05 else { return (nil, brightness) }
+
+    let r = Double(brightest.red) / 255
+    let g = Double(brightest.green) / 255
+    let b = Double(brightest.blue) / 255
+    let maximum = max(r, max(g, b))
+    let minimum = min(r, min(g, b))
+    let delta = maximum - minimum
+    guard delta > 0.02 else { return (nil, brightness) }
+
+    var hue: Double
+    if maximum == r {
+        hue = 60 * ((g - b) / delta).truncatingRemainder(dividingBy: 6)
+    } else if maximum == g {
+        hue = 60 * ((b - r) / delta + 2)
+    } else {
+        hue = 60 * ((r - g) / delta + 4)
+    }
+    if hue < 0 { hue += 360 }
+    return (hue, brightness)
 }
 
 /// Measures the *shape* of the bright region: how much of the board is
@@ -282,6 +334,9 @@ for frame in 0..<frameCount {
     let measured = gestureCoherence(colors)
     litFractionPerFrame.append(measured.lit)
     coherencePerFrame.append(measured.coherence)
+    let appearance = hueAndBrightness(colors)
+    if let hue = appearance.hue { huePerFrame.append(hue) }
+    brightnessPerFrame.append(appearance.brightness)
 
     do {
         try movie?.append(try FrameImage.image(colors: colors))
@@ -309,6 +364,28 @@ do { try movie?.finish() } catch { fail(String(describing: error)) }
 func mean(_ values: [Double]) -> Double {
     values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
 }
+
+func percentile(_ values: [Double], _ fraction: Double) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted()
+    let index = Int((Double(sorted.count - 1) * fraction).rounded())
+    return sorted[index]
+}
+
+// Hue is circular, so the spread is the widest gap's complement: a run that
+// wraps past 360 is one arc, not two distant ones.
+let hueSpread: Double = {
+    guard huePerFrame.count > 1 else { return 0 }
+    let sorted = huePerFrame.sorted()
+    var widestGap = sorted[0] + 360 - sorted[sorted.count - 1]
+    for index in 1..<sorted.count {
+        widestGap = max(widestGap, sorted[index] - sorted[index - 1])
+    }
+    return max(0, 360 - widestGap)
+}()
+let hueSummary: String = huePerFrame.isEmpty
+    ? "none (board never bright enough)"
+    : String(format: "%.0f° – %.0f°", huePerFrame.min()!, huePerFrame.max()!)
 
 let bpmMean = mean(bpmSamples)
 let bpmSorted = bpmSamples.sorted()
@@ -360,6 +437,16 @@ for kind in OnsetKind.allCases {
 
 report += """
 
+
+    colour
+      hue range:           \(hueSummary)
+      hue spread:          \(String(format: "%.0f", hueSpread))°  (of 360; wide = expressive)
+
+    contrast
+      mean brightness:     \(String(format: "%.3f", mean(brightnessPerFrame)))
+      brightness p10:      \(String(format: "%.3f", percentile(brightnessPerFrame, 0.10)))  (dark end)
+      brightness p90:      \(String(format: "%.3f", percentile(brightnessPerFrame, 0.90)))  (bright end)
+      dynamic range p90/p10: \(String(format: "%.1fx", percentile(brightnessPerFrame, 0.10) > 0.001 ? percentile(brightnessPerFrame, 0.90) / percentile(brightnessPerFrame, 0.10) : 0))
 
     gesture
       mean lit fraction:   \(String(format: "%.3f", mean(litFractionPerFrame)))  (of all level keys)

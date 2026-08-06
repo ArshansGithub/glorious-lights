@@ -183,6 +183,9 @@ public final class VisualizerPipeline {
     private var latestCentroid: Float = 0
     /// Previous full spectrum, for the broadband flux the tempo tracker runs on.
     private var previousSpectrum: [Float] = []
+    /// Recent broadband flux, for the running median the envelope is rectified
+    /// against.
+    private var fluxHistory: [Float] = []
 
     public init(sampleRate: Float, bandCount: Int, tuning: Tuning = Tuning()) {
         self.sampleRate = sampleRate
@@ -216,6 +219,10 @@ public final class VisualizerPipeline {
     /// frame-to-frame wobble of noise, short enough that a passage starting is
     /// not held back for a noticeable moment.
     public static let decisionAverageTime: Double = 0.25
+
+    /// How much broadband flux history the tempo envelope's median is drawn
+    /// from — about a second at the analysis rate.
+    static let fluxHistoryLength = 96
 
     // MARK: - Analysis half
 
@@ -288,7 +295,22 @@ public final class VisualizerPipeline {
         }
         previousSpectrum = magnitudes
 
-        let tempo = tempoTracker.process(fluxSum: totalFlux, elapsed: elapsed)
+        // Rectify the envelope against its own running median before handing
+        // it to the tempo tracker. Raw flux carries the track's sustained
+        // energy as well as its hits, and autocorrelating that finds the
+        // texture's periodicity rather than the beat's — which is why the
+        // estimate drifted between 100 and 113 BPM on material whose beat is
+        // neither. Subtracting the median leaves a spiky, onset-dominated
+        // envelope, which is what the autocorrelation is meant to see.
+        fluxHistory.append(totalFlux)
+        if fluxHistory.count > Self.fluxHistoryLength {
+            fluxHistory.removeFirst(fluxHistory.count - Self.fluxHistoryLength)
+        }
+        let sortedFlux = fluxHistory.sorted()
+        let medianFlux = sortedFlux[sortedFlux.count / 2]
+        let onsetEnvelope = max(0, totalFlux - medianFlux)
+
+        let tempo = tempoTracker.process(fluxSum: onsetEnvelope, elapsed: elapsed)
         // A kick is the most reliable thing to align the grid to.
         if firedKinds[.kick] != nil { tempoTracker.align(toOnsetAt: time) }
 
@@ -477,6 +499,7 @@ public final class VisualizerPipeline {
                                                  refractorySeconds: kind.refractorySeconds)
         }
         previousSpectrum.removeAll()
+        fluxHistory.removeAll()
         analysisTime = 0
         lastAnalysisTime = 0
         levelsLock.lock()

@@ -77,9 +77,9 @@ public enum OnsetKind: String, CaseIterable, Sendable {
     /// second on a 120 BPM song, which should be two.
     public var refractorySeconds: Double {
         switch self {
-        case .kick:  return 0.16
+        case .kick:  return 0.18
         case .snare: return 0.13
-        case .hat:   return 0.07
+        case .hat:   return 0.06
         }
     }
 
@@ -88,9 +88,9 @@ public enum OnsetKind: String, CaseIterable, Sendable {
     /// stream of hits.
     public var thresholdRatio: Float {
         switch self {
-        case .kick:  return 2.6
-        case .snare: return 2.4
-        case .hat:   return 2.2
+        case .kick:  return 5.0
+        case .snare: return 4.4
+        case .hat:   return 3.6
         }
     }
 }
@@ -131,7 +131,7 @@ public struct TempoEstimate: Equatable, Sendable {
 /// because the useful threshold on a sparse intro and a dense chorus differ by
 /// an order of magnitude, and a median is what shrugs off the outliers the
 /// onsets themselves create.
-public struct OnsetDetector: Equatable, Sendable {
+public struct OnsetDetector: Sendable {
 
     /// How much of the recent flux history the threshold is drawn from.
     public static let historySeconds: Double = 1.5
@@ -146,6 +146,8 @@ public struct OnsetDetector: Equatable, Sendable {
     private var historyLimit: Int
     private var previousMagnitudes: [Float] = []
     private var lastOnsetTime: Double = -.infinity
+    /// The last three flux values, so the middle one can be peak-tested.
+    private var recent: [(flux: Float, time: Double)] = []
 
     public init(analysisRate: Double,
                 thresholdRatio: Float = 2.4,
@@ -174,7 +176,19 @@ public struct OnsetDetector: Equatable, Sendable {
 
         history.append(flux)
         if history.count > historyLimit { history.removeFirst(history.count - historyLimit) }
-        guard history.count >= 8 else { return 0 }
+
+        // Hold the last three values so the middle one can be tested for being
+        // a **local maximum**. Without this, a single drum hit whose flux stays
+        // above threshold for several analysis frames fires on every one of
+        // them — which is most of why the detector reported 4.4 kicks a second
+        // on a track with 1.9 beats a second. An onset is a peak, not a period
+        // spent above a line.
+        recent.append((flux: flux, time: time))
+        if recent.count > 3 { recent.removeFirst(recent.count - 3) }
+        guard recent.count == 3, history.count >= 8 else { return 0 }
+
+        let candidate = recent[1]
+        guard candidate.flux > recent[0].flux, candidate.flux >= recent[2].flux else { return 0 }
 
         let sorted = history.sorted()
         let median = sorted[sorted.count / 2]
@@ -182,10 +196,11 @@ public struct OnsetDetector: Equatable, Sendable {
         // median is essentially zero.
         let threshold = median * thresholdRatio + 1e-5
 
-        guard flux > threshold, time - lastOnsetTime >= refractorySeconds else { return 0 }
-        lastOnsetTime = time
+        guard candidate.flux > threshold,
+              candidate.time - lastOnsetTime >= refractorySeconds else { return 0 }
+        lastOnsetTime = candidate.time
         // Strength saturates: a hit twice past the threshold is already "hard".
-        return min(1, (flux - threshold) / max(threshold, 1e-6))
+        return min(1, (candidate.flux - threshold) / max(threshold, 1e-6))
     }
 }
 
@@ -225,6 +240,8 @@ public struct TempoTracker: Sendable {
     private var estimate = TempoEstimate()
     /// Recent octave-folded observations, for the median.
     private var observations: [Double] = []
+    /// Whether the published tempo has stopped following the median.
+    private var isLocked = false
     /// Advances with time so phase keeps running between updates.
     private var phaseAccumulator: Double = 0
     private var framesSinceEstimate = 0
@@ -281,18 +298,36 @@ public struct TempoTracker: Sendable {
         let maximumLag = min(centred.count - 1, Int((60 / Self.minimumBPM) * analysisRate))
         guard maximumLag > minimumLag else { return }
 
-        var correlations = [Float](repeating: 0, count: maximumLag + 1)
-        var best = (lag: 0, value: Float(0))
-        for lag in minimumLag...maximumLag {
+        // Correlate across the whole plausible span, plus the multiples the
+        // harmonic sum below needs.
+        let correlationLimit = min(centred.count - 1, maximumLag * Self.harmonics)
+        var correlations = [Float](repeating: 0, count: correlationLimit + 1)
+        for lag in minimumLag...correlationLimit {
             var sum: Float = 0
             for index in lag..<centred.count {
                 sum += centred[index] * centred[index - lag]
             }
             // Normalising by overlap length stops long lags being penalised
             // simply for having fewer terms.
-            let value = sum / Float(centred.count - lag)
-            correlations[lag] = value
-            if value > best.value { best = (lag, value) }
+            correlations[lag] = sum / Float(centred.count - lag)
+        }
+
+        // **Harmonic sum.** A beat period is supported by its own multiples —
+        // energy recurs at one beat, two beats, four — while a metrical
+        // relative is not. Scoring each candidate by its correlation *plus* a
+        // falling share of its multiples is what separates the beat from the
+        // 3:2 and 4:3 lags that a plain peak search picks arbitrarily between:
+        // one track drifted among 100, 113 and 150 BPM, all of which are real
+        // periodicities of the same music.
+        var best = (lag: 0, value: Float(0))
+        for lag in minimumLag...maximumLag {
+            var score = correlations[lag]
+            for harmonic in 2...Self.harmonics {
+                let multiple = lag * harmonic
+                guard multiple <= correlationLimit else { break }
+                score += correlations[multiple] / Float(harmonic)
+            }
+            if score > best.value { best = (lag, score) }
         }
         guard best.lag > 0, best.value > 0 else { return }
 
@@ -317,7 +352,7 @@ public struct TempoTracker: Sendable {
         // periodic signal correlates with itself far better than a wash does.
         let normaliser = energy / Float(centred.count)
         let confidence = normaliser > 0
-            ? min(1, Double(correlations[chosenLag] / normaliser))
+            ? min(1, Double(correlations[min(chosenLag, correlations.count - 1)] / normaliser))
             : 0
 
         recordObservation(bpm: bpm, confidence: confidence)
@@ -356,11 +391,23 @@ public struct TempoTracker: Sendable {
         let agreement = Double(agreeing) / Double(observations.count)
 
         if estimate.bpm <= 0 { phaseAccumulator = 0 }
-        // Only move the published tempo when the median actually moves, so a
-        // locked grid is rock steady rather than dithering by fractions.
-        if abs(median - estimate.bpm) > 0.05 {
+
+        if isLocked {
+            // Release only when the recent observations genuinely stop agreeing
+            // with the locked value — a real tempo change, not one odd reading.
+            let agreeingWithLock = observations.filter {
+                abs($0 - estimate.bpm) / max(estimate.bpm, 1) < 0.04
+            }.count
+            if Double(agreeingWithLock) / Double(observations.count) < Self.unlockAgreement {
+                isLocked = false
+            }
+        } else if agreement >= Self.lockAgreement && observations.count >= 6 {
+            estimate.bpm = median
+            isLocked = true
+        } else if abs(median - estimate.bpm) > 0.05 {
             estimate.bpm = median
         }
+
         estimate.confidence = estimate.confidence * 0.5
             + (agreement * min(1, confidence * 2)) * 0.5
     }
@@ -368,6 +415,21 @@ public struct TempoTracker: Sendable {
     /// How many recent observations the median is taken over — about eight
     /// seconds at one observation every half second.
     private static let observationWindow = 16
+
+    /// Agreement at which the tempo is considered **locked**.
+    ///
+    /// Once this many recent observations agree, the published BPM stops
+    /// following the median at all. Modes tie animation speed to it — the wave
+    /// crosses the board in one beat — so a tempo that keeps drifting by a few
+    /// BPM makes the motion visibly breathe even though the track has not
+    /// changed. Locking costs nothing: a genuine tempo change breaks the
+    /// agreement and releases the lock.
+    private static let lockAgreement = 0.75
+    /// Agreement below which a lock is released.
+    private static let unlockAgreement = 0.45
+
+    /// How many multiples of a candidate lag contribute to its harmonic score.
+    private static let harmonics = 4
 
     /// Nudges the beat phase toward an onset that arrived, so the grid stays
     /// aligned with the music rather than free-running from whenever it locked.
@@ -381,6 +443,9 @@ public struct TempoTracker: Sendable {
     }
 
     public var current: TempoEstimate { estimate }
+
+    /// Whether the tempo is locked and no longer tracking the median.
+    public var isTempoLocked: Bool { isLocked }
 }
 
 // MARK: - Features
@@ -403,6 +468,19 @@ public struct FeatureExtractor: Sendable {
     private var treble: Float = 0
     private var loudness: Float = 0
     private var brightness: Float = 0
+    /// Running bounds of the observed centroid, so the hue ramp is stretched
+    /// across the range this material actually uses.
+    private var centroidLow: Float = 0
+    private var centroidHigh: Float = 0
+    private var hasSeenCentroid = false
+
+    /// How quickly the observed centroid bounds adapt. Slow: they should
+    /// describe the track, not the bar.
+    public static let centroidAdaptTime: Double = 8
+    /// Minimum span of the observed centroid range, in Hz. Without a floor, a
+    /// steady tone collapses the range to nothing and the hue jumps wildly on
+    /// noise.
+    public static let minimumCentroidSpan: Float = 400
 
     public init() {}
 
@@ -446,10 +524,38 @@ public struct FeatureExtractor: Sendable {
                                attack: Self.loudnessAttack,
                                release: Self.loudnessRelease, elapsed: elapsed)
 
-        // Centroid on a log scale, since pitch perception is logarithmic: 200 Hz
-        // to 6 kHz spans the range where music actually moves.
-        let clamped = min(max(centroid, 200), 6_000)
-        let target = Float((log(Double(clamped)) - log(200.0)) / (log(6_000.0) - log(200.0)))
+        // Centroid on a log scale, since pitch perception is logarithmic —
+        // then stretched across the range *this material* actually occupies.
+        //
+        // A fixed 200 Hz - 6 kHz window was the reason every frame came out
+        // blue or purple: real music keeps its centroid in a far narrower band
+        // than that, so only the middle of the hue ramp was ever reached.
+        // Tracking the observed bounds the same way the level stage tracks its
+        // noise floor makes the full ramp available to any source.
+        let logCentroid = log(Double(min(max(centroid, 60), 12_000)))
+        if !hasSeenCentroid {
+            hasSeenCentroid = true
+            centroidLow = Float(logCentroid)
+            centroidHigh = Float(logCentroid)
+        } else {
+            let adapt = Float(exp(-max(elapsed, 0) / Self.centroidAdaptTime))
+            // Bounds snap outward to any new extreme and relax inward slowly,
+            // so a track's full range stays represented between its extremes.
+            centroidLow = min(Float(logCentroid), centroidLow * adapt
+                              + Float(logCentroid) * (1 - adapt))
+            centroidHigh = max(Float(logCentroid), centroidHigh * adapt
+                               + Float(logCentroid) * (1 - adapt))
+        }
+
+        let minimumSpan = Float(log(Double(Self.minimumCentroidSpan)) - log(200.0))
+        var low = centroidLow
+        var high = centroidHigh
+        if high - low < minimumSpan {
+            let middle = (high + low) / 2
+            low = middle - minimumSpan / 2
+            high = middle + minimumSpan / 2
+        }
+        let target = min(max((Float(logCentroid) - low) / (high - low), 0), 1)
         let decay = Float(exp(-max(elapsed, 0) / Self.brightnessTime))
         brightness = target + (brightness - target) * decay
 

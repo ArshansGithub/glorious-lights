@@ -62,13 +62,20 @@ public final class ModeRenderer {
                     Double(themeColor.green) / 255,
                     Double(themeColor.blue) / 255)
         }
-        // Deep orange → magenta → cyan, which keeps saturation up across the
-        // whole sweep rather than passing through a washed-out yellow-green.
+        // A full musical sweep: deep red for bass-dominant passages, through
+        // orange and gold, into green, cyan and finally a bright blue-white for
+        // treble-rich ones. The previous ramp ran orange → magenta → violet →
+        // cyan, which sounds varied but spends most of its length in the
+        // blue-purple quarter of the wheel — and with the centroid mapping only
+        // reaching the middle of it, every frame came out the same colour.
         let stops: [(Double, (Double, Double, Double))] = [
-            (0.00, (1.00, 0.25, 0.05)),
-            (0.35, (0.95, 0.10, 0.55)),
-            (0.70, (0.35, 0.30, 1.00)),
-            (1.00, (0.10, 0.90, 1.00)),
+            (0.00, (1.00, 0.05, 0.02)),
+            (0.18, (1.00, 0.35, 0.00)),
+            (0.36, (1.00, 0.80, 0.05)),
+            (0.54, (0.35, 1.00, 0.15)),
+            (0.72, (0.00, 0.95, 0.75)),
+            (0.88, (0.10, 0.65, 1.00)),
+            (1.00, (0.65, 0.80, 1.00)),
         ]
         let position = Double(min(max(brightness, 0), 1))
         for index in 1..<stops.count where position <= stops[index].0 {
@@ -276,11 +283,15 @@ public final class ModeRenderer {
         let decayTime = max(0.12, period * 0.55)
         pulseEnergy *= Double(exp(-elapsed / decayTime))
 
-        let base = Double(frame.loudness) * 0.45
-        let intensity = min(1, base + pulseEnergy * 0.75)
-        // Never fully dark while audio is playing: a floor keeps the board alive
-        // between hits instead of blinking off.
-        let floor = frame.loudness > 0.02 ? 0.08 : 0
+        // Squaring loudness expands the dynamics: a quiet passage sits genuinely
+        // low and a drop actually lands, where a linear term kept the board at a
+        // permanent half-glow with nothing to read a gesture against.
+        let sustained = Double(frame.loudness) * Double(frame.loudness) * 0.40
+        let intensity = min(1, sustained + pulseEnergy * 0.85)
+        // A resting level low enough to read as dark, but not zero — a board
+        // that blinks fully off between hits reads as broken rather than as
+        // quiet.
+        let floor = frame.loudness > 0.02 ? 0.02 : 0
         let level = max(floor, intensity)
         guard level > 0 else { return }
 
@@ -318,8 +329,10 @@ public final class ModeRenderer {
 
         let colour = Self.hue(forBrightness: frame.brightness,
                               themeColor: themeColor, useTheme: useThemeColor)
-        // A dim bed so the board is never empty between waves.
-        let bed = 0.06 + Double(frame.loudness) * 0.10
+        // A very dim bed so the board is never empty between waves — but dark
+        // enough that a wave reads as light travelling across darkness rather
+        // than as a bright patch on a lit board.
+        let bed = 0.012 + Double(frame.loudness) * 0.045
         for index in 0..<columnCount {
             canvas.wholeColumn(index, Self.rgb(colour, intensity: bed))
         }
@@ -364,7 +377,7 @@ public final class ModeRenderer {
         rings.removeAll { $0.strength < 0.05 || $0.radius > Double(columnCount) }
 
         let centre = Double(columnCount - 1) / 2
-        let bed = 0.05 + Double(frame.loudness) * 0.08
+        let bed = 0.010 + Double(frame.loudness) * 0.035
         let bedColour = Self.hue(forBrightness: frame.brightness,
                                  themeColor: themeColor, useTheme: useThemeColor)
         for index in 0..<columnCount {
@@ -477,7 +490,7 @@ public final class ModeRenderer {
             // Fade at the leading edge so the boundary is soft rather than a
             // hard step, and always at least two columns wide.
             let edge = min(1, (reach - distance) / 1.5)
-            let level = min(1, 0.15 + 0.85 * edge * max(0.35, vuLevel))
+            let level = min(1, 0.06 + 0.94 * edge * max(0.25, vuLevel * vuLevel + vuLevel * 0.4))
             canvas.wholeColumn(index, Self.rgb(colour, intensity: level),
                                includePeak: distance <= reach - 1.5)
         }
