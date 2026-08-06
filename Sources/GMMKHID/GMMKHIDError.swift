@@ -20,9 +20,17 @@ public enum GMMKHIDError: Error, CustomStringConvertible {
     case commandRejected(status: UInt8, packetIndex: Int)
     /// A read was sent `attempts` times and the keyboard never answered.
     case noReply(attempts: Int)
+    /// A frame was sent outside a streaming session.
+    case notStreaming
 
     public var description: String {
         switch self {
+        case .notStreaming:
+            return """
+                A frame was sent without a streaming session open. Frames skip the 0x03 hello \
+                read that makes writes latch, so they are only valid after beginStreaming() \
+                has issued one (docs/protocol-tkl-notes.md §13.8).
+                """
         case .deviceNotFound:
             return """
                 GMMK keyboard not found (expected USB 0C45:652F with vendor usage page \

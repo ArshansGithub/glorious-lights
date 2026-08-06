@@ -16,6 +16,14 @@ final class KeyboardController {
     static let throttleInterval: TimeInterval = 0.030
 
     private let keyboard = GMMKKeyboard()
+
+    /// Shared with the visualizer. While the visualizer holds it, every send
+    /// here is dropped: ``GMMKKeyboard`` is one-thread-at-a-time, and the
+    /// visualizer drives its own instance from its own thread. Dropping rather
+    /// than queueing is deliberate — a menu action taken during a visualizer
+    /// session is about a board the visualizer is repainting fifteen times a
+    /// second, so replaying it later would apply it to a different world.
+    let lease = TransportLease()
     private var pendingSends: [String: DispatchWorkItem] = [:]
     /// Uptime of the last delivery per throttle key, for the leading edge.
     private var lastDelivery: [String: TimeInterval] = [:]
@@ -192,6 +200,7 @@ final class KeyboardController {
 
     private func deliver(_ packets: [[UInt8]]) {
         guard keyboard.isConnected else { return }
+        guard lease.isAvailable(to: .menu) else { return }
         do {
             try keyboard.send(packets: packets)
             if lastError != nil {

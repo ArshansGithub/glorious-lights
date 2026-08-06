@@ -383,6 +383,58 @@ public final class GMMKKeyboard {
     /// `END` is sent before rethrowing: the `END` is the commit, so aborting
     /// without one leaves the keyboard mid-transaction until it is replugged.
     public func send(packets: [[UInt8]]) throws {
+        try deliver(packets, openingSession: true)
+    }
+
+    // MARK: - Streaming
+
+    /// Whether a streaming session is open — see ``beginStreaming(mode:)``.
+    public private(set) var isStreaming = false
+
+    /// Opens a streaming session: one hello read, one mode write, and then
+    /// nothing but frames.
+    ///
+    /// An ordinary ``send(packets:)`` is self-contained — it opens with the
+    /// `0x03` hello read every time, because a caller that sends one transaction
+    /// a minute cannot assume the firmware still counts it as recent. A
+    /// visualizer sending fifteen frames a second can: the hello is what makes
+    /// writes latch (`docs/protocol-tkl-notes.md` §13.8), and one at the top of
+    /// the session covers the frames that follow. Paying for it per frame would
+    /// double the packet count for nothing.
+    ///
+    /// The mode write is here for the same reason: per-key colours are only
+    /// displayed in mode `custom`, and that is a property of the session rather
+    /// than of each frame.
+    ///
+    /// - Throws: anything ``send(packets:)`` throws. A failure leaves the
+    ///   session closed rather than half-open.
+    public func beginStreaming(mode: LightingMode = .custom) throws {
+        guard !isStreaming else { return }
+        try deliver(GMMKTransaction.setMode(mode), openingSession: true)
+        isStreaming = true
+    }
+
+    /// Sends one frame: the caller's packets, echo-paced, with **no** hello read
+    /// and no read-back.
+    ///
+    /// The caller owns the bracketing — a frame is expected to be one
+    /// `START` … `END` run of per-key colour packets, so that a frame is never
+    /// displayed half-applied.
+    ///
+    /// - Throws: ``GMMKHIDError/notStreaming`` if no session is open, plus
+    ///   whatever the send path throws.
+    public func sendFrame(packets: [[UInt8]]) throws {
+        guard isStreaming else { throw GMMKHIDError.notStreaming }
+        try deliver(packets, openingSession: false)
+    }
+
+    /// Closes the streaming session. Sends nothing: what the board should show
+    /// afterwards is the caller's business, not the transport's.
+    public func endStreaming() {
+        isStreaming = false
+    }
+
+    private func deliver(_ packets: [[UInt8]], openingSession: Bool) throws {
         var sentAny = false
         // Set once the firmware has stopped answering. Waiting the full timeout
         // on every remaining packet would block this thread for
@@ -395,8 +447,11 @@ public final class GMMKKeyboard {
         do {
             // The hello read comes first, and its own silence is worth
             // respecting: a board that will not answer this will not answer the
-            // writes either.
-            replyChannelIsSilent = try openSessionReportingSilence().wentSilent
+            // writes either. A streaming frame skips it — the session opener
+            // already did it once, see `beginStreaming(mode:)`.
+            if openingSession {
+                replyChannelIsSilent = try openSessionReportingSilence().wentSilent
+            }
 
             for (index, packet) in packets.enumerated() {
                 let floor = replyChannelIsSilent
