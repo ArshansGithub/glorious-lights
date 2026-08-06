@@ -521,6 +521,47 @@ func runMouseCommand(_ arguments: [String]) -> Never {
                   + "\nwrite " + (ok ? "verified by read-back" : "NOT confirmed by read-back"))
         }
 
+    case "flash-probe":
+        // Timing discrimination (docs/mouse-protocol.md §14.10): does an
+        // UNCHANGED blob write take as long as a CHANGED one? Distinguishes
+        // diff-and-skip firmware from unconditional flash programming.
+        withMouse { mouse in
+            let baseline = try mouse.readConfig(profile: .one)
+            guard let size = baseline.observedConfigSize else {
+                fail("could not observe config size", .transport)
+            }
+            func timeWrites(_ label: String, mutate: (Int, inout MouseConfigBlob) -> Void) throws -> [Double] {
+                var times: [Double] = []
+                for i in 0..<20 {
+                    var blob = baseline
+                    mutate(i, &blob)
+                    let prepared = blob.preparedForWrite(profile: .one, configSize: size)
+                    let t0 = Date()
+                    try mouse.writeConfig(prepared)
+                    times.append(Date().timeIntervalSince(t0) * 1000)
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                let sorted = times.sorted()
+                print(String(format: "%@: median %.2f ms  min %.2f  max %.2f",
+                             label, sorted[10], sorted.first!, sorted.last!))
+                return times
+            }
+            _ = try timeWrites("unchanged writes") { _, _ in }
+            let toggled = try timeWrites("changed writes ") { i, blob in
+                // Alternate the single-colour effect's brightness nibble.
+                if let param = blob.modeParameter(for: .single) {
+                    try? blob.setModeParameter(
+                        MouseModeParameter(speed: param.speed, brightness: i % 2 == 0 ? 3 : 4),
+                        for: .single)
+                }
+            }
+            _ = toggled
+            print("interpretation: see docs/mouse-protocol.md §14.10 —")
+            print("  unchanged ≪ changed  → firmware diffs; write-on-change is a real mitigation")
+            print("  both slow (10-50ms)  → every write is a flash cycle; hard budget")
+            print("  both fast (1-3ms)    → commit deferred/conditional; most hopeful")
+        }
+
     case "restore":
         guard let path = rest.first else {
             fail("`mouse restore` needs the path of a file written by `mouse dump`", .usage)
