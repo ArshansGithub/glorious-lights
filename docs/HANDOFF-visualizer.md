@@ -147,7 +147,7 @@ tracks** — the owner called that out explicitly. Use them as sanity checks onl
 
 ## 5. Current state
 
-- HEAD is `0613ab6` on branch `visualizer-r2-1`, green: `swift build` and `swift test` clean, **468 tests pass**, zero warnings.
+- HEAD is on `main` (fast-forwarded from `visualizer-r2-1`), green: `swift build` and `swift test` clean, **468 tests pass**, zero warnings.
 - `viz-sim --battery` **FAILS**: ~1257 of 13929 checks. Do not trust that number
   as a defect count — see §7.
 - The app is installed and runs; the visualizer works in the sense that it
