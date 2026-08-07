@@ -164,8 +164,6 @@ public struct EnergyModel: Sendable {
     private var escaping = false
     private var silentFor: Double = 0
     private var hasOpened = false
-    /// Seconds `Σ` has existed, for the same seed-versus-track distinction.
-    private var sectionElapsed: Double = 0
     /// Whether a hop carrying real programme material has seeded the reference.
     private var referenceSeeded = false
 
@@ -315,29 +313,6 @@ public struct EnergyModel: Sendable {
         noveltyFired = escaping && !wasEscaping
         wasEscaping = escaping
 
-        // **`Σ` may not claim a history it does not have.**
-        //
-        // `Σ` starts at zero and climbs to the material with an 8 s rise, so for
-        // the first twenty seconds of any session it reads far below `Φ`. That
-        // is not a quiet section, it is an empty filter — and §11.4's swell is
-        // `Φ − k·Σ`, which is therefore *maximal* exactly when `Σ` is least
-        // informative. The consequence is that the opening of every session is
-        // displayed at close to full brightness whatever is playing.
-        //
-        // `build-drop` measures precisely this, because its intro *is* the first
-        // eight seconds: measured, `Σ` 0.066 and `Φ` 0.389 there, so swell 0.183
-        // and resting 0.283 against the drop's own 0.304 — a contrast of 0.02
-        // where M9b asks for 0.18. The board showed the intro and the drop as
-        // the same picture, which is the cliff complaint upside down.
-        //
-        // Same distinction the reference tracker draws (``QuantileTracker``):
-        // seeding is not tracking. Until `Σ` has a section's worth of history it
-        // runs on the history it has, so it *starts* on the material instead of
-        // climbing to it from zero. After ``sectionRise`` seconds the constant
-        // is exactly what it always was, so nothing about how a real section
-        // change is tracked is affected — including the fall-rate limit below,
-        // which is normative and is applied on this path too.
-        sectionElapsed += max(dt, 0)
         let rising = phraseEnvelope.value > sectionValue
         var tau: Double
         if rising {
@@ -346,7 +321,6 @@ public struct EnergyModel: Sendable {
             let mayAccelerate = escaping && quietFor >= Self.quietHold
             tau = mayAccelerate ? Self.sectionEscape : Self.sectionFall
         }
-        tau = min(tau, max(sectionElapsed, 1e-3))
         let a = exp(-max(dt, 0) / max(tau, 1e-6))
         var next = phraseEnvelope.value + (sectionValue - phraseEnvelope.value) * a
         // The hard limit, applied at all times and not only on the escape path.
@@ -374,7 +348,6 @@ public struct EnergyModel: Sendable {
         silenceRamp = 0
         hasOpened = false
         referenceSeeded = false
-        sectionElapsed = 0
         energy = 0
     }
 }
