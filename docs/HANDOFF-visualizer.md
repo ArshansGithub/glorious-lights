@@ -147,7 +147,7 @@ tracks** — the owner called that out explicitly. Use them as sanity checks onl
 
 ## 5. Current state
 
-- HEAD is green: `swift build` and `swift test` clean, **468 tests pass**, zero warnings.
+- HEAD is `0613ab6` on branch `visualizer-r2-1`, green: `swift build` and `swift test` clean, **468 tests pass**, zero warnings.
 - `viz-sim --battery` **FAILS**: ~1257 of 13929 checks. Do not trust that number
   as a defect count — see §7.
 - The app is installed and runs; the visualizer works in the sense that it
@@ -207,6 +207,20 @@ internal contradictions that were proven, not suspected:
   Raising the bed makes them vacuous; lowering it makes everything strobe.
 - **§10.5 item 8's stated mechanism is false** — the tradeoff it describes was an
   artifact of a bad reference seed and disappears once the seed is fixed.
+
+### One finding that survives any rewrite
+
+**The gamma/bed geometry problem is independent of which analyzer you use.**
+With 8-bit output and gamma ≈ 2.2, decoded levels step `0 → 0.081 → 0.110`. The
+"is this key lit" threshold used throughout is `0.10`, which is exactly *PWM code
+≥ 2* — while the resting bed sits at code 1. So **any** design that keeps a
+resting glow under the keys will find that the bed reads as "off" to a
+level-based measurement, and that the tiniest accent lifts a key across the line
+and its decay drops it back within a frame or two. If you keep a bed (and you
+should — it is what fixes the "cliff"), decide up front whether "lit" means
+*absolute level* or *level above the bed*, because absolute-level measurement and
+a resting bed are mutually incoherent. The saved
+`docs/leads/accent-layer-prototype.patch` is one worked answer to this.
 
 **Recommendation: treat the doc as an archive of measurements and a cautionary
 tale, not as a contract.** Roughly four checks would have done the job the
