@@ -1,0 +1,487 @@
+diff --git a/Sources/GloriousVisualizer/LinearCanvas.swift b/Sources/GloriousVisualizer/LinearCanvas.swift
+index 2a70118..b03c8fa 100644
+--- a/Sources/GloriousVisualizer/LinearCanvas.swift
++++ b/Sources/GloriousVisualizer/LinearCanvas.swift
+@@ -163,15 +163,51 @@ public struct KeyHold: Equatable, Sendable {
+     /// A key cannot fall from full to black faster than this.
+     public static let downSlewSeconds: Double = 0.200
+ 
++    /// How far above the bed a key is held during its minimum on-time (§6.3, as
++    /// amended in r2.2), and the same number M1 and M4 count a key as lit at.
++    ///
++    /// §10.2 has always said M4's `p10 ≥ 0.15 s` "is what the §6.3 minimum
++    /// on-time guarantees". It was not: the interlock holds the *boolean* `lit`
++    /// while displaying whatever the model composed, so a key could be held and
++    /// still measured off, and the implication was aspirational. Restoring
++    /// r2.0's snap-to-threshold makes it true and makes both metrics vacuous
++    /// instead — measured, M4's `p10` median became 28.2 s on a 30 s run.
++    ///
++    /// What holds instead is a floor **relative to this frame's bed**, and only
++    /// while the hold is running: a key the model lit stays at least one PWM
++    /// code above the resting board for 150 ms, and after that it is free to
++    /// fall back to the bed. It is bounded (one code, not "up to the rise
++    /// threshold"), it is relative (it cannot make a dark board glow, because
++    /// where there is no bed there is nothing to be above), and it expires. The
++    /// level still varies freely above it, so it is a floor and not a snap.
++    public static let accentFloor: Double = 0.050
++    /// How far above the bed the model must go to *arm* the hold. Above the
++    /// floor it holds to, so a key that is merely grazing the floor does not
++    /// re-arm itself every frame and latch on for ever.
++    public static let accentRise: Double = 0.075
++
+     private var lit = false
+     private var litSince: Double = -.infinity
+     private var darkSince: Double = -.infinity
+     private var displayed: Double = 0
++    /// The second trigger, on the **accent** rather than on the level.
++    ///
++    /// `lit` is a statement about absolute level, and once §11.4's bed is
++    /// healthy it is permanently true for every key — a key lights on the first
++    /// bar and never goes dark again, so `litSince` is ancient and the hold
++    /// window never re-arms. The guarantee M4 states is about the light a
++    /// *gesture* added, which needs a trigger on that quantity: struck, held for
++    /// the minimum on-time, then free to fall back to the bed.
++    private var struck = false
++    private var struckSince: Double = -.infinity
+ 
+     public init() {}
+ 
++    /// - Parameter bed: what §11.4 composed for this key with every mode's fast
++    ///   field removed. The hold floor is relative to it.
+     @discardableResult
+-    public mutating func update(_ x: Double, now: Double, dt: Double) -> Double {
++    public mutating func update(_ x: Double, bed: Double = 0,
++                                now: Double, dt: Double) -> Double {
+         if lit {
+             if x < Self.fallThreshold, now - litSince >= Self.minimumOn {
+                 lit = false
+@@ -182,10 +218,27 @@ public struct KeyHold: Equatable, Sendable {
+             litSince = now
+         }
+ 
++        // The accent trigger: a key is *struck* when the model puts it a visible
++        // step above the bed, and stays struck for the minimum on-time whatever
++        // the gesture's envelope does next.
++        let reference = max(bed, 0)
++        let accent = x - reference
++        if struck {
++            if accent < Self.accentFloor, now - struckSince >= Self.minimumOn {
++                struck = false
++            }
++        } else if accent >= Self.accentRise {
++            struck = true
++            struckSince = now
++        }
++
+         // Rising is unbounded — attacks must stay instant. Falling is rate
+         // limited, and while the key is held on it cannot fall below the level
+         // at which the model said it was lit.
+-        let desired = lit ? x : 0
++        let holding = struck && now - struckSince < Self.minimumOn
++        let desired = lit
++            ? (holding ? max(x, min(1, reference + Self.accentFloor)) : x)
++            : 0
+         if desired >= displayed {
+             displayed = desired
+         } else {
+@@ -195,6 +248,8 @@ public struct KeyHold: Equatable, Sendable {
+     }
+ 
+     public var isLit: Bool { lit }
++    /// Whether gesture light is currently being held on this key.
++    public var isStruck: Bool { struck }
+     public var level: Double { displayed }
+ }
+ 
+@@ -215,6 +270,7 @@ public struct KeyInterlock: Sendable {
+     ///   - sensitivity: the user's gain, applied **after** the hold decision so
+     ///     that turning it down cannot make the interlock let go of a key.
+     public mutating func encode(_ levels: [(r: Double, g: Double, b: Double)],
++                                bed: [Double] = [],
+                                 sensitivity: Double,
+                                 now: Double, dt: Double) -> [RGB] {
+         var out = [RGB](repeating: .black, count: keys.count)
+@@ -224,7 +280,9 @@ public struct KeyInterlock: Sendable {
+             // The interlock decides on the key's overall lightness, so a key
+             // never changes hue as a side effect of being held on.
+             let lightness = max(colour.r, max(colour.g, colour.b))
+-            let held = keys[index].update(min(lightness, 1), now: now, dt: dt)
++            let held = keys[index].update(min(lightness, 1),
++                                          bed: index < bed.count ? bed[index] : 0,
++                                          now: now, dt: dt)
+             guard held > 0, lightness > 0 else { continue }
+             let scale = held / lightness
+             out[index] = RGB(red: Self.gamma(Self.gain(colour.r * scale, sensitivity)),
+diff --git a/Sources/GloriousVisualizer/Modes.swift b/Sources/GloriousVisualizer/Modes.swift
+index 63a2484..360da45 100644
+--- a/Sources/GloriousVisualizer/Modes.swift
++++ b/Sources/GloriousVisualizer/Modes.swift
+@@ -90,6 +90,14 @@ public final class ModeRenderer {
+     /// there is deliberately no constant here any more.
+     public var latency: Double = 0
+ 
++    /// The most recent bed-only composition — the board as it would look this
++    /// frame if nothing had been struck.
++    ///
++    /// Composed on every frame, not only under verification: §6.3's hold floor
++    /// is relative to it, so it is part of what the app displays. It costs a
++    /// second compose and a second blur over a 17 × 6 grid.
++    public private(set) var bedReference: LinearCanvas?
++
+     private var gestures: GestureList
+     private var colourField = ColourField()
+     private var schedule = BeatSchedule()
+@@ -182,6 +190,24 @@ public final class ModeRenderer {
+         case .vu:       buildVU(state, time: time, into: &field, deposits: &deposits)
+         }
+ 
++        // The same composition with every mode's fast field removed. Two things
++        // consume it. §6.3's hold floor is relative to it, so a held key is a
++        // code above *the resting board* rather than above a constant. And M1,
++        // M4 and M10c are claims about gesture light, which since §11.4 put a
++        // bed under every key cannot be read off the absolute level any more;
++        // this is what they measure against.
++        do {
++            var bedField = field
++            for column in 0..<columnCount {
++                bedField.accent[column] = 0
++                bedField.peak[column] = 0
++            }
++            var bed = LinearCanvas()
++            compose(bedField, state: state, into: &bed)
++            bed.blur(sigma: 1.0)
++            bedReference = bed
++        }
++
+         var canvas = LinearCanvas()
+         compose(field, state: state, into: &canvas)
+         for deposit in deposits {
+diff --git a/Sources/GloriousVisualizer/VisualizerEngine.swift b/Sources/GloriousVisualizer/VisualizerEngine.swift
+index 5edd6d0..6ce5079 100644
+--- a/Sources/GloriousVisualizer/VisualizerEngine.swift
++++ b/Sources/GloriousVisualizer/VisualizerEngine.swift
+@@ -139,6 +139,39 @@ public final class VisualizerEngine {
+                       now: time, dt: dt)
+     }
+ 
++    /// Per-LED lightness of the bed-only board for the frame just composed, in
++    /// the same units the metrics measure — after master and user brightness,
++    /// before the interlock and the user's sensitivity, which `viz-sim` inverts.
++    ///
++    /// This is what §6.3's hold floor is measured against, so it is live in the
++    /// app and not only under verification.
++    public private(set) var bedLevels: [Double] = []
++
++    /// Flattens a canvas onto the LED map, which is the same walk for the
++    /// composed board and for the bed underneath it.
++    private func flatten(_ canvas: LinearCanvas, scale: Double)
++        -> [(r: Double, g: Double, b: Double)] {
++        var levels = [(r: Double, g: Double, b: Double)](
++            repeating: (0, 0, 0), count: GMMKKeyMap.paintableLEDIndices.count)
++        func write(_ led: UInt16, _ colour: (r: Double, g: Double, b: Double)) {
++            let offset = Int(led) - Int(GMMKKeyMap.minLEDIndex)
++            guard levels.indices.contains(offset) else { return }
++            levels[offset] = (max(levels[offset].r, colour.r * scale),
++                              max(levels[offset].g, colour.g * scale),
++                              max(levels[offset].b, colour.b * scale))
++        }
++        for (index, column) in VisualizerLayout.columns.enumerated() {
++            for (rowIndex, row) in column.levelRows.enumerated() {
++                let colour = canvas.sample(column: index, physicalRow: rowIndex,
++                                           of: column.rowCount)
++                for led in row { write(led, colour) }
++            }
++            let peak = canvas.peak(column: index)
++            for led in column.peakKeys { write(led, peak) }
++        }
++        return levels
++    }
++
+     private func encode(_ canvas: LinearCanvas, brightness: Double,
+                         now: Double, dt: Double) -> [RGB] {
+         var levels = [(r: Double, g: Double, b: Double)](
+@@ -163,23 +196,12 @@ public final class VisualizerEngine {
+         // made on what the modes asked for, which is what this type's own
+         // documentation has always claimed.
+         let scale = brightness
+-        func write(_ led: UInt16, _ colour: (r: Double, g: Double, b: Double)) {
+-            let offset = Int(led) - Int(GMMKKeyMap.minLEDIndex)
+-            guard levels.indices.contains(offset) else { return }
+-            levels[offset] = (max(levels[offset].r, colour.r * scale),
+-                              max(levels[offset].g, colour.g * scale),
+-                              max(levels[offset].b, colour.b * scale))
+-        }
+-        for (index, column) in VisualizerLayout.columns.enumerated() {
+-            for (rowIndex, row) in column.levelRows.enumerated() {
+-                let colour = canvas.sample(column: index, physicalRow: rowIndex,
+-                                           of: column.rowCount)
+-                for led in row { write(led, colour) }
+-            }
+-            let peak = canvas.peak(column: index)
+-            for led in column.peakKeys { write(led, peak) }
++        levels = flatten(canvas, scale: scale)
++        if let bed = renderer.bedReference {
++            bedLevels = flatten(bed, scale: scale).map { max($0.r, max($0.g, $0.b)) }
+         }
+-        return interlock.encode(levels, sensitivity: max(sensitivity, 0), now: now, dt: dt)
++        return interlock.encode(levels, bed: bedLevels,
++                                sensitivity: max(sensitivity, 0), now: now, dt: dt)
+     }
+ 
+     /// Finds the analysis states bracketing `time` and evaluates them there.
+diff --git a/Sources/viz-sim/Metrics.swift b/Sources/viz-sim/Metrics.swift
+index 52ce881..06197b4 100644
+--- a/Sources/viz-sim/Metrics.swift
++++ b/Sources/viz-sim/Metrics.swift
+@@ -13,13 +13,69 @@ import GloriousVisualizer
+ /// board flickers, goes inert, lags, or stops holding.
+ struct Metrics {
+ 
+-    /// A key is **on** when its gamma-decoded lightness is at least this. The
+-    /// same value in every metric, so the metrics are mutually consistent.
++    // §10.2's absolute on-level of 0.10 is **gone**, and its absence is the
++    // point rather than an omission. It was "the same value in every metric, so
++    // the metrics are mutually consistent" — but the two metrics that used it
++    // are claims about gesture light, and after §11.4 put a bed under every key
++    // an absolute level cannot express that. What replaces it is
++    // ``accentMargin``, which is relative to the bed the model composed on that
++    // frame. The metrics that really are claims about absolute brightness carry
++    // their own thresholds and always did: M3's rise is 0.05 of board mean and
++    // M9c's dark floor is 0.06.
++
++    /// How far above **this frame's bed** a key must be to count as lit, for the
++    /// three metrics that are claims about gesture light (§10.2, r2.2).
+     ///
+-    /// Mapped through the user sensitivity curve: sensitivity is an output gain
+-    /// applied *after* the per-key interlock, so it changes how bright the board
+-    /// is without changing which keys the model is holding lit.
+-    static let onLevel: Double = 0.10
++    /// ## Why these metrics cannot use an absolute level any more
++    ///
++    /// M1, M4 and M10c were written for a display with no resting bed, and
++    /// §11.4 then put one under every key on every frame. Measuring absolute
++    /// level after that asks the wrong question, and both ways of answering it
++    /// are wrong:
++    ///
++    /// * with the bed **below** the on-level, the whole resting board reads
++    ///   "off" and every accent — however small — lifts a key across the line
++    ///   and its decay drops it back within a frame or two. Measured at r2.1:
++    ///   237 M4 failures and 72 M1 failures, with `p10` at 0.033 s;
++    /// * with the bed **above** it, every key is on for the whole run. Measured
++    ///   by restoring the r2.0 snap: M4's `p10` median became 28.2 s on a 30 s
++    ///   run and M1's `p95` was exactly 0.000 in over three quarters of the
++    ///   battery. The metrics passed and asserted nothing.
++    ///
++    /// The question all three actually mean to ask is *where did the light a
++    /// gesture added go, and how long did it stay*. So they measure
++    /// `max(0, level − bed)`, with the bed the model's own composition for that
++    /// frame with every mode's fast field removed — not a constant, and not an
++    /// estimate.
++    ///
++    /// ## Why 0.035
++    ///
++    /// The single gamma-2.2 encode at 8 bits is very coarse at the bottom:
++    /// decoded codes run 0, 0.0806, 0.1104, 0.1327, so "a bit brighter than the
++    /// bed" has to clear a whole code to exist on the wire at all. One code at
++    /// composed lightness `b` is `1/(255 · 2.2 · b^1.2)`, which is largest where
++    /// the bed is dimmest: at `B0` it is 0.032 and it shrinks monotonically from
++    /// there. **0.035 therefore guarantees at least one PWM code above the bed
++    /// at every level the bed can take**, which is the weakest statement that
++    /// makes "lit" mean "visibly brighter than the resting board".
++    /// `MetricDefinitionTests.accentMarginIsAtLeastOneCodeEverywhere` proves it
++    /// over the whole range rather than at the two ends.
++    /// **The same constant the interlock holds to**, deliberately: a metric that
++    /// counted a key as lit at a different level from the one the hold
++    /// guarantees would be measuring a board nobody built.
++    static let accentMargin: Double = 0.035
++
++    /// The light a gesture added, per frame per LED: the displayed level minus
++    /// the bed the model composed underneath it, never below zero.
++    static func accentLayer(_ levels: [[Double]], bed: [[Double]]) -> [[Double]] {
++        guard bed.count == levels.count else { return levels }
++        return levels.enumerated().map { index, frame in
++            let reference = bed[index]
++            return frame.enumerated().map { led, value in
++                max(0, value - (led < reference.count ? reference[led] : 0))
++            }
++        }
++    }
+ 
+     // M1
+     var flickerMean: Double = 0
+@@ -117,18 +173,23 @@ struct Metrics {
+         guard frames.count > 1, let ledCount = frames.first?.count else { return metrics }
+         let dt = result.frameInterval
+         let duration = Double(frames.count) * dt
+-        let onLevel = Self.onLevel
+-
+-        // ---- M1 flicker: complete on→off→on cycles per key-second.
++        // The bed is exported before the user's sensitivity, so it is already in
++        // the units `model(_:sensitivity:)` puts the displayed levels back into.
++        let accent = Self.accentLayer(frames, bed: result.bedLevels)
++        let margin = Self.accentMargin
++
++        // ---- M1 flicker: complete on→off→on cycles per key-second, on the
++        // **accent layer** — how often gesture light on a key stopped and
++        // started, not how often the board crossed an absolute level.
+         var flicker = [Double](repeating: 0, count: ledCount)
+         var onRuns: [Double] = []
+         for led in 0..<ledCount {
+-            var wasOn = frames[0][led] >= onLevel
++            var wasOn = accent[0][led] >= margin
+             var sawOff = false
+             var cycles = 0.0
+             var runStart = wasOn ? 0 : -1
+             for index in 1..<frames.count {
+-                let isOn = frames[index][led] >= onLevel
++                let isOn = accent[index][led] >= margin
+                 if isOn != wasOn {
+                     if isOn {
+                         if sawOff { cycles += 1 }
+@@ -313,7 +374,8 @@ struct Metrics {
+ 
+         // ---- M10 spatial diversity, from the RGB export: lightness discards
+         // hue, which is the thing being measured.
+-        metrics.spatial = SpatialDiversity.measure(colors: result.colors)
++        metrics.spatial = SpatialDiversity.measure(colors: result.colors,
++                                                  bed: result.bedLevels)
+ 
+         // ---- §7.2-R packet budget, from the real packet builder.
+         if !result.packetCounts.isEmpty {
+diff --git a/Sources/viz-sim/MetricsR2.swift b/Sources/viz-sim/MetricsR2.swift
+index 196df8c..1a82443 100644
+--- a/Sources/viz-sim/MetricsR2.swift
++++ b/Sources/viz-sim/MetricsR2.swift
+@@ -404,7 +404,18 @@ struct SpatialDiversity {
+         return leds
+     }
+ 
+-    static func measure(colors: [[RGB]]) -> SpatialDiversity {
++    /// - Parameter bed: per-frame per-LED bed lightness. **M10c's centre of mass
++    ///   is weighted by the accent layer, not by total brightness** (§10.2,
++    ///   r2.2). §11.4 puts a bed under every column on every frame, and a
++    ///   near-uniform term of that size pins the centre of mass at column 8 by
++    ///   arithmetic: with `f` the accent's share of board light,
++    ///   `x̄ − 8 = f · (origin − 8)`, so the metric was reporting the bed's
++    ///   symmetry rather than where gesture light went. It failed 230 of 245 in
++    ///   every mode alike, including the three whose geometry is not symmetric
++    ///   at all, which is the signature of measuring the wrong quantity.
++    ///   M10a/M10b/M10d are unchanged: hue and column starvation are claims
++    ///   about the whole picture, bed included.
++    static func measure(colors: [[RGB]], bed: [[Double]] = []) -> SpatialDiversity {
+         var result = SpatialDiversity()
+         guard let first = colors.first, !first.isEmpty else { return result }
+         let columns = columnLEDs.count
+@@ -417,13 +428,18 @@ struct SpatialDiversity {
+         // Per-frame hue profiles, relative to the frame's own mean hue.
+         var profiles: [[Double]] = []
+ 
+-        for frame in colors {
++        for (frameIndex, frame) in colors.enumerated() {
+             var weight = 0.0
+             var cosine = 0.0, sine = 0.0
+             var columnValues = [Double](repeating: 0, count: columns)
++            // …and the same per column with the bed taken out, which is what the
++            // centre of mass is computed from.
++            var columnAccents = [Double](repeating: 0, count: columns)
+             var columnHues = [Double](repeating: .nan, count: columns)
++            let frameBed = frameIndex < bed.count ? bed[frameIndex] : []
+             for (index, leds) in columnLEDs.enumerated() {
+                 var sum = 0.0
++                var accentSum = 0.0
+                 var columnWeight = 0.0
+                 var columnCosine = 0.0, columnSine = 0.0
+                 for led in leds where led >= 0 && led < frame.count {
+@@ -433,6 +449,7 @@ struct SpatialDiversity {
+                     let b = KeyInterlock.decode(colour.blue)
+                     let value = max(r, max(g, b))
+                     sum += value
++                    accentSum += max(0, value - (led < frameBed.count ? frameBed[led] : 0))
+                     guard value > 1e-6 else { continue }
+                     // Hue is circular, and a hue on a dark key is not visible,
+                     // so the spread is brightness-weighted and circular.
+@@ -445,6 +462,7 @@ struct SpatialDiversity {
+                     columnSine += value * sin(2 * .pi * hue)
+                 }
+                 columnValues[index] = leds.isEmpty ? 0 : sum / Double(leds.count)
++                columnAccents[index] = leds.isEmpty ? 0 : accentSum / Double(leds.count)
+                 if columnWeight > 1e-9 {
+                     columnHues[index] = atan2(columnSine, columnCosine) / (2 * .pi)
+                 }
+@@ -471,11 +489,15 @@ struct SpatialDiversity {
+                 })
+             }
+ 
+-            let columnSum = columnValues.reduce(0, +)
+-            if columnSum >= visibleMean * Double(columns) {
++            // A frame contributes a centre only when there is gesture light to
++            // find one in: with no accent anywhere the centroid of nothing is
++            // not column 8, it is undefined, and averaging it in would be
++            // reporting the bed again by a different route.
++            let accentSum = columnAccents.reduce(0, +)
++            if accentSum >= Metrics.accentMargin {
+                 var moment = 0.0
+-                for index in 0..<columns { moment += columnValues[index] * Double(index) }
+-                centres.append(moment / columnSum)
++                for index in 0..<columns { moment += columnAccents[index] * Double(index) }
++                centres.append(moment / accentSum)
+             }
+         }
+ 
+diff --git a/Sources/viz-sim/Runner.swift b/Sources/viz-sim/Runner.swift
+index d5a0916..719499c 100644
+--- a/Sources/viz-sim/Runner.swift
++++ b/Sources/viz-sim/Runner.swift
+@@ -38,6 +38,10 @@ struct SimRun {
+         var frameTimes: [Double] = []
+         /// Per displayed frame, the gamma-decoded lightness of every LED.
+         var levels: [[Double]] = []
++        /// Per displayed frame, the **bed-only** lightness of every LED — the
++        /// board as it would have looked with nothing struck. M1, M4 and M10c
++        /// are claims about gesture light and measure against this (§10.2).
++        var bedLevels: [[Double]] = []
+         /// Per displayed frame, the colours as sent, for the movie writer.
+         var colors: [[RGB]] = []
+         /// Intervals between the timestamps frames were **composed for**, for M7.
+@@ -162,6 +166,7 @@ struct SimRun {
+         var scheduled = 0.0
+         var lastComposed = 0.0
+         var lastColors: [RGB]?
++        var lastBed: [Double]?
+         var lastPacked: [RGB]?
+ 
+         let totalFrames = Int(duration / dt)
+@@ -212,12 +217,16 @@ struct SimRun {
+             engine.reportDelivery(lag: outputLatency + lateness
+                                   + (stalled ? (stall?.length ?? 0) : 0))
+             let colors = engine.renderFrame(at: scheduled)
++            let bed = engine.bedLevels
+             result.tickIntervals.append(scheduled - lastComposed)
+             lastComposed = scheduled
+             // What the *board* shows: the newly composed frame, or the last one
+             // that was delivered if the transport is mid-stall.
+             let shown = stalled ? (lastColors ?? colors) : colors
+-            if stalled { result.droppedFrames += 1 } else { lastColors = colors }
++            // A stalled transport shows the last frame that got out, and the bed
++            // it is measured against has to be that frame's too.
++            let shownBed = stalled ? (lastBed ?? bed) : bed
++            if stalled { result.droppedFrames += 1 } else { lastColors = colors; lastBed = bed }
+             if !stalled {
+                 let plan = FramePackets.plan(for: colors, lastSent: lastPacked)
+                 lastPacked = colors
+@@ -231,6 +240,7 @@ struct SimRun {
+                     max(KeyInterlock.decode(colour.green), KeyInterlock.decode(colour.blue)))
+             })
+             result.colors.append(shown)
++            result.bedLevels.append(shownBed)
+ 
+             // Catch up by whole intervals: a late wake-up skips the frames whose
+             // slots have already passed rather than sliding the clock.
+@@ -244,6 +254,7 @@ struct SimRun {
+                     result.displayTimes.append(Double(next - 1) * dt + outputLatency)
+                     result.levels.append(result.levels[result.levels.count - 1])
+                     result.colors.append(lastColors)
++                    result.bedLevels.append(result.bedLevels[result.bedLevels.count - 1])
+                 }
+             }
+             frame = next
